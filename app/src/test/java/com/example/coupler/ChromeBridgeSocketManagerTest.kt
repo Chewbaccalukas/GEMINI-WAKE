@@ -14,7 +14,7 @@ import org.robolectric.annotation.Config
 import java.io.File
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36])
+@Config(sdk = [34])
 class ChromeBridgeSocketManagerTest {
 
     private lateinit var context: Context

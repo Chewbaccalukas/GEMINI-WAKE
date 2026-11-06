@@ -22,7 +22,7 @@ import java.util.Base64
 
 @OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [36])
+@Config(sdk = [34])
 class StreamingVoicePlayerTest {
 
     private lateinit var context: Context
