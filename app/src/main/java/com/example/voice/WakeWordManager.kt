@@ -728,6 +728,12 @@ class WakeWordManager(
             if (bytesRead <= 0 || pcmBytes.isEmpty()) return false
             return !isPcmByteBufferSilent(pcmBytes, bytesRead)
         }
+
+        /** 500ms debounce before re-arming listening on AUDIOFOCUS_GAIN. */
+        const val AUDIOFOCUS_GAIN_DEBOUNCE_MS = 500L
+
+        /** Strict 1500ms debounce for windowFocus changes to prevent rapid start/stop cycling on transient focus losses. */
+        const val WINDOW_FOCUS_DEBOUNCE_MS = 1500L
     }
 
     @Volatile
@@ -735,9 +741,24 @@ class WakeWordManager(
     @Volatile
     private var silenceStartTimestamp = 0L
 
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val audioFocusGainRunnable = Runnable {
+        if (_hasAudioFocus.value) {
+            maybeResumeAfterYield()
+        }
+    }
+    private val windowFocusDebounceRunnable = Runnable {
+        if (!hasActiveWindowFocus && (!_isHandsFreeMode.value || _isSleepMode.value) && (audioRecord != null || isRecording)) {
+            releaseAudioRecordHardware(stopForegroundService = false)
+        }
+    }
+    var onAudioFocusChangeCallback: ((Int) -> Unit)? = null
+
     /**
      * Window focus guard: prevents `AudioRecord.startRecording()` from starting or looping
      * in the background when `MainActivity` does not have active window focus.
+     * Debounces hardware release by [WINDOW_FOCUS_DEBOUNCE_MS] (`1500ms`) so transient focus
+     * losses (notification shade, dialogs) do not cycle listening state.
      */
     @Volatile
     var hasActiveWindowFocus: Boolean = true
@@ -745,8 +766,9 @@ class WakeWordManager(
 
     fun setWindowFocused(focused: Boolean) {
         hasActiveWindowFocus = focused
-        if (!focused && (audioRecord != null || isRecording)) {
-            releaseAudioRecordHardware(stopForegroundService = false)
+        mainHandler.removeCallbacks(windowFocusDebounceRunnable)
+        if (!focused && (!_isHandsFreeMode.value || _isSleepMode.value) && (audioRecord != null || isRecording)) {
+            mainHandler.postDelayed(windowFocusDebounceRunnable, WINDOW_FOCUS_DEBOUNCE_MS)
         }
     }
 
@@ -939,8 +961,10 @@ class WakeWordManager(
     }
 
     /**
-     * Handles AudioManager audio focus transitions (e.g. Gboard voice typing or another app
-     * requesting microphone / audio focus).
+     * Handles AudioManager audio focus transitions:
+     * - Only yields audio focus on [AudioManager.AUDIOFOCUS_LOSS] and [AudioManager.AUDIOFOCUS_LOSS_TRANSIENT].
+     * - Does NOT yield on [AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK].
+     * - Uses a 500ms debounce ([AUDIOFOCUS_GAIN_DEBOUNCE_MS]) before re-arming on [AudioManager.AUDIOFOCUS_GAIN].
      */
     fun handleAudioFocusChange(focusChange: Int) {
         if (isTransitioningAudioState) {
@@ -949,8 +973,8 @@ class WakeWordManager(
         }
         when (focusChange) {
             AudioManager.AUDIOFOCUS_LOSS,
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                mainHandler.removeCallbacks(audioFocusGainRunnable)
                 _hasAudioFocus.value = false
                 WakeWordVoiceService.setExclusiveAudioFocusState(false)
                 if (_isListening.value || _isHandsFreeMode.value) {
@@ -959,13 +983,21 @@ class WakeWordManager(
                 if (_isListening.value) {
                     stopAndReleaseForYield("Paused for external audio focus")
                 }
+                onAudioFocusChangeCallback?.invoke(focusChange)
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                // Do NOT yield audio focus on CAN_DUCK — keep handsFreeMode and listening active
+                Log.d(TAG, "Ignoring AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK (not yielding audio focus)")
+                onAudioFocusChangeCallback?.invoke(focusChange)
             }
             AudioManager.AUDIOFOCUS_GAIN,
             AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
             AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE -> {
                 _hasAudioFocus.value = true
                 WakeWordVoiceService.setExclusiveAudioFocusState(true)
-                maybeResumeAfterYield()
+                onAudioFocusChangeCallback?.invoke(focusChange)
+                mainHandler.removeCallbacks(audioFocusGainRunnable)
+                mainHandler.postDelayed(audioFocusGainRunnable, AUDIOFOCUS_GAIN_DEBOUNCE_MS)
             }
         }
     }

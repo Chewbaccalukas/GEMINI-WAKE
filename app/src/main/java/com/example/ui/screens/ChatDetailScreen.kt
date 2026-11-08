@@ -246,7 +246,7 @@ fun ChatDetailScreen(
     onStartVoiceRecording: () -> Unit = {},
     onToggleInChatDictation: () -> Unit = {
         if (viewModel != null) {
-            viewModel.toggleInChatDictation()
+            viewModel.toggleInternalDictation()
         } else {
             onStartVoiceRecording()
         }
@@ -445,9 +445,25 @@ fun ChatDetailScreen(
         }
     }
 
-    // Voice recognition is strictly decoupled from the bottom text input box:
-    // Both partial and final speech transcripts never populate inputText; finalized speech dispatches directly via sendMessage.
-    val isDictationScopedToComposer = false
+    // When manual in-chat voice dictation is active, mirror the live spoken transcript into the composer
+    // text field in real time so the user can see their words while speaking, and clear it once auto-sent.
+    val isDictationScopedToComposer = isInChatDictationActive
+    var wasInChatDictationActive by remember { mutableStateOf(false) }
+    LaunchedEffect(isInChatDictationActive, lastHeardText, draftSpokenText) {
+        if (isInChatDictationActive) {
+            wasInChatDictationActive = true
+            val liveTranscript = lastHeardText.trim().ifBlank { draftSpokenText.trim() }
+            if (liveTranscript.isNotBlank() && inputText.text != liveTranscript) {
+                inputText = TextFieldValue(
+                    text = liveTranscript,
+                    selection = androidx.compose.ui.text.TextRange(liveTranscript.length)
+                )
+            }
+        } else if (wasInChatDictationActive) {
+            wasInChatDictationActive = false
+            inputText = TextFieldValue("")
+        }
+    }
 
     val density = androidx.compose.ui.platform.LocalDensity.current
     val imeBottomPx = WindowInsets.ime.getBottom(density)
@@ -488,10 +504,13 @@ fun ChatDetailScreen(
                     }
                 },
                 title = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(start = 4.dp, end = 4.dp)
+                    ) {
                         Box(
                             modifier = Modifier
-                                .size(34.dp)
+                                .size(30.dp)
                                 .clip(RoundedCornerShape(8.dp))
                                 .background(accentColor.copy(alpha = 0.2f)),
                             contentAlignment = Alignment.Center
@@ -500,19 +519,21 @@ fun ChatDetailScreen(
                                 imageVector = getIconForName(chat.iconName),
                                 contentDescription = null,
                                 tint = accentColor,
-                                modifier = Modifier.size(20.dp)
+                                modifier = Modifier.size(18.dp)
                             )
                         }
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Column {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f, fill = false)) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text(
                                     text = chat.title,
                                     style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                                    maxLines = 1
+                                    maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f, fill = false)
                                 )
                                 // API Key Status Pill
-                                Spacer(modifier = Modifier.width(8.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
                                 Box(
                                     modifier = Modifier
                                         .clip(RoundedCornerShape(12.dp))
@@ -560,7 +581,7 @@ fun ChatDetailScreen(
                                 ) && !isSleepMode
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
                             ) {
                                 Text(
                                     text = buildString {
@@ -577,7 +598,9 @@ fun ChatDetailScreen(
                                     },
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.primary,
-                                    maxLines = 1
+                                    maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f, fill = false)
                                 )
                                 AnimatedVisibility(
                                     visible = isActivelyListeningForWake,
@@ -588,8 +611,8 @@ fun ChatDetailScreen(
                                         isListening = isActivelyListeningForWake,
                                         audioRmsDb = audioRmsDb,
                                         barCount = 7,
-                                        waveformWidth = 34.dp,
-                                        waveformHeight = 13.dp
+                                        waveformWidth = 30.dp,
+                                        waveformHeight = 12.dp
                                     )
                                 }
                             }
@@ -603,7 +626,7 @@ fun ChatDetailScreen(
                             isHandsFreeActive
                         ) && !isSleepMode
 
-                    // Prominent Hands-Free Radar Toggle Pill bound directly to audioRmsDb
+                    // Compact Hands-Free Radar Toggle Pill with start padding and max width so back arrow is unobstructed
                     com.example.ui.components.TopBarHandsFreeRadarPill(
                         isActive = isActivelyListeningInChat,
                         audioRmsDb = audioRmsDb,
@@ -615,7 +638,10 @@ fun ChatDetailScreen(
                                 onToggleHandsFree()
                             }
                         },
-                        testTagPrefix = "chat"
+                        testTagPrefix = "chat",
+                        modifier = Modifier
+                            .padding(start = 6.dp)
+                            .widthIn(max = 98.dp)
                     )
 
                     // Persistent Category Filter Toggle + Icon in Chat Interface Header
@@ -1041,14 +1067,14 @@ fun ChatDetailScreen(
                         viewModel = viewModel,
                         onStartVoiceRecording = {
                             if (viewModel != null) {
-                                viewModel.toggleInChatDictation()
+                                viewModel.toggleInternalDictation()
                             } else {
                                 onToggleInChatDictation()
                             }
                         },
                         onToggleInChatDictation = {
                             if (viewModel != null) {
-                                viewModel.toggleInChatDictation()
+                                viewModel.toggleInternalDictation()
                             } else {
                                 onToggleInChatDictation()
                             }
@@ -1491,14 +1517,14 @@ fun ChatDetailScreen(
                     viewModel = viewModel,
                     onStartVoiceRecording = {
                         if (viewModel != null) {
-                            viewModel.toggleInChatDictation()
+                            viewModel.toggleInternalDictation()
                         } else {
                             onToggleInChatDictation()
                         }
                     },
                     onToggleInChatDictation = {
                         if (viewModel != null) {
-                            viewModel.toggleInChatDictation()
+                            viewModel.toggleInternalDictation()
                         } else {
                             onToggleInChatDictation()
                         }
@@ -2168,7 +2194,7 @@ fun ChatBottomInputBar(
     onStartVoiceRecording: () -> Unit = {},
     onToggleInChatDictation: () -> Unit = {
         if (viewModel != null) {
-            viewModel.toggleInChatDictation()
+            viewModel.toggleInternalDictation()
         } else {
             onStartVoiceRecording()
         }
@@ -2503,18 +2529,19 @@ fun ChatBottomInputBar(
             }
 
             // Combined Input & Voice Bar
-            Box(
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 10.dp, vertical = 8.dp)
+                    .padding(horizontal = 10.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                if (isVoiceRecording) {
-                    // COMPACT RECORDING ROW
+                if (isVoiceRecording || isInChatDictationActive) {
+                    // COMPACT LIVE RECORDING BANNER (Shown above composer when in-chat dictation is active so composer text field remains visible)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(48.dp)
-                            .clip(RoundedCornerShape(24.dp))
+                            .height(44.dp)
+                            .clip(RoundedCornerShape(22.dp))
                             .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.9f))
                             .padding(horizontal = 4.dp),
                         verticalAlignment = Alignment.CenterVertically
@@ -2522,7 +2549,7 @@ fun ChatBottomInputBar(
                         IconButton(
                             onClick = onCancelVoiceRecording,
                             modifier = Modifier
-                                .size(40.dp)
+                                .size(36.dp)
                                 .clip(CircleShape)
                                 .background(MaterialTheme.colorScheme.errorContainer)
                                 .testTag("cancel_voice_button")
@@ -2535,7 +2562,7 @@ fun ChatBottomInputBar(
                             isListening = true,
                             audioRmsDb = audioRmsDb,
                             modifier = Modifier.weight(1f).padding(horizontal = 12.dp),
-                            height = 28.dp,
+                            height = 24.dp,
                             barCount = 14
                         )
 
@@ -2543,7 +2570,7 @@ fun ChatBottomInputBar(
                             onClick = onSendVoiceRecording,
                             enabled = !isSending,
                             modifier = Modifier
-                                .size(40.dp)
+                                .size(36.dp)
                                 .clip(CircleShape)
                                 .background(MaterialTheme.colorScheme.primary)
                                 .testTag("send_voice_button")
@@ -2551,8 +2578,10 @@ fun ChatBottomInputBar(
                             Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.onPrimary, modifier = Modifier.size(18.dp))
                         }
                     }
-                } else {
-                    // STANDARD INPUT ROW
+                }
+
+                if (!isVoiceRecording || isInChatDictationActive) {
+                    // STANDARD INPUT ROW (Always stays visible during manual in-chat dictation so live transcript populates in real time)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically
@@ -2657,7 +2686,7 @@ fun ChatBottomInputBar(
                         IconButton(
                             onClick = {
                                 if (viewModel != null) {
-                                    viewModel.toggleInChatDictation()
+                                    viewModel.toggleInternalDictation()
                                 } else {
                                     onToggleInChatDictation()
                                 }

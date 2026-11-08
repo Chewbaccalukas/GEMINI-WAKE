@@ -1,6 +1,6 @@
 {
-  "summary":  "Implementation plan for isolating Hands-Free Radar state from window focus loss, preventing Activity backgrounding on wake-word/voice command dispatch via a centralized VoiceCommandDispatcher, and automatically re-arming speech listening after command completion.",
-  "updatedAt":  "2026-11-08T03:01:38.310457899Z",
+  "summary":  "Implementation plan for the 4 critical Samsung One UI lifecycle, audio, UI overlap, and chat spinner fixes:\n1. 1500ms Window Focus Debounce & Transient Focus Preservation in SpeechRecognitionCoordinator, WakeWordManager, MainViewModel, and MainActivity.\n2. Pure Internal Dictation (viewModel.toggleInternalDictation()) for the Chat Mic Button with zero external Intent or startActivity calls.\n3. Compact TopBarHandsFreeRadarPill with reduced max width, smaller icon, and start padding so the navigation back button is never obstructed.\n4. Fix self-cancelling activeGenerationJob in MainViewModel.sendMessage() and wrap Gemini API execution in a strict try/catch/finally block that prints errors directly to the chat thread and immediately resets isGenerating/isLoading to false.",
+  "updatedAt":  "2026-11-08T08:27:23.068189267Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

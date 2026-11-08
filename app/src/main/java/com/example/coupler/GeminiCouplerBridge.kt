@@ -343,15 +343,15 @@ object GeminiCouplerBridge {
     /**
      * Executes a complete force reset & clear on the ChromeBridgeSocketManager,
      * flushing client streams, packet ring buffers, and local cache directories,
-     * then re-binding to a fresh random ephemeral port and opening Chrome with the new link.
+     * then re-binding to a fresh random ephemeral port and passively staging the bridge payload.
      */
     fun resetAndReconnectChrome(context: Context, chat: ChatSession? = null, preserveCache: Boolean = false): Int {
         val newPort = ChromeBridgeSocketManager.forceResetAndClear(context, preserveCache)
         ChromeBridgeSocketManager.launchChromeBridge(context, chat)
         val msg = if (preserveCache) {
-            "Chrome Bridge reset (Cache Preserved)! Rebound to port $newPort"
+            "Chrome Bridge reset (Cache Preserved)! Staged on port $newPort"
         } else {
-            "Chrome Bridge reset & cache wiped! Rebound to port $newPort"
+            "Chrome Bridge reset & cache wiped! Staged on port $newPort"
         }
         Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
         return newPort

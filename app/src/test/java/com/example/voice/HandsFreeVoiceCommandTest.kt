@@ -1007,15 +1007,17 @@ class HandsFreeVoiceCommandTest {
         org.junit.Assert.assertNull(SpeechRecognitionCoordinator.extractMatchedWakeWordAndPrompt("open history"))
         org.junit.Assert.assertNull(SpeechRecognitionCoordinator.extractMatchedWakeWordAndPrompt("Hey Gemini, show history"))
 
-        // 3. Dispatching a voice history command immediately suspends SpeechRecognitionCoordinator & WakeWordVoiceService
-        //    and emits pendingVoiceNavigationRoute = "history" without populating pendingWakeQuery
+        // 3. Dispatching a voice history command immediately enters transient isProcessingCommand=true
+        //    (without setting isIntentionallyPaused=true) and emits pendingVoiceNavigationRoute = "history"
         val handled = viewModel.processSpeechRecognizerResults(listOf("open history"), isFinal = true)
         assertTrue(handled)
         assertEquals("history", viewModel.pendingVoiceNavigationRoute.value)
         assertTrue(viewModel.isNavigatingViaVoiceCommand.value)
-        assertTrue(viewModel.speechRecognitionCoordinator.isIntentionallyPaused)
+        assertFalse(viewModel.speechRecognitionCoordinator.isIntentionallyPaused)
         assertTrue(viewModel.speechRecognitionCoordinator.isProcessing)
-        assertTrue(WakeWordVoiceService.isIntentionallyPaused)
+        assertTrue(viewModel.speechRecognitionCoordinator.isProcessingCommand)
+        assertFalse(WakeWordVoiceService.isIntentionallyPaused)
+        assertTrue(WakeWordVoiceService.isProcessingCommand)
         org.junit.Assert.assertNull(viewModel.pendingWakeQuery.value)
 
         // 4. Consuming the pending route immediately resets pendingVoiceNavigationRoute to null so it cannot loop on resume
@@ -1041,10 +1043,12 @@ class HandsFreeVoiceCommandTest {
             .idleFor(java.time.Duration.ofMillis(250))
 
         assertFalse(viewModel.isNavigatingViaVoiceCommand.value)
+        assertFalse(viewModel.speechRecognitionCoordinator.isProcessingCommand)
         assertFalse(WakeWordVoiceService.isIntentionallyPaused)
+        assertFalse(WakeWordVoiceService.isProcessingCommand)
         assertTrue(viewModel.wakeWordLogs.value.any { it.wakeWord.contains("VOICE_NAV_MUTEX_RESUMED") })
 
-        viewModel.wakeWordManager.destroy()
+        viewModel.cleanShutdown(null)
         org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
     }
 
@@ -1053,8 +1057,11 @@ class HandsFreeVoiceCommandTest {
         val app = ApplicationProvider.getApplicationContext<android.app.Application>()
         val viewModel = com.example.ui.MainViewModel(app)
         viewModel.setPermissionGrantedOverrideForTest(true)
+        if (viewModel.isHandsFreeActive.value) {
+            viewModel.toggleHandsFreeVoice(false)
+        }
 
-        // 1. Verify Window Focus Guard blocks startListening() and AudioRecord.startRecording() when unfocused
+        // 1. Verify Window Focus Guard blocks startListening() and AudioRecord.startRecording() when unfocused and hands-free is OFF
         viewModel.onWindowFocusChanged(false)
         assertFalse(viewModel.hasWindowFocus.value)
         assertFalse(viewModel.speechRecognitionCoordinator.isWindowFocused)
@@ -1101,7 +1108,7 @@ class HandsFreeVoiceCommandTest {
         org.junit.Assert.assertNull(viewModel.pendingWakeQuery.value)
         org.junit.Assert.assertNull(viewModel.wakeConversationSummary.value)
 
-        viewModel.wakeWordManager.destroy()
+        viewModel.cleanShutdown(null)
         org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
     }
 
@@ -1259,4 +1266,402 @@ class HandsFreeVoiceCommandTest {
         viewModel.cleanShutdown(null)
         org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
     }
+
+    @Test
+    fun testIsolateHandsFreeFromFocusLoss_VoiceCommandDispatcher_andAutoRearm() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val viewModel = com.example.ui.MainViewModel(app)
+        viewModel.setPermissionGrantedOverrideForTest(true)
+        AudioCommandSanitizer.resetHapticDiagnosticsForTest()
+
+        // Enable Hands-Free Radar
+        viewModel.toggleHandsFreeVoice(true)
+        assertTrue(viewModel.isHandsFreeActive.value)
+        assertFalse(viewModel.speechRecognitionCoordinator.isIntentionallyPaused)
+
+        // 1. Focus loss / pause / background transitions must NEVER set handsFreeMode = false,
+        //    emit RADAR_TOGGLE_OFF, or set isIntentionallyPaused = true
+        AudioCommandSanitizer.resetHapticDiagnosticsForTest()
+        viewModel.onWindowFocusChanged(false)
+        viewModel.onAppPaused()
+        viewModel.onAppBackgrounded()
+        assertTrue("Hands-Free Radar must remain TRUE across focus loss & backgrounding", viewModel.isHandsFreeActive.value)
+        assertFalse("isIntentionallyPaused must remain FALSE when handsFreeMode is active", viewModel.speechRecognitionCoordinator.isIntentionallyPaused)
+        assertFalse(
+            "RADAR_TOGGLE_OFF must never be emitted on focus loss or backgrounding",
+            AudioCommandSanitizer.getRecentHapticEvents().any { it.contains("RADAR_TOGGLE_OFF") }
+        )
+
+        viewModel.onAppForegrounded()
+        viewModel.onWindowFocusChanged(true)
+        assertTrue(viewModel.isHandsFreeActive.value)
+        assertFalse(viewModel.speechRecognitionCoordinator.isIntentionallyPaused)
+
+        // 2. VoiceCommandDispatcher internal screen navigation ("Hey Gemini, open settings")
+        //    must route internally without setting isIntentionallyPaused = true or disabling handsFreeMode
+        val navSettingsHandled = viewModel.processSpeechRecognizerResults(
+            listOf("Hey Gemini, open settings"),
+            isFinal = true
+        )
+        assertTrue(navSettingsHandled)
+        assertEquals("settings", viewModel.pendingVoiceNavigationRoute.value)
+        assertTrue(viewModel.isHandsFreeActive.value)
+        assertFalse(viewModel.speechRecognitionCoordinator.isIntentionallyPaused)
+        assertTrue(viewModel.speechRecognitionCoordinator.isProcessingCommand)
+        assertFalse(viewModel.isUserVoiceTurn.value)
+
+        viewModel.consumePendingVoiceNavigationRoute()
+        viewModel.onVoiceNavigationDestinationCommitted("settings", settleDelayMs = 100L)
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper())
+            .idleFor(java.time.Duration.ofMillis(250))
+
+        // Verify re-armed after command completion
+        assertFalse(viewModel.speechRecognitionCoordinator.isProcessingCommand)
+        assertFalse(viewModel.speechRecognitionCoordinator.isIntentionallyPaused)
+        assertTrue(viewModel.isHandsFreeActive.value)
+
+        // 3. VoiceCommandDispatcher category filter switching ("filter by Work" and "show all categories")
+        val catHandled = viewModel.processSpeechRecognizerResults(
+            listOf("filter by Work"),
+            isFinal = true
+        )
+        assertTrue(catHandled)
+        assertEquals("Work", viewModel.selectedCategoryFilter.value)
+        assertEquals("home", viewModel.pendingVoiceNavigationRoute.value)
+        assertFalse(viewModel.speechRecognitionCoordinator.isProcessingCommand)
+        assertFalse(viewModel.speechRecognitionCoordinator.isIntentionallyPaused)
+        assertTrue(viewModel.isHandsFreeActive.value)
+
+        val clearCatHandled = viewModel.processSpeechRecognizerResults(
+            listOf("show all categories"),
+            isFinal = true
+        )
+        assertTrue(clearCatHandled)
+        org.junit.Assert.assertNull(viewModel.selectedCategoryFilter.value)
+        assertFalse(viewModel.speechRecognitionCoordinator.isProcessingCommand)
+        assertFalse(viewModel.speechRecognitionCoordinator.isIntentionallyPaused)
+
+        // 4. External URL opening passively stages URL in transient isProcessingCommand state and re-arms without disabling radar or starting an external Activity
+        val shadowApp = org.robolectric.Shadows.shadowOf(app)
+        shadowApp.clearNextStartedActivities()
+        viewModel.openExternalUrlWithTransientGuard(app, "https://example.com")
+        assertTrue(viewModel.isHandsFreeActive.value)
+        assertFalse(viewModel.speechRecognitionCoordinator.isIntentionallyPaused)
+        assertFalse(viewModel.speechRecognitionCoordinator.isProcessingCommand)
+        org.junit.Assert.assertNull(
+            "openExternalUrlWithTransientGuard must passively stage URL and never call startActivity()",
+            shadowApp.nextStartedActivity
+        )
+
+        // 5. "open chat" voice command navigates internally via NavController route ("chat") without launching Chrome
+        val openChatHandled = viewModel.processSpeechRecognizerResults(
+            listOf("Hey Gemini, open chat"),
+            isFinal = true
+        )
+        assertTrue(openChatHandled)
+        assertEquals("chat", viewModel.pendingVoiceNavigationRoute.value)
+        assertTrue(viewModel.isHandsFreeActive.value)
+        org.junit.Assert.assertNull(
+            "Voice command 'open chat' must never launch an external Activity",
+            shadowApp.nextStartedActivity
+        )
+        viewModel.consumePendingVoiceNavigationRoute()
+        viewModel.onVoiceNavigationDestinationCommitted("chat", settleDelayMs = 100L)
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper())
+            .idleFor(java.time.Duration.ofMillis(200))
+        assertFalse(viewModel.isNavigatingViaVoiceCommand.value)
+        assertTrue(viewModel.isHandsFreeActive.value)
+
+        // 6. Audio Focus Handling:
+        //    - Do NOT yield on AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK
+        //    - Yield on AUDIOFOCUS_LOSS and AUDIOFOCUS_LOSS_TRANSIENT
+        //    - Use a 500ms debounce before re-arming SpeechRecognizer on AUDIOFOCUS_GAIN
+        assertEquals(500L, SpeechRecognitionCoordinator.AUDIOFOCUS_GAIN_REARM_DEBOUNCE_MS)
+        assertEquals(500L, WakeWordManager.AUDIOFOCUS_GAIN_DEBOUNCE_MS)
+
+        viewModel.wakeWordManager.handleAudioFocusChange(android.media.AudioManager.AUDIOFOCUS_GAIN)
+        assertTrue(viewModel.wakeWordManager.hasAudioFocus.value)
+
+        // CAN_DUCK must NOT yield audio focus
+        viewModel.wakeWordManager.handleAudioFocusChange(android.media.AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK)
+        assertTrue(
+            "Audio focus must NOT be yielded on AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK",
+            viewModel.wakeWordManager.hasAudioFocus.value
+        )
+        assertTrue(
+            viewModel.speechRecognitionCoordinator.traceHistory.value.any {
+                it.contains("stage=AUDIOFOCUS_CAN_DUCK_IGNORED")
+            }
+        )
+
+        // AUDIOFOCUS_LOSS_TRANSIENT must yield audio focus
+        viewModel.wakeWordManager.handleAudioFocusChange(android.media.AudioManager.AUDIOFOCUS_LOSS_TRANSIENT)
+        assertFalse(viewModel.wakeWordManager.hasAudioFocus.value)
+        assertTrue(
+            viewModel.speechRecognitionCoordinator.traceHistory.value.any {
+                it.contains("stage=AUDIOFOCUS_YIELD")
+            }
+        )
+
+        // AUDIOFOCUS_GAIN must queue a 500ms debounced re-arm of SpeechRecognizer
+        viewModel.wakeWordManager.handleAudioFocusChange(android.media.AudioManager.AUDIOFOCUS_GAIN)
+        assertTrue(viewModel.wakeWordManager.hasAudioFocus.value)
+        assertTrue(viewModel.speechRecognitionCoordinator.hasPendingRestart)
+        assertTrue(
+            viewModel.speechRecognitionCoordinator.traceHistory.value.any {
+                it.contains("stage=AUDIOFOCUS_GAIN_REARM_QUEUED") && it.contains("debounceMs=500")
+            }
+        )
+
+        viewModel.cleanShutdown(null)
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+    }
+
+    @Test
+    fun testCloudBackupVaultRestoreAndLocalOnlyDeletionDecoupling() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val db = androidx.room.Room.inMemoryDatabaseBuilder(
+            app,
+            com.example.data.db.AppDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val chatRepo = com.example.data.repository.ChatRepository(db.chatDao(), db.messageDao())
+        val messageRepo = com.example.data.repository.MessageRepository(db.messageDao(), db.chatDao())
+        val wakeRepo = com.example.data.repository.WakeWordRepository(db.wakeWordDao())
+        val viewModel = com.example.ui.MainViewModel(app)
+
+        // 1. Verify FirestoreChatDoc with localChatId == 0L and non-numeric id resolves a deterministic positive ID
+        val cloudDoc = com.example.data.firebase.FirestoreChatDoc(
+            id = "cloud_backup_alpha_99",
+            userId = "user_123",
+            localChatId = 0L,
+            title = "Restored Cloud Architecture Chat",
+            wakeWord = "Hey Cloud",
+            systemInstruction = "Cloud backup assistant"
+        )
+        val mappedSession = cloudDoc.toChatSession()
+        assertTrue("Mapped ChatSession ID must be positive even when localChatId is 0", mappedSession.id > 0L)
+
+        val cloudMsgDoc = com.example.data.firebase.FirestoreMessageDoc(
+            id = "msg_cloud_1",
+            userId = "user_123",
+            localMessageId = 501L,
+            localChatId = mappedSession.id,
+            sender = "user",
+            content = "Restore my cloud architecture notes",
+            messageTimestamp = 1730000010000L
+        )
+        viewModel.seedCloudBackupStateForTest(
+            chats = listOf(cloudDoc),
+            messages = listOf(cloudMsgDoc)
+        )
+        assertEquals(1, viewModel.cloudBackupChats.value.size)
+
+        kotlinx.coroutines.runBlocking {
+            // 2. Restore the cloud backup to the device and verify it is upserted into local Room DB and selected
+            val restoredId = viewModel.restoreChatFromCloudSuspend(
+                chatDoc = cloudDoc,
+                chatRepoOverride = chatRepo,
+                messageRepoOverride = messageRepo,
+                wakeRepoOverride = wakeRepo
+            )
+            assertTrue("Restored chat ID must be > 0", restoredId > 0L)
+            val localRoomChat = chatRepo.getChatByIdSync(restoredId)
+            org.junit.Assert.assertNotNull("Restored cloud chat must exist in local Room database", localRoomChat)
+            assertEquals("Restored Cloud Architecture Chat", localRoomChat?.title)
+            assertEquals(restoredId, viewModel.currentChatId.value)
+
+            val restoredMessages = chatRepo.getMessagesForChatSync(restoredId)
+            assertEquals(1, restoredMessages.size)
+            assertEquals("Restore my cloud architecture notes", restoredMessages.first().content)
+
+            // 3. Delete the chat locally -> must remove from local Room DB while cloudBackupChats remains intact
+            chatRepo.deleteChat(restoredId)
+            val afterLocalDelete = chatRepo.getChatByIdSync(restoredId)
+            org.junit.Assert.assertNull("Local deleteChat must remove the chat from local Room DB", afterLocalDelete)
+            assertEquals(
+                "Local delete must NOT remove the backup from Cloud Backup Vault",
+                1,
+                viewModel.cloudBackupChats.value.size
+            )
+
+            // 4. Verify deleteChatFromCloudSuspend removes the backup from Cloud Backup Vault
+            val cloudDeleted = viewModel.deleteChatFromCloudSuspend(cloudDoc)
+            assertTrue(cloudDeleted)
+            assertTrue("Cloud backup must be removed after deleteChatFromCloudSuspend", viewModel.cloudBackupChats.value.isEmpty())
+        }
+
+        db.close()
+        viewModel.cleanShutdown(null)
+    }
+
+    @Test
+    fun testInAppManualMicAutoSendAndSingleTapPermissionCallback() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val shadowApp = org.robolectric.Shadows.shadowOf(app)
+        shadowApp.clearNextStartedActivities()
+
+        val viewModel = com.example.ui.MainViewModel(app)
+        var simulatedClockMs = 50_000L
+        viewModel.handsFreeToggleClockMs = { simulatedClockMs }
+        viewModel.resetHandsFreeToggleDebounceForTest()
+
+        // 1. Start with microphone permission DENIED and hands-free OFF
+        if (viewModel.isHandsFreeActive.value) {
+            viewModel.toggleHandsFreeVoice(false)
+            simulatedClockMs += 500L
+        }
+        viewModel.setPermissionGrantedOverrideForTest(false)
+        assertFalse(viewModel.hasRecordAudioPermission.value)
+
+        // User taps the Hands-Free Radar toggle once -> requests permission and sets pendingWakeStartAfterPermission
+        viewModel.toggleHandsFreeVoice(true)
+        assertTrue(viewModel.requiresAudioPermission.value)
+
+        // Simulate system permission dialog causing temporary window focus loss, then user taps "Allow"
+        viewModel.onWindowFocusChanged(false)
+        viewModel.setPermissionGrantedOverrideForTest(true)
+        viewModel.onAudioPermissionResult(true)
+
+        // Verify that granting permission on the FIRST tap immediately enables handsFreeActive and restores window focus
+        assertTrue("Window focus must be restored upon permission grant", viewModel.hasWindowFocus.value)
+        assertTrue("Hands-Free Radar must activate on the first tap once permission is granted", viewModel.isHandsFreeActive.value)
+        assertFalse(viewModel.speechRecognitionCoordinator.isIntentionallyPaused)
+
+        // 2. Verify Manual In-Chat Mic Button uses internal speechRecognitionCoordinator (no external Activity intent)
+        //    updates live partial transcript, and auto-sends on final speech result
+        val startedDictation = viewModel.toggleInChatDictation()
+        assertTrue("Manual mic button must start in-chat dictation in-app", startedDictation)
+        assertTrue(viewModel.isInChatDictationActive.value)
+        org.junit.Assert.assertNull(
+            "Manual mic button must never launch an external RecognizerIntent Activity",
+            shadowApp.nextStartedActivity
+        )
+
+        // Partial results update wakeWordManager.lastHeardText in real time for the composer text field
+        val partialBundle = android.os.Bundle().apply {
+            putStringArrayList(
+                android.speech.SpeechRecognizer.RESULTS_RECOGNITION,
+                arrayListOf("Drafting architecture")
+            )
+        }
+        viewModel.wakeRecognitionListener.onPartialResults(partialBundle)
+        assertEquals("Drafting architecture", viewModel.wakeWordManager.lastHeardText.value)
+        assertEquals("", viewModel.currentDraftText.value)
+
+        // Final results auto-send the recognized utterance and end in-chat dictation
+        val finalBundle = android.os.Bundle().apply {
+            putStringArrayList(
+                android.speech.SpeechRecognizer.RESULTS_RECOGNITION,
+                arrayListOf("Drafting architecture summary now")
+            )
+        }
+        viewModel.wakeRecognitionListener.onResults(finalBundle)
+        assertFalse("In-chat dictation must finish and auto-send when utterance completes", viewModel.isInChatDictationActive.value)
+        assertEquals("Drafting architecture summary now", viewModel.lastDispatchedVoicePrompt.value)
+
+        simulatedClockMs += 500L
+        viewModel.toggleHandsFreeVoice(false)
+        WakeWordVoiceService.resumeMicrophoneAfterCommandNavigation(app)
+        viewModel.selectChat(null)
+        viewModel.cleanShutdown(null)
+    }
+
+    @Test
+    fun testWindowFocus1500msDebounce_toggleInternalDictation_andSendMessageErrorRecovery() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val shadowApp = org.robolectric.Shadows.shadowOf(app)
+        shadowApp.clearNextStartedActivities()
+
+        val viewModel = com.example.ui.MainViewModel(app)
+        viewModel.setPermissionGrantedOverrideForTest(true)
+        viewModel.onWindowFocusChanged(true)
+
+        // 1. Verify 1500ms windowFocus debounce constant and transient focus loss behavior
+        assertEquals(1500L, SpeechRecognitionCoordinator.WINDOW_FOCUS_DEBOUNCE_MS)
+        assertEquals(1500L, WakeWordManager.WINDOW_FOCUS_DEBOUNCE_MS)
+
+        val initialRecreations = viewModel.speechRecognitionCoordinator.recognizerRecreationCount
+        viewModel.onWindowFocusChanged(false)
+        // Simulate transient notification shade pull-down (< 1500ms) followed by focus restoration
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper())
+            .idleFor(java.time.Duration.ofMillis(400))
+        viewModel.onWindowFocusChanged(true)
+        assertEquals(
+            "Transient windowFocus loss (< 1500ms) must NEVER recreate SpeechRecognizer",
+            initialRecreations,
+            viewModel.speechRecognitionCoordinator.recognizerRecreationCount
+        )
+
+        // 2. Verify toggleInternalDictation() uses internal coordinator and never launches an external Activity or Service Intent
+        shadowApp.clearNextStartedActivities()
+        val started = viewModel.toggleInternalDictation()
+        assertTrue(started)
+        assertTrue(viewModel.isInChatDictationActive.value)
+        org.junit.Assert.assertNull(
+            "toggleInternalDictation() must never launch an external Activity",
+            shadowApp.nextStartedActivity
+        )
+        val stopped = viewModel.toggleInternalDictation()
+        assertFalse(stopped)
+        assertFalse(viewModel.isInChatDictationActive.value)
+
+        // 3. Verify sendMessage() catches Gemini API errors, prints error message into chat, and immediately sets isGenerating = false
+        viewModel.geminiServiceOverrideForTest = object : com.example.ai.GeminiService() {
+            override fun streamChatResponse(
+                context: android.content.Context?,
+                systemInstruction: String,
+                history: List<com.example.data.model.ChatMessage>,
+                userPrompt: String,
+                userAudioBytes: ByteArray?,
+                attachmentBytes: ByteArray?,
+                attachmentMimeType: String?,
+                requestAudio: Boolean,
+                onAudioChunk: ((ByteArray) -> Unit)?
+            ): kotlinx.coroutines.flow.Flow<String> = kotlinx.coroutines.flow.flow {
+                throw IllegalStateException("Simulated Gemini API network failure")
+            }
+        }
+
+        val chatId = kotlinx.coroutines.runBlocking {
+            viewModel.repository.saveChat(
+                com.example.data.model.ChatSession(
+                    title = "Spinner Recovery Test Chat",
+                    wakeWord = "SpinnerTest",
+                    systemInstruction = "Test assistant"
+                )
+            )
+        }
+        viewModel.selectChat(chatId)
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        viewModel.sendMessage(chatId = chatId, text = "Hello typed message", triggeredByWakeWord = false)
+
+        val deadline = System.currentTimeMillis() + 3000L
+        while (viewModel.isGenerating.value && System.currentTimeMillis() < deadline) {
+            org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            Thread.sleep(20)
+        }
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+
+        assertFalse(
+            "sendMessage() must immediately reset isGenerating = false when API throws",
+            viewModel.isGenerating.value
+        )
+        assertTrue(
+            "sendMessage() must populate errorMessage on API failure",
+            viewModel.errorMessage.value?.contains("Simulated Gemini API network failure") == true
+        )
+        val chatMessages = kotlinx.coroutines.runBlocking {
+            viewModel.messageRepository.getMessagesForChatSync(chatId)
+        }
+        assertTrue(
+            "sendMessage() must print the caught error directly into the chat thread",
+            chatMessages.any { it.sender == "gemini" && it.content.contains("⚠️ Error: Simulated Gemini API network failure") }
+        )
+
+        viewModel.geminiServiceOverrideForTest = null
+        viewModel.selectChat(null)
+        viewModel.cleanShutdown(null)
+    }
 }
+

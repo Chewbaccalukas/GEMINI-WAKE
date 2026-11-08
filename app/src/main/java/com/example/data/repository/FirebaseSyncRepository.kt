@@ -355,4 +355,136 @@ class FirebaseSyncRepository(
             throw handleFirestoreError(e, OperationType.DELETE, path)
         }
     }
+
+    // =========================================================================
+    // Explicit Cloud Backup Vault Operations (Restore to Device & Delete from Cloud)
+    // =========================================================================
+
+    data class CloudChatBackupBundle(
+        val chatDoc: FirestoreChatDoc,
+        val messages: List<FirestoreMessageDoc>,
+        val wakeWords: List<FirestoreWakeWordDoc>
+    )
+
+    /**
+     * Fetches the chat document, all associated messages, and wake words from Firestore
+     * so they can be explicitly restored into the local Room database on user demand.
+     */
+    suspend fun fetchChatBackupBundle(
+        userId: String,
+        chatDoc: FirestoreChatDoc
+    ): CloudChatBackupBundle {
+        val resolvedSession = chatDoc.toChatSession()
+        val targetLocalChatId = if (chatDoc.localChatId > 0L) chatDoc.localChatId else resolvedSession.id
+        val docId = chatDoc.id.ifBlank { FirestoreChatDoc.docIdForChat(targetLocalChatId) }
+
+        val latestChatDoc = runCatching { getChat(userId, docId) }.getOrNull() ?: chatDoc
+
+        val messages = mutableListOf<FirestoreMessageDoc>()
+        if (targetLocalChatId > 0L) {
+            val userMessagesPath = messagesPath(userId)
+            val queriedMessages = try {
+                firestore.collection(userMessagesPath)
+                    .whereEqualTo("localChatId", targetLocalChatId)
+                    .get()
+                    .await()
+                    .toObjects<FirestoreMessageDoc>()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                handleFirestoreError(e, OperationType.LIST, userMessagesPath)
+                emptyList()
+            }
+            messages.addAll(queriedMessages)
+        }
+
+        val wakeWords = mutableListOf<FirestoreWakeWordDoc>()
+        if (targetLocalChatId > 0L) {
+            val userWakePath = wakeWordsPath(userId)
+            val queriedWakeWords = try {
+                firestore.collection(userWakePath)
+                    .whereEqualTo("chatId", targetLocalChatId)
+                    .get()
+                    .await()
+                    .toObjects<FirestoreWakeWordDoc>()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                handleFirestoreError(e, OperationType.LIST, userWakePath)
+                emptyList()
+            }
+            wakeWords.addAll(queriedWakeWords)
+        }
+
+        return CloudChatBackupBundle(
+            chatDoc = latestChatDoc,
+            messages = messages.distinctBy { it.id.ifBlank { "${it.localMessageId}_${it.messageTimestamp}" } }
+                .sortedBy { it.messageTimestamp },
+            wakeWords = wakeWords.distinctBy { it.id.ifBlank { it.phrase.lowercase() } }
+        )
+    }
+
+    /**
+     * Permanently deletes the user-scoped chat document, its associated messages,
+     * and associated wake words from Cloud Firestore when the user confirms "Delete from Cloud".
+     */
+    suspend fun deleteChatBackupFromCloud(
+        userId: String,
+        chatDoc: FirestoreChatDoc,
+        cachedMessagesForChat: List<FirestoreMessageDoc> = emptyList(),
+        cachedWakeWordsForChat: List<FirestoreWakeWordDoc> = emptyList()
+    ) {
+        val resolvedSession = chatDoc.toChatSession()
+        val targetLocalChatId = if (chatDoc.localChatId > 0L) chatDoc.localChatId else resolvedSession.id
+        val primaryDocId = chatDoc.id.ifBlank { FirestoreChatDoc.docIdForChat(targetLocalChatId) }
+        val fallbackDocId = if (targetLocalChatId > 0L) FirestoreChatDoc.docIdForChat(targetLocalChatId) else ""
+
+        // 1. Delete associated messages from /users/{userId}/messages
+        val messageDocIdsToDelete = mutableSetOf<String>()
+        cachedMessagesForChat.mapNotNullTo(messageDocIdsToDelete) {
+            it.id.ifBlank { FirestoreMessageDoc.docIdForMessage(it.localMessageId) }.takeIf { id -> id.isNotBlank() }
+        }
+        if (targetLocalChatId > 0L) {
+            runCatching {
+                val msgSnapshot = firestore.collection(messagesPath(userId))
+                    .whereEqualTo("localChatId", targetLocalChatId)
+                    .get()
+                    .await()
+                for (doc in msgSnapshot.documents) {
+                    messageDocIdsToDelete.add(doc.id)
+                }
+            }
+        }
+        for (msgDocId in messageDocIdsToDelete) {
+            runCatching { deleteMessageByDocId(userId, msgDocId) }
+        }
+
+        // 2. Delete associated wake words from /users/{userId}/wake_words
+        val wakeDocIdsToDelete = mutableSetOf<String>()
+        cachedWakeWordsForChat.mapNotNullTo(wakeDocIdsToDelete) {
+            it.id.ifBlank { FirestoreWakeWordDoc.docIdForWakeWord(it.localWakeWordId) }.takeIf { id -> id.isNotBlank() }
+        }
+        if (targetLocalChatId > 0L) {
+            runCatching {
+                val wakeSnapshot = firestore.collection(wakeWordsPath(userId))
+                    .whereEqualTo("chatId", targetLocalChatId)
+                    .get()
+                    .await()
+                for (doc in wakeSnapshot.documents) {
+                    wakeDocIdsToDelete.add(doc.id)
+                }
+            }
+        }
+        for (wakeDocId in wakeDocIdsToDelete) {
+            runCatching { deleteWakeWordByDocId(userId, wakeDocId) }
+        }
+
+        // 3. Delete the user-scoped chat document itself (/users/{userId}/chats/{docId})
+        if (primaryDocId.isNotBlank()) {
+            deleteChatByDocId(userId, primaryDocId)
+        }
+        if (fallbackDocId.isNotBlank() && fallbackDocId != primaryDocId) {
+            runCatching { deleteChatByDocId(userId, fallbackDocId) }
+        }
+    }
 }

@@ -89,11 +89,21 @@ class WebLinkHistoryAndBrowserTest {
     }
 
     @Test
-    fun createExternalBrowserIntent_buildsBrowsableActionViewIntent() {
-        val intent = WebLinkHistoryManager.createExternalBrowserIntent("https://developer.android.com")
-        assertEquals(Intent.ACTION_VIEW, intent.action)
-        assertTrue(intent.categories.contains(Intent.CATEGORY_BROWSABLE))
-        assertEquals("https://developer.android.com", intent.dataString)
+    fun openUrlInDefaultBrowser_passivelyStagesUrlInChromeBridgeWithoutStartingActivity() {
+        val app = context as android.app.Application
+        val shadowApp = org.robolectric.Shadows.shadowOf(app)
+        shadowApp.clearNextStartedActivities()
+
+        val staged = WebLinkHistoryManager.openUrlInDefaultBrowser(context, "developer.android.com/compose")
+        assertTrue(staged)
+        assertEquals(
+            "https://developer.android.com/compose",
+            com.example.coupler.ChromeBridgeSocketManager.bridgeState.value.stagedUrlPayload
+        )
+        org.junit.Assert.assertNull(
+            "openUrlInDefaultBrowser must NEVER call startActivity() or launch Chrome externally",
+            shadowApp.nextStartedActivity
+        )
     }
 
     @Test

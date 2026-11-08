@@ -1,9 +1,7 @@
 package com.example.bridge
 
 import android.content.Context
-import android.content.Intent
-import android.net.Uri
-import androidx.core.content.FileProvider
+import com.example.coupler.ChromeBridgeSocketManager
 import com.example.data.model.ChatMessage
 import com.example.data.model.ChatSession
 import org.json.JSONArray
@@ -415,35 +413,35 @@ class ChromeAppBridge(private val context: Context) {
     }
 
     /**
-     * Launches the companion HTML in Google Chrome (or default browser).
+     * Passively stages the companion HTML and JSON payload in the local bridge cache and
+     * [ChromeBridgeSocketManager] socket buffer without launching any external browser activity.
+     */
+    fun stageChatForChrome(
+        chat: ChatSession,
+        messages: List<ChatMessage>,
+        stagedUrl: String? = null
+    ): File {
+        val htmlFile = generateChromeCompanionHtml(chat, messages)
+        val jsonPayload = createBridgePayload(chat, messages)
+        val bridgeDir = File(context.cacheDir, "chrome_bridge").apply {
+            if (!exists()) mkdirs()
+        }
+        File(bridgeDir, "gemini_chrome_bridge_${chat.id}.json").writeText(jsonPayload)
+        ChromeBridgeSocketManager.stageChatAndUrlPayload(
+            context = context,
+            chatSession = chat,
+            messages = messages,
+            urlPayload = stagedUrl,
+            bridgeJsonPayload = jsonPayload
+        )
+        return htmlFile
+    }
+
+    /**
+     * Passively stages the companion HTML and JSON payload in the local Chrome Bridge buffer.
+     * Never fires Intent(Intent.ACTION_VIEW) or startActivity().
      */
     fun openChatInChrome(chat: ChatSession, messages: List<ChatMessage>) {
-        val file = generateChromeCompanionHtml(chat, messages)
-        val uri: Uri = FileProvider.getUriForFile(
-            context,
-            "${context.packageName}.fileprovider",
-            file
-        )
-
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "text/html")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            // Attempt targeting Google Chrome specifically if installed
-            setPackage("com.android.chrome")
-        }
-
-        try {
-            context.startActivity(intent)
-        } catch (e: Exception) {
-            val genericIntent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "text/html")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            context.startActivity(Intent.createChooser(genericIntent, "Open Preloaded Chat in Browser").apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            })
-        }
+        stageChatForChrome(chat, messages)
     }
 }

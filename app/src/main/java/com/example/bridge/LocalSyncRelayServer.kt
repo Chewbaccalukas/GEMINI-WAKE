@@ -35,7 +35,11 @@ data class RelayServerState(
     val deduplicatedTurnCount: Int = 0,
     val lastSyncTimestamp: Long = 0L,
     val connectedClientsCount: Int = 0,
-    val statusText: String = "Stopped"
+    val statusText: String = "Stopped",
+    val stagedChatId: Long = 0L,
+    val stagedChatTitle: String = "",
+    val stagedUrlPayload: String = "",
+    val stagedMessageCount: Int = 0
 )
 
 /**
@@ -47,6 +51,8 @@ data class RelayServerState(
  *   or `?token=` query parameter).
  * - Deduplicates incoming and outgoing turns using a thread-safe [ConcurrentHashMap] timestamp
  *   cache (`turnDeduplicationCache`) to prevent echo loops between Chrome and Android.
+ * - Passively stages chat sessions, messages, and URL payloads in memory so Chrome clients
+ *   can query `127.0.0.1:8765/sync` on demand without the app ever launching Chrome externally.
  */
 class LocalSyncRelayServer(
     private val scope: CoroutineScope,
@@ -91,8 +97,78 @@ class LocalSyncRelayServer(
 
     private var activeChatProvider: (() -> Pair<ChatSession?, List<ChatMessage>>)? = null
 
+    @Volatile
+    var stagedChatSession: ChatSession? = null
+        private set
+
+    @Volatile
+    var stagedMessages: List<ChatMessage> = emptyList()
+        private set
+
+    @Volatile
+    var stagedUrlPayload: String = ""
+        private set
+
+    @Volatile
+    var stagedTimestampMs: Long = 0L
+        private set
+
     fun setChatDataProvider(provider: () -> Pair<ChatSession?, List<ChatMessage>>) {
         this.activeChatProvider = provider
+    }
+
+    /**
+     * Passively stages chat data and URL payload inside the local relay buffer on `127.0.0.1:8765`.
+     * When the user manually opens Chrome later, the Chrome extension/client queries `/sync` or `/staged`
+     * and hydrates the page on demand.
+     */
+    fun stageChatAndUrlPayload(
+        chat: ChatSession?,
+        messages: List<ChatMessage> = emptyList(),
+        stagedUrl: String? = null
+    ) {
+        if (chat != null) {
+            stagedChatSession = chat
+        }
+        if (messages.isNotEmpty() || chat != null) {
+            stagedMessages = messages
+        }
+        val activeChat = stagedChatSession
+        val activeMessages = stagedMessages
+        val resolvedUrl = when {
+            !stagedUrl.isNullOrBlank() -> stagedUrl
+            stagedUrlPayload.isNotBlank() && chat == null -> stagedUrlPayload
+            activeChat != null -> "http://$LOOPBACK_HOST:${_serverState.value.port}/sync?token=$sessionToken&chatId=${activeChat.id}"
+            else -> "http://$LOOPBACK_HOST:${_serverState.value.port}/sync?token=$sessionToken"
+        }
+        stagedUrlPayload = resolvedUrl
+        stagedTimestampMs = System.currentTimeMillis()
+
+        _serverState.value = _serverState.value.copy(
+            stagedChatId = activeChat?.id ?: 0L,
+            stagedChatTitle = activeChat?.title ?: "",
+            stagedUrlPayload = resolvedUrl,
+            stagedMessageCount = activeMessages.size
+        )
+
+        if (sseClientStreams.isNotEmpty()) {
+            val eventPayload = JSONObject().apply {
+                put("chatId", activeChat?.id ?: 0L)
+                put("chatTitle", activeChat?.title ?: "Gemini Chat")
+                put("stagedUrl", resolvedUrl)
+                put("messageCount", activeMessages.size)
+                put("stagedAt", stagedTimestampMs)
+            }.toString()
+            val sseFrame = "event: staged\ndata: $eventPayload\n\n".toByteArray(Charsets.UTF_8)
+            for (stream in sseClientStreams) {
+                try {
+                    stream.write(sseFrame)
+                    stream.flush()
+                } catch (_: Exception) {
+                    sseClientStreams.remove(stream)
+                }
+            }
+        }
     }
 
     /**
@@ -245,13 +321,18 @@ class LocalSyncRelayServer(
                     reuseAddress = true
                 }
                 val boundPort = serverSocket?.localPort?.takeIf { it > 0 } ?: port
+                val prev = _serverState.value
                 _serverState.value = RelayServerState(
                     isRunning = true,
                     bindHost = LOOPBACK_HOST,
                     port = boundPort,
                     sessionToken = sessionToken,
-                    deduplicatedTurnCount = _serverState.value.deduplicatedTurnCount,
-                    statusText = "Relay Active ($LOOPBACK_HOST:$boundPort)"
+                    deduplicatedTurnCount = prev.deduplicatedTurnCount,
+                    statusText = "Relay Active ($LOOPBACK_HOST:$boundPort)",
+                    stagedChatId = prev.stagedChatId,
+                    stagedChatTitle = prev.stagedChatTitle,
+                    stagedUrlPayload = prev.stagedUrlPayload,
+                    stagedMessageCount = prev.stagedMessageCount
                 )
                 Log.d(TAG, "LocalSyncRelayServer started strictly on $LOOPBACK_HOST:$boundPort")
 
@@ -358,10 +439,14 @@ class LocalSyncRelayServer(
                         method == "GET" && pathOnly.startsWith("/events") -> {
                             handleSseStream(client)
                         }
-                        method == "GET" && (pathOnly.startsWith("/sync") || pathOnly.startsWith("/status")) -> {
+                        method == "GET" && (pathOnly.startsWith("/sync") || pathOnly.startsWith("/status") || pathOnly.startsWith("/staged")) -> {
                             val data = activeChatProvider?.invoke()
-                            val chat = data?.first
-                            val rawMessages = data?.second ?: emptyList()
+                            val chat = data?.first ?: stagedChatSession
+                            val rawMessages = if (data?.second?.isNotEmpty() == true) {
+                                data.second
+                            } else {
+                                stagedMessages
+                            }
 
                             // Deduplicate outgoing messages using ConcurrentHashMap timestamp cache
                             val seenTurnSignatures = HashSet<String>(rawMessages.size * 2)
@@ -374,9 +459,11 @@ class LocalSyncRelayServer(
                             val root = JSONObject().apply {
                                 put("bindHost", LOOPBACK_HOST)
                                 put("port", _serverState.value.port)
-                                put("chatId", chat?.id ?: 0L)
-                                put("chatTitle", chat?.title ?: "Gemini Chat")
+                                put("chatId", chat?.id ?: _serverState.value.stagedChatId)
+                                put("chatTitle", chat?.title ?: _serverState.value.stagedChatTitle.ifBlank { "Gemini Chat" })
                                 put("wakeWord", chat?.wakeWord ?: "Hey Gemini")
+                                put("stagedUrl", stagedUrlPayload)
+                                put("stagedAt", stagedTimestampMs)
                                 put("timestamp", System.currentTimeMillis())
 
                                 val msgArray = JSONArray()

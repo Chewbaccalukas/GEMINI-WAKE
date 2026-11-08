@@ -264,10 +264,18 @@ fun HomeScreen(
     availableCategories: List<String> = com.example.util.AppSettingsManager.DEFAULT_CHAT_CATEGORIES,
     onOpenBufferBridgeDialog: () -> Unit = {},
     onOpenSyncCompanionRelay: () -> Unit = {},
-    onClearChatThread: (Long) -> Unit = {}
+    onOpenCloudBackupVault: () -> Unit = {},
+    onClearChatThread: (Long) -> Unit = {},
+    externalSelectedCategoryFilter: String? = null,
+    onSelectCategoryFilter: ((String?) -> Unit)? = null
 ) {
     val context = LocalContext.current
-    var selectedCategoryFilter by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedCategoryFilter by rememberSaveable { mutableStateOf(externalSelectedCategoryFilter) }
+    androidx.compose.runtime.LaunchedEffect(externalSelectedCategoryFilter) {
+        if (onSelectCategoryFilter != null && selectedCategoryFilter != externalSelectedCategoryFilter) {
+            selectedCategoryFilter = externalSelectedCategoryFilter
+        }
+    }
     var selectedTagFilter by rememberSaveable { mutableStateOf<String?>(null) }
     var isSideCategoryBarCollapsed by rememberSaveable { mutableStateOf(true) }
     // Cloud Sync & Summary drawer is collapsed by default behind the top-bar icon
@@ -450,24 +458,16 @@ fun HomeScreen(
                             testTagPrefix = "home"
                         )
 
-                        // Collapsible Cloud Sync / Summary & Radar Drawer Toggle Icon
+                        // Cloud Backup & Restore Vault Top-Bar Icon
                         IconButton(
-                            onClick = { isCloudSummaryDrawerExpanded = !isCloudSummaryDrawerExpanded },
+                            onClick = onOpenCloudBackupVault,
                             modifier = Modifier.testTag("home_cloud_summary_drawer_toggle")
                         ) {
                             Box(contentAlignment = Alignment.TopEnd) {
                                 Icon(
                                     imageVector = Icons.Default.CloudDone,
-                                    contentDescription = if (isCloudSummaryDrawerExpanded) {
-                                        "Collapse Cloud Sync & Summary Drawer"
-                                    } else {
-                                        "Expand Cloud Sync & Summary Drawer"
-                                    },
-                                    tint = if (isCloudSummaryDrawerExpanded) {
-                                        MaterialTheme.colorScheme.primary
-                                    } else {
-                                        MaterialTheme.colorScheme.onSurfaceVariant
-                                    }
+                                    contentDescription = "Open Cloud Backup & Restore Vault",
+                                    tint = MaterialTheme.colorScheme.primary
                                 )
                                 Box(
                                     modifier = Modifier
@@ -574,10 +574,25 @@ fun HomeScreen(
                                     }
                                 )
                                 DropdownMenuItem(
-                                    text = { Text("Cloud Sync & Summary Drawer") },
+                                    text = { Text("Cloud Backup & Restore Vault") },
                                     leadingIcon = {
                                         Icon(
                                             Icons.Default.CloudDone,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
+                                    },
+                                    modifier = Modifier.testTag("home_menu_cloud_backup_vault"),
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onOpenCloudBackupVault()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Wake Radar & Analytics Drawer") },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.Hearing,
                                             contentDescription = null
                                         )
                                     },
@@ -1133,7 +1148,10 @@ fun HomeScreen(
             // Right-edge Collapsible Category Filter Chip Bar ('All', 'Work', 'Personal', 'Projects')
             com.example.ui.components.CollapsibleSideCategoryFilterBar(
                 selectedCategory = selectedCategoryFilter,
-                onSelectCategory = { selectedCategoryFilter = it },
+                onSelectCategory = {
+                    selectedCategoryFilter = it
+                    onSelectCategoryFilter?.invoke(it)
+                },
                 isCollapsed = isSideCategoryBarCollapsed,
                 onToggleCollapsed = { isSideCategoryBarCollapsed = !isSideCategoryBarCollapsed },
                 chats = chats,

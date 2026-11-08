@@ -298,7 +298,7 @@ fun FloatingMovableChatInput(
                         IconButton(
                             onClick = {
                                 if (viewModel != null) {
-                                    viewModel.toggleInChatDictation()
+                                    viewModel.toggleInternalDictation()
                                 } else {
                                     onToggleInChatDictation()
                                 }

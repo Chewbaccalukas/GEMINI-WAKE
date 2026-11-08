@@ -4,7 +4,7 @@ import com.example.data.model.ChatMessage
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 
-class GeminiService {
+open class GeminiService {
 
     private val apiService: GeminiApiService by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         GeminiApiService()
@@ -13,7 +13,7 @@ class GeminiService {
     /**
      * Streams responses from Gemini with support for Orion neural speech, graceful text fallback, and 429 failover.
      */
-    fun streamChatResponse(
+    open fun streamChatResponse(
         context: android.content.Context? = null,
         systemInstruction: String,
         history: List<ChatMessage>,
@@ -46,7 +46,7 @@ class GeminiService {
     /**
      * Transcribes captured audio bytes using Gemini transcription model.
      */
-    suspend fun transcribeAudioSnippet(
+    open suspend fun transcribeAudioSnippet(
         audioBytes: ByteArray,
         mimeType: String = "audio/pcm"
     ): String {

@@ -120,11 +120,13 @@ class WakeWordVoiceService : Service() {
         }
         when (focusChange) {
             AudioManager.AUDIOFOCUS_LOSS,
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
                 Log.d(TAG, "AudioFocus lost ($focusChange) — pausing background AudioRecord")
                 _hasExclusiveAudioFocus.value = false
                 onAudioFocusLostCallback?.invoke(focusChange)
+            }
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                Log.d(TAG, "Ignoring AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK in WakeWordVoiceService")
             }
             AudioManager.AUDIOFOCUS_GAIN,
             AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
@@ -249,20 +251,26 @@ class WakeWordVoiceService : Service() {
                 onBatterySaverResumeRequestedCallback?.invoke()
                 return START_STICKY
             }
-            ACTION_PAUSE_FOR_INPUT_FOCUS,
-            ACTION_PAUSE_FOR_COMMAND_DISPATCH -> {
+            ACTION_PAUSE_FOR_INPUT_FOCUS -> {
                 _isInputFocusPaused.value = true
                 setIntentionallyPaused(true)
                 releaseServiceMicrophoneRecord()
                 abandonExclusiveAudioFocus()
                 promoteToMicrophoneForeground()
-                if (intent.action == ACTION_PAUSE_FOR_INPUT_FOCUS) {
-                    onInputFocusPauseRequested?.invoke(true)
-                }
+                onInputFocusPauseRequested?.invoke(true)
+                return START_STICKY
+            }
+            ACTION_PAUSE_FOR_COMMAND_DISPATCH -> {
+                isProcessingCommand = true
+                _isInputFocusPaused.value = true
+                releaseServiceMicrophoneRecord()
+                abandonExclusiveAudioFocus()
+                promoteToMicrophoneForeground()
                 return START_STICKY
             }
             ACTION_RESUME_AFTER_INPUT_FOCUS,
             ACTION_RESUME_AFTER_COMMAND_DISPATCH -> {
+                isProcessingCommand = false
                 _isInputFocusPaused.value = false
                 if (!_isSleepModeGlobal.value && !_isBatterySaverPausedGlobal.value) {
                     setIntentionallyPaused(false)
@@ -553,7 +561,7 @@ class WakeWordVoiceService : Service() {
             )
         ) {
             AudioCommandSanitizer.playVoiceCommandHaptic(applicationContext, "Voice History Navigation (\"$cleanTranscript\")")
-            setIntentionallyPaused(true)
+            isProcessingCommand = true
             releaseServiceMicrophoneRecord()
             abandonExclusiveAudioFocus()
             onVoiceHistoryNavigationRequestedCallback?.invoke(cleanTranscript)
@@ -824,25 +832,55 @@ class WakeWordVoiceService : Service() {
         var isIntentionallyPaused: Boolean = false
             private set
 
+        @Volatile
+        var isProcessingCommand: Boolean = false
+            private set
+
         fun setIntentionallyPaused(paused: Boolean) {
             isIntentionallyPaused = paused
         }
 
         /**
-         * Immediately pauses the service's active microphone loop and releases its [AudioRecord]
-         * and audio focus before an in-app voice navigation command is dispatched.
+         * Pauses the service's microphone state purely in memory without creating or firing any Intent
+         * so in-chat dictation stays 100% internal to the app process.
+         */
+        fun pauseForInternalDictationInMemory() {
+            isProcessingCommand = true
+            isIntentionallyPaused = true
+            _isInputFocusPaused.value = true
+        }
+
+        /**
+         * Resumes the service's passive microphone state purely in memory after internal dictation finishes.
+         */
+        fun resumeAfterInternalDictationInMemory() {
+            isProcessingCommand = false
+            _isInputFocusPaused.value = false
+            if (!_isSleepModeGlobal.value && !_isBatterySaverPausedGlobal.value) {
+                isIntentionallyPaused = false
+            }
+        }
+
+        /**
+         * Enters transient `isProcessingCommand = true` state and releases the service's
+         * [AudioRecord] and audio focus before an in-app voice command or external Intent is
+         * dispatched, without setting `isIntentionallyPaused = true`.
          */
         fun pauseMicrophoneForCommandDispatch(context: Context) {
-            isIntentionallyPaused = true
+            isProcessingCommand = true
+            if (!_isSleepModeGlobal.value && !_isBatterySaverPausedGlobal.value) {
+                isIntentionallyPaused = false
+            }
             _isInputFocusPaused.value = true
             startServiceSafely(context, ACTION_PAUSE_FOR_COMMAND_DISPATCH)
         }
 
         /**
-         * Resumes the service's passive microphone state after an in-app voice navigation transition
-         * settles (unless Sleep Mode or Battery Saver pause is active).
+         * Resumes the service's passive microphone state after a voice command or navigation
+         * transition settles (unless Sleep Mode or Battery Saver pause is active).
          */
         fun resumeMicrophoneAfterCommandNavigation(context: Context) {
+            isProcessingCommand = false
             _isInputFocusPaused.value = false
             if (!_isSleepModeGlobal.value && !_isBatterySaverPausedGlobal.value) {
                 isIntentionallyPaused = false

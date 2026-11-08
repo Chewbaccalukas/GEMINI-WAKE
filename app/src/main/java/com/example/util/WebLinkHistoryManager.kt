@@ -87,7 +87,12 @@ class WebLinkHistoryManager(context: Context) {
                     )
                 }
                 db.chatDao().getRecentVoiceCommands().collect { roomEntities ->
-                    if (roomEntities.isNotEmpty()) {
+                    val currentPrefs = loadVoiceCommandsFromPrefs()
+                    if (currentPrefs.isEmpty() && _voiceCommandEntries.value.isEmpty()) {
+                        // History was explicitly cleared; do not repopulate from stale async DB rows
+                        return@collect
+                    }
+                    if (roomEntities.isNotEmpty() && _voiceCommandEntries.value.isEmpty()) {
                         val mapped = roomEntities
                             .filter { it.hasValidTranscript || !com.example.data.model.ChatMessage.isLegacyAudioPlaceholder(it.triggerPhrase) }
                             .take(MAX_HISTORY_ITEMS)
@@ -189,7 +194,8 @@ class WebLinkHistoryManager(context: Context) {
             val resolvedTranscript = cleanTranscript.ifBlank {
                 "Wake phrase \"$resolvedTrigger\" recognized"
             }
-            val now = System.currentTimeMillis().coerceAtLeast(1L)
+            val latestTs = _voiceCommandEntries.value.firstOrNull()?.timestamp ?: 0L
+            val now = maxOf(System.currentTimeMillis().coerceAtLeast(1L), latestTs + 1L)
 
             val entry = VoiceCommandHistoryEntry(
                 id = UUID.randomUUID().toString(),
@@ -586,49 +592,15 @@ class WebLinkHistoryManager(context: Context) {
             return results.sortedBy { it.startIndex }.distinctBy { it.url }
         }
 
-        fun createExternalBrowserIntent(url: String): Intent {
-            val normalizedUrl = normalizeInputToUrl(url)
-            return Intent(Intent.ACTION_VIEW, Uri.parse(normalizedUrl)).apply {
-                addCategory(Intent.CATEGORY_BROWSABLE)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-        }
-
         /**
-         * Opens the target URL in the user's external default browser.
-         * Explicitly avoids routing back into this app's own MainActivity when possible.
+         * Passively stages a normalized URL payload in [com.example.coupler.ChromeBridgeSocketManager]
+         * without ever creating an external browser `Intent(Intent.ACTION_VIEW)` or calling `startActivity()`.
          */
         fun openUrlInDefaultBrowser(context: Context, rawUrlOrQuery: String): Boolean {
             val normalizedUrl = normalizeInputToUrl(rawUrlOrQuery)
-            val baseIntent = createExternalBrowserIntent(normalizedUrl)
-            return try {
-                val pm = context.packageManager
-                val resolvedList = pm.queryIntentActivities(baseIntent, PackageManager.MATCH_ALL)
-                val externalTarget = resolvedList.firstOrNull {
-                    it.activityInfo?.packageName != null &&
-                        it.activityInfo.packageName != context.packageName
-                }
-                if (externalTarget != null) {
-                    baseIntent.setPackage(externalTarget.activityInfo.packageName)
-                }
-                context.startActivity(baseIntent)
-                true
-            } catch (e: Exception) {
-                try {
-                    val fallbackIntent = Intent(Intent.ACTION_VIEW, Uri.parse(normalizedUrl)).apply {
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    }
-                    context.startActivity(fallbackIntent)
-                    true
-                } catch (_: Exception) {
-                    Toast.makeText(
-                        context,
-                        "No external browser found to open: $normalizedUrl",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                    false
-                }
-            }
+            if (normalizedUrl.isBlank()) return false
+            com.example.coupler.ChromeBridgeSocketManager.stageUrlPayload(context, normalizedUrl)
+            return true
         }
     }
 }

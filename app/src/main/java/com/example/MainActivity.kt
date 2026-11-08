@@ -49,6 +49,7 @@ import com.example.ui.components.ImportGeminiChatDialog
 import com.example.ui.components.MemoryBufferBridgeDialog
 import com.example.ui.components.WakeWordSettingsDialog
 import com.example.ui.screens.ChatDetailScreen
+import com.example.ui.screens.CloudBackupVaultScreen
 import com.example.ui.screens.DiagnosticLogScreen
 import com.example.ui.screens.GoogleAuthScreen
 import com.example.ui.screens.HistoryScreen
@@ -78,6 +79,7 @@ sealed class Screen {
     object Settings : Screen()
     object WakeWordStudio : Screen()
     object DiagnosticLog : Screen()
+    object CloudBackupVault : Screen()
     data class Chat(val chatId: Long) : Screen()
 }
 
@@ -167,6 +169,11 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         viewModel.onAppForegrounded()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        viewModel.onAppPaused()
     }
 
     override fun onStop() {
@@ -396,6 +403,10 @@ fun MainApp(
     val currentUserEmail by viewModel.currentUserEmail.collectAsStateWithLifecycle()
     val currentUserDisplayName by viewModel.currentUserDisplayName.collectAsStateWithLifecycle()
     val cloudSyncStatus by viewModel.cloudSyncStatus.collectAsStateWithLifecycle()
+    val cloudBackupChats by viewModel.cloudBackupChats.collectAsStateWithLifecycle()
+    val cloudBackupMessages by viewModel.cloudBackupMessages.collectAsStateWithLifecycle()
+    val isCloudOperationInProgress by viewModel.isCloudOperationInProgress.collectAsStateWithLifecycle()
+    val cloudVaultStatusMessage by viewModel.cloudVaultStatusMessage.collectAsStateWithLifecycle()
     val favoriteChatIds by viewModel.favoriteChatIds.collectAsStateWithLifecycle()
     val pinnedChatIds by viewModel.pinnedChatIds.collectAsStateWithLifecycle()
     val contextualRoutingEnabled by viewModel.contextualRoutingEnabled.collectAsStateWithLifecycle()
@@ -650,7 +661,7 @@ fun MainApp(
                 viewModel.toggleHandsFreeVoice()
             }
             is PendingAudioAction.StartVoiceRecording -> {
-                viewModel.toggleInChatDictation()
+                viewModel.toggleInternalDictation()
             }
             is PendingAudioAction.RecordWakeSnippet -> {
                 viewModel.startRecordingWakeSnippet(action.chatId, action.slotIndex)
@@ -663,18 +674,38 @@ fun MainApp(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         hasAudioPermission = granted
-        viewModel.onAudioPermissionResult(granted)
         val action = pendingAudioAction
         pendingAudioAction = null
 
         if (granted) {
-            if (action != null) {
-                executePendingAction(action)
-            } else {
-                Toast.makeText(context, "Microphone access enabled.", Toast.LENGTH_SHORT).show()
+            // Restore foreground window focus immediately after the system permission dialog closes
+            viewModel.onWindowFocusChanged(true)
+            viewModel.onAudioPermissionResult(true)
+            when (action) {
+                is PendingAudioAction.ToggleListening -> {
+                    if (!viewModel.isHandsFreeActive.value) {
+                        viewModel.toggleHandsFreeVoice(true)
+                    } else {
+                        viewModel.speechRecognitionCoordinator.startListening(userInitiated = true)
+                    }
+                }
+                is PendingAudioAction.StartVoiceRecording -> {
+                    if (!viewModel.isInChatDictationActive.value) {
+                        viewModel.toggleInternalDictation()
+                    }
+                }
+                is PendingAudioAction.RecordWakeSnippet -> {
+                    executePendingAction(action)
+                }
+                null -> {
+                    Toast.makeText(context, "Microphone access enabled.", Toast.LENGTH_SHORT).show()
+                }
             }
-        } else if (permissionRationaleEnabled) {
-            showPermissionRationaleDialog = true
+        } else {
+            viewModel.onAudioPermissionResult(false)
+            if (permissionRationaleEnabled) {
+                showPermissionRationaleDialog = true
+            }
         }
     }
 
@@ -781,7 +812,7 @@ fun MainApp(
         val clean = route?.trim() ?: return false
         if (clean.isEmpty()) return false
         return when {
-            clean == "home" || clean == "history" || clean == "settings" || clean == "studio" || clean == "diagnostics" -> true
+            clean == "home" || clean == "chat" || clean == "history" || clean == "settings" || clean == "studio" || clean == "diagnostics" || clean == "cloud_vault" -> true
             clean.startsWith("chat/") -> {
                 val id = clean.removePrefix("chat/").toLongOrNull()
                 id != null && id > 0L
@@ -811,6 +842,7 @@ fun MainApp(
             is Screen.Settings -> "settings"
             is Screen.WakeWordStudio -> "studio"
             is Screen.DiagnosticLog -> "diagnostics"
+            is Screen.CloudBackupVault -> "cloud_vault"
             is Screen.Chat -> "chat/${targetScreen.chatId}"
         }
         navigateNavControllerSafely(targetRoute)
@@ -823,12 +855,13 @@ fun MainApp(
             is Screen.Settings -> "settings"
             is Screen.WakeWordStudio -> "studio"
             is Screen.DiagnosticLog -> "diagnostics"
+            is Screen.CloudBackupVault -> "cloud_vault"
             is Screen.Chat -> "chat/${s.chatId}"
         }
         navigateNavControllerSafely(targetRoute)
     }
 
-    // Consume voice navigation commands (such as "open history", "show history", "voice history")
+    // Consume voice navigation commands (such as "open chat", "open history", "show history", "voice history")
     // purely in-memory via root NavController without ever calling startActivity() or external intents.
     LaunchedEffect(pendingVoiceNavigationRoute) {
         val route = pendingVoiceNavigationRoute
@@ -854,6 +887,14 @@ fun MainApp(
                     cleanRoute == "settings" -> navigateInApp(Screen.Settings)
                     cleanRoute == "studio" -> navigateInApp(Screen.WakeWordStudio)
                     cleanRoute == "diagnostics" -> navigateInApp(Screen.DiagnosticLog)
+                    cleanRoute == "chat" -> {
+                        val targetId = currentChatId
+                            ?: chats.firstOrNull { it.isDefaultWakeChat }?.id
+                            ?: chats.firstOrNull()?.id
+                            ?: 1L
+                        viewModel.selectChat(targetId)
+                        navigateInApp(Screen.Chat(targetId))
+                    }
                     cleanRoute.startsWith("chat/") -> {
                         val chatId = cleanRoute.removePrefix("chat/").toLongOrNull()
                         if (chatId != null && chatId > 0L) {
@@ -869,11 +910,9 @@ fun MainApp(
     }
 
     // Root-level continuous voice radar lifecycle across ALL screens (Home, ChatDetail, Settings, History, Studio).
-    // Respects hasWindowFocus and isNavigatingViaVoiceCommand so the microphone never loops in the background or mid-transition.
-    // Note: Do NOT include transient isListening / isSpeechRecognizerListening in LaunchedEffect keys,
-    // as brief recognizer restarts between utterances must not trigger recomposition restart loops.
+    //Note: Do NOT key on transient hasWindowFocus changes here so notification shade pull-downs or dialogs
+    // never bypass the strict 1500ms windowFocus debounce in SpeechRecognitionCoordinator and WakeWordManager.
     LaunchedEffect(
-        hasWindowFocus,
         hasAudioPermission,
         isHandsFreeActive,
         isUserVoiceTurn,
@@ -888,6 +927,7 @@ fun MainApp(
             !isListening &&
             !isSpeechRecognizerListening &&
             !viewModel.speechRecognitionCoordinator.hasPendingRestart &&
+            !viewModel.speechRecognitionCoordinator.hasPendingWindowFocusDebounce &&
             !isUserVoiceTurn &&
             !isNavigatingViaVoiceCommand &&
             !viewModel.wakeWordManager.isTransitioningAudioState
@@ -928,7 +968,7 @@ fun MainApp(
         }
     }
 
-    // Hidden/synced Compose NavHost backing in-app route navigation ("home", "chat/{chatId}", "settings", "history", "studio")
+    // Hidden/synced Compose NavHost backing in-app route navigation ("home", "chat/{chatId}", "settings", "history", "studio", "cloud_vault")
     NavHost(
         navController = navController,
         startDestination = "home"
@@ -938,16 +978,21 @@ fun MainApp(
         composable("settings") {}
         composable("studio") {}
         composable("diagnostics") {}
+        composable("cloud_vault") {}
         composable(
             route = "chat/{chatId}",
             arguments = listOf(navArgument("chatId") { type = NavType.LongType })
         ) {}
     }
 
-    if (currentScreen is Screen.Chat && currentChat != null) {
-        androidx.compose.runtime.key(currentChatId) {
+    val activeChatForScreen = currentChat ?: (currentScreen as? Screen.Chat)?.let { screen ->
+        chats.firstOrNull { it.id == screen.chatId }
+    }
+
+    if (currentScreen is Screen.Chat && activeChatForScreen != null) {
+        androidx.compose.runtime.key(activeChatForScreen.id) {
             ChatDetailScreen(
-                chat = currentChat!!,
+                chat = activeChatForScreen,
                 messages = hotMessages,
                 streamingText = streamingText,
                 isGenerating = isGenerating,
@@ -961,14 +1006,14 @@ fun MainApp(
                 customPrompts = customPrompts,
                 onBack = { navigateInApp(Screen.Home) },
                 onSendMessage = { text ->
-                    viewModel.sendMessage(currentChat!!.id, text)
+                    viewModel.sendMessage(activeChatForScreen.id, text)
                 },
                 onToggleAutoSpeak = { viewModel.toggleAutoSpeak() },
                 onSpeakText = { text -> viewModel.speakMessage(text) },
                 onStopSpeaking = { viewModel.stopSpeaking() },
-                onClearHistory = { viewModel.clearChatHistory(currentChat!!.id) },
+                onClearHistory = { viewModel.clearChatHistory(activeChatForScreen.id) },
                 onEditChat = {
-                    chatToEdit = currentChat
+                    chatToEdit = activeChatForScreen
                     showCreateEditDialog = true
                 },
                 onLoadOlderMessages = { viewModel.loadOlderMessages() },
@@ -979,7 +1024,7 @@ fun MainApp(
                     showCouplerDialog = true
                 },
                 onDismissTriggerBanner = { viewModel.clearTriggerBanner() },
-                onToggleChatPersistence = { viewModel.toggleChatPersistence(currentChat!!.id) },
+                onToggleChatPersistence = { viewModel.toggleChatPersistence(activeChatForScreen.id) },
                 openChatTimerSeconds = openChatTimerSeconds,
                 isOpenChatTimerRunning = isOpenChatTimerRunning,
                 showUsageLimitsComparison = showUsageLimitsComparison,
@@ -1030,10 +1075,10 @@ fun MainApp(
                 audioRmsDb = audioRmsDb,
                 viewModel = viewModel,
                 onStartVoiceRecording = {
-                    viewModel.toggleInChatDictation()
+                    viewModel.toggleInternalDictation()
                 },
                 onToggleInChatDictation = {
-                    viewModel.toggleInChatDictation()
+                    viewModel.toggleInternalDictation()
                 },
                 onSendVoiceRecording = { promptText ->
                     viewModel.finishVoiceRecordingAndSend(promptText)
@@ -1047,17 +1092,17 @@ fun MainApp(
                 onOpenChatLink = { url, label ->
                     val entry = viewModel.recordChatLinkOpened(url, label, currentChat?.title)
                     val targetUrl = entry?.url ?: url
-                    WebLinkHistoryManager.openUrlInDefaultBrowser(context, targetUrl)
+                    viewModel.openExternalUrlWithTransientGuard(context, targetUrl)
                 },
                 onSubmitWebSearchOrUrl = { queryOrUrl ->
                     val entry = viewModel.submitWebSearchOrUrl(queryOrUrl)
                     if (entry != null) {
-                        WebLinkHistoryManager.openUrlInDefaultBrowser(context, entry.url)
+                        viewModel.openExternalUrlWithTransientGuard(context, entry.url)
                     }
                 },
                 onOpenWebHistoryEntry = { entry ->
                     viewModel.submitWebSearchOrUrl(entry.url)
-                    WebLinkHistoryManager.openUrlInDefaultBrowser(context, entry.url)
+                    viewModel.openExternalUrlWithTransientGuard(context, entry.url)
                 },
                 onDeleteWebHistoryEntry = { id -> viewModel.deleteWebHistoryEntry(id) },
                 onClearAllWebHistory = { viewModel.clearAllWebHistory() },
@@ -1106,30 +1151,30 @@ fun MainApp(
                 },
                 isWakeWordListening = isListening || isSpeechRecognizerListening,
                 lastHeardText = lastHeardText,
-                wakeConversationSummary = wakeConversationSummary?.takeIf { it.chatId == currentChat!!.id },
+                wakeConversationSummary = wakeConversationSummary?.takeIf { it.chatId == activeChatForScreen.id },
                 onGenerateWakeAiSummary = { viewModel.generateWakeAiSummary() },
                 onOpenWakeFavoritesPicker = { viewModel.openWakeFavoritesPicker() },
                 onDismissWakeSummary = { viewModel.dismissWakeConversationSummary() },
-                isFavoriteChat = favoriteChatIds.contains(currentChat!!.id),
+                isFavoriteChat = favoriteChatIds.contains(activeChatForScreen.id),
                 onToggleFavoriteChat = {
-                    val isNowFav = viewModel.toggleFavoriteChat(currentChat!!.id)
+                    val isNowFav = viewModel.toggleFavoriteChat(activeChatForScreen.id)
                     Toast.makeText(
                         context,
-                        if (isNowFav) "Added \"${currentChat!!.title}\" to Favorite Wake Chats" else "Removed from Favorite Wake Chats",
+                        if (isNowFav) "Added \"${activeChatForScreen.title}\" to Favorite Wake Chats" else "Removed from Favorite Wake Chats",
                         Toast.LENGTH_SHORT
                     ).show()
                 },
-                isPinnedChat = currentChat!!.isPinned || pinnedChatIds.contains(currentChat!!.id),
+                isPinnedChat = activeChatForScreen.isPinned || pinnedChatIds.contains(activeChatForScreen.id),
                 onTogglePinChat = {
-                    val isNowPinned = viewModel.togglePinnedChat(currentChat!!.id)
+                    val isNowPinned = viewModel.togglePinnedChat(activeChatForScreen.id)
                     Toast.makeText(
                         context,
-                        if (isNowPinned) "Pinned \"${currentChat!!.title}\" to top of list" else "Unpinned \"${currentChat!!.title}\"",
+                        if (isNowPinned) "Pinned \"${activeChatForScreen.title}\" to top of list" else "Unpinned \"${activeChatForScreen.title}\"",
                         Toast.LENGTH_SHORT
                     ).show()
                 },
-                chatCategory = viewModel.chatCategoryMap.collectAsStateWithLifecycle().value[currentChat!!.id],
-                chatTags = viewModel.chatTagsMap.collectAsStateWithLifecycle().value[currentChat!!.id].orEmpty(),
+                chatCategory = viewModel.chatCategoryMap.collectAsStateWithLifecycle().value[activeChatForScreen.id],
+                chatTags = viewModel.chatTagsMap.collectAsStateWithLifecycle().value[activeChatForScreen.id].orEmpty(),
                 allChats = chats,
                 chatCategoryMap = viewModel.chatCategoryMap.collectAsStateWithLifecycle().value,
                 messageCategoryMap = viewModel.messageCategoryMap.collectAsStateWithLifecycle().value,
@@ -1138,10 +1183,10 @@ fun MainApp(
                     onNavigate(Screen.Chat(targetId))
                 },
                 onReassignChatCategory = { newCategory ->
-                    viewModel.reassignChatAndMessagesCategory(currentChat!!.id, newCategory)
+                    viewModel.reassignChatAndMessagesCategory(activeChatForScreen.id, newCategory)
                     Toast.makeText(
                         context,
-                        "Assigned \"${currentChat!!.title}\" & messages to $newCategory",
+                        "Assigned \"${activeChatForScreen.title}\" & messages to $newCategory",
                         Toast.LENGTH_SHORT
                     ).show()
                 },
@@ -1157,7 +1202,7 @@ fun MainApp(
                 },
                 onUpdateChatAppearance = { paletteId, backgroundStyle, primaryHex ->
                     viewModel.updateChatAppearance(
-                        chatId = currentChat!!.id,
+                        chatId = activeChatForScreen.id,
                         colorPaletteId = paletteId,
                         backgroundStyle = backgroundStyle,
                         themeColorHex = primaryHex
@@ -1256,6 +1301,39 @@ fun MainApp(
                 requestAudioPermissionAndExecute(PendingAudioAction.RecordWakeSnippet(chatId, slotIndex))
             }
         )
+    } else if (currentScreen is Screen.CloudBackupVault) {
+        CloudBackupVaultScreen(
+            cloudChats = cloudBackupChats,
+            cloudMessages = cloudBackupMessages,
+            localChats = chats,
+            userEmail = currentUserEmail,
+            userDisplayName = currentUserDisplayName,
+            cloudSyncStatus = cloudSyncStatus,
+            isCloudOperationInProgress = isCloudOperationInProgress,
+            cloudVaultStatusMessage = cloudVaultStatusMessage,
+            onBack = { navigateInApp(Screen.Home) },
+            onSyncNow = {
+                viewModel.triggerManualCloudSync()
+                Toast.makeText(context, "Refreshing Cloud Backup Vault...", Toast.LENGTH_SHORT).show()
+            },
+            onSignOut = {
+                authScope.launch {
+                    GoogleAuthManager.signOut(context)
+                    viewModel.onAuthStateChanged(null)
+                    Toast.makeText(context, "Signed out of Google Account.", Toast.LENGTH_SHORT).show()
+                }
+            },
+            onRestoreToDevice = { cloudDoc ->
+                viewModel.restoreChatFromCloud(cloudDoc) { restoredChatId ->
+                    if (restoredChatId > 0L) {
+                        navigateInApp(Screen.Chat(restoredChatId))
+                    }
+                }
+            },
+            onDeleteFromCloud = { cloudDoc ->
+                viewModel.deleteChatFromCloud(cloudDoc)
+            }
+        )
     } else {
         HomeScreen(
             chats = chats,
@@ -1331,12 +1409,12 @@ fun MainApp(
             onSubmitWebSearchOrUrl = { queryOrUrl ->
                 val entry = viewModel.submitWebSearchOrUrl(queryOrUrl)
                 if (entry != null) {
-                    WebLinkHistoryManager.openUrlInDefaultBrowser(context, entry.url)
+                    viewModel.openExternalUrlWithTransientGuard(context, entry.url)
                 }
             },
             onOpenWebHistoryEntry = { entry ->
                 viewModel.submitWebSearchOrUrl(entry.url)
-                WebLinkHistoryManager.openUrlInDefaultBrowser(context, entry.url)
+                viewModel.openExternalUrlWithTransientGuard(context, entry.url)
             },
             onDeleteWebHistoryEntry = { id -> viewModel.deleteWebHistoryEntry(id) },
             onClearAllWebHistory = { viewModel.clearAllWebHistory() },
@@ -1404,7 +1482,10 @@ fun MainApp(
             availableCategories = viewModel.availableCategories.collectAsStateWithLifecycle().value,
             onOpenBufferBridgeDialog = { showBufferBridgeDialog = true },
             onOpenSyncCompanionRelay = { showBufferBridgeDialog = true },
-            onClearChatThread = { chatId -> viewModel.clearChatHistory(chatId) }
+            onOpenCloudBackupVault = { navigateInApp(Screen.CloudBackupVault) },
+            onClearChatThread = { chatId -> viewModel.clearChatHistory(chatId) },
+            externalSelectedCategoryFilter = viewModel.selectedCategoryFilter.collectAsStateWithLifecycle().value,
+            onSelectCategoryFilter = { category -> viewModel.setSelectedCategoryFilter(category) }
         )
     }
 
@@ -1491,7 +1572,9 @@ fun MainApp(
                     onClick = {
                         val urlToOpen = incomingExternalWebUrl
                         onClearIncomingExternalWebUrl()
-                        WebLinkHistoryManager.openUrlInDefaultBrowser(context, urlToOpen)
+                        if (!urlToOpen.isNullOrBlank()) {
+                            viewModel.openExternalUrlWithTransientGuard(context, urlToOpen)
+                        }
                     },
                     modifier = Modifier.testTag("open_incoming_link_browser_button")
                 ) {

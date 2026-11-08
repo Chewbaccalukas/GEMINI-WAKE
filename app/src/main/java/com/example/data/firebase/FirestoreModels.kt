@@ -34,7 +34,13 @@ data class FirestoreChatDoc(
     @ServerTimestamp val updatedAt: Timestamp? = null
 ) {
     fun toChatSession(): ChatSession {
-        val resolvedId = if (localChatId > 0L) localChatId else (id.removePrefix("chat_").toLongOrNull() ?: 0L)
+        val parsedFromDocId = id.removePrefix("chat_").toLongOrNull()
+        val resolvedId = when {
+            localChatId > 0L -> localChatId
+            parsedFromDocId != null && parsedFromDocId > 0L -> parsedFromDocId
+            id.isNotBlank() -> (id.hashCode().toLong() and 0x7fffffffL).coerceAtLeast(1L)
+            else -> 0L
+        }
         val now = System.currentTimeMillis()
         val resolvedCreated = createdAt?.toDate()?.time ?: now
         val resolvedUpdated = updatedAt?.toDate()?.time ?: resolvedCreated

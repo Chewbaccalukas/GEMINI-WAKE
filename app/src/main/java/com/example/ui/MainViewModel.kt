@@ -41,6 +41,7 @@ import com.example.util.WebLinkHistoryEntry
 import com.example.util.WebLinkHistoryManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -174,10 +175,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val chunkedImporter: com.example.importer.ChunkedChatImporter by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         com.example.importer.ChunkedChatImporter()
     }
-    private val geminiService: GeminiService by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+    internal var geminiServiceOverrideForTest: GeminiService? = null
+    private val defaultGeminiService: GeminiService by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         isGeminiServiceInitialized = true
         GeminiService()
     }
+    private val geminiService: GeminiService
+        get() = geminiServiceOverrideForTest ?: defaultGeminiService
 
     private val _currentUserUid = MutableStateFlow<String?>(null)
     val currentUserUid: StateFlow<String?> = _currentUserUid.asStateFlow()
@@ -191,6 +195,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _cloudSyncStatus = MutableStateFlow("Sign in to enable Cloud Firestore sync")
     val cloudSyncStatus: StateFlow<String> = _cloudSyncStatus.asStateFlow()
 
+    private val _cloudBackupChats = MutableStateFlow<List<com.example.data.firebase.FirestoreChatDoc>>(emptyList())
+    val cloudBackupChats: StateFlow<List<com.example.data.firebase.FirestoreChatDoc>> = _cloudBackupChats.asStateFlow()
+
+    private val _cloudBackupMessages = MutableStateFlow<List<com.example.data.firebase.FirestoreMessageDoc>>(emptyList())
+    val cloudBackupMessages: StateFlow<List<com.example.data.firebase.FirestoreMessageDoc>> = _cloudBackupMessages.asStateFlow()
+
+    private val _cloudBackupWakeWords = MutableStateFlow<List<com.example.data.firebase.FirestoreWakeWordDoc>>(emptyList())
+    val cloudBackupWakeWords: StateFlow<List<com.example.data.firebase.FirestoreWakeWordDoc>> = _cloudBackupWakeWords.asStateFlow()
+
+    private val _isCloudOperationInProgress = MutableStateFlow(false)
+    val isCloudOperationInProgress: StateFlow<Boolean> = _isCloudOperationInProgress.asStateFlow()
+
+    private val _cloudVaultStatusMessage = MutableStateFlow<String?>(null)
+    val cloudVaultStatusMessage: StateFlow<String?> = _cloudVaultStatusMessage.asStateFlow()
+
     private var cloudSyncJob: Job? = null
 
     fun onAuthStateChanged(user: com.google.firebase.auth.FirebaseUser?) {
@@ -203,6 +222,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (uid.isNullOrBlank()) {
             cloudSyncJob?.cancel()
             cloudSyncJob = null
+            _cloudBackupChats.value = emptyList()
+            _cloudBackupMessages.value = emptyList()
+            _cloudBackupWakeWords.value = emptyList()
+            _cloudVaultStatusMessage.value = null
             _cloudSyncStatus.value = "Signed out (Local Room cache active)"
             return
         }
@@ -228,30 +251,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 messageRepository.rebindLocalRecordsForUser(userId)
                 wakeWordRepository.rebindLocalRecordsForUser(userId)
 
-                // 1. Reconcile any soft-deleted local tombstones (`isDeleted = true`) with Cloud Firestore first
-                for (deletedChat in chatRepository.getPendingDeletedChats()) {
-                    runCatching {
-                        syncRepo.deleteChat(userId, deletedChat.id)
-                        chatRepository.purgeDeletedChat(deletedChat.id)
-                    }
-                }
-                for (deletedWake in wakeWordRepository.getPendingDeletedWakeWords()) {
-                    runCatching {
-                        syncRepo.deleteWakeWord(userId, deletedWake.id)
-                        wakeWordRepository.purgeDeletedWakeWord(deletedWake.id)
-                    }
-                }
-                for (deletedMsg in messageRepository.getPendingDeletedMessages()) {
-                    runCatching {
-                        syncRepo.deleteMessage(userId, deletedMsg.id)
-                        messageRepository.purgeDeletedMessage(deletedMsg.id)
-                    }
-                }
-
-                // 2. Push pending/dirty or initial local Room chats, wake words, and messages to Firestore
+                // 1. Push active local Room chats, wake words, and messages to Firestore as cloud backups.
+                // Note: Local deletions NEVER auto-delete from Firestore; cloud deletion is strictly manual via Cloud Backup Vault.
                 val localChats = chatRepository.getPendingSyncChats().ifEmpty { chatRepository.getAllChatsSync() }
                 for (chat in localChats) {
-                    if (chat.id > 0L && chat.isPersistent) {
+                    if (chat.id > 0L && chat.isPersistent && !chat.isDeleted) {
                         runCatching {
                             val docId = syncRepo.upsertChat(userId, chat)
                             chatRepository.markChatSynced(chat.id, docId, userId)
@@ -260,7 +264,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 val localWakeWords = wakeWordRepository.getPendingSyncWakeWords().ifEmpty { wakeWordRepository.getAllWakeWordsSync() }
                 for (ww in localWakeWords) {
-                    if (ww.id > 0L) {
+                    if (ww.id > 0L && !ww.isDeleted) {
                         runCatching {
                             val docId = syncRepo.upsertWakeWord(userId, ww)
                             wakeWordRepository.markWakeWordSynced(ww.id, docId, userId)
@@ -269,7 +273,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 val localMessages = messageRepository.getPendingSyncMessages().ifEmpty { allMessages.value }
                 for (msg in localMessages) {
-                    if (msg.id > 0L && msg.content.isNotBlank()) {
+                    if (msg.id > 0L && msg.content.isNotBlank() && !msg.isDeleted) {
                         runCatching {
                             val docId = syncRepo.upsertMessage(userId, msg)
                             messageRepository.markMessageSynced(msg.id, docId, userId)
@@ -278,47 +282,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 _cloudSyncStatus.value = "Synced with Cloud Firestore"
 
-                // 2. Listen for real-time remote chat changes from Firestore -> Room (Last-Write-Wins)
+                // 2. Observe remote chat backups for the Cloud Backup & Restore Vault.
+                // Do NOT auto-insert un-restored cloud chats into Room so HomeScreen only shows local Room chats.
                 launch {
                     runCatching {
                         syncRepo.observeChats(userId).collect { remoteDocs ->
-                            for (doc in remoteDocs) {
-                                val remoteSession = doc.toChatSession()
-                                if (remoteSession.id > 0L) {
-                                    repository.upsertRemoteChat(remoteSession)
-                                }
-                            }
-                            _cloudSyncStatus.value = "Synced • ${remoteDocs.size} chats in cloud"
+                            _cloudBackupChats.value = remoteDocs
+                            _cloudSyncStatus.value = "Synced • ${remoteDocs.size} chat backup${if (remoteDocs.size == 1) "" else "s"} in cloud"
                         }
                     }.onFailure {
                         _cloudSyncStatus.value = "Offline cache active (Cloud sync paused)"
                     }
                 }
 
-                // 3. Listen for real-time remote wake word changes from Firestore -> Room (Last-Write-Wins)
+                // 3. Observe remote wake word backups for the Cloud Backup & Restore Vault.
                 launch {
                     runCatching {
                         syncRepo.observeWakeWords(userId).collect { remoteWakeDocs ->
-                            for (doc in remoteWakeDocs) {
-                                val remoteWake = doc.toWakeWord()
-                                if (remoteWake.id > 0L && remoteWake.phrase.isNotBlank()) {
-                                    wakeWordRepository.upsertRemoteWakeWord(remoteWake)
-                                }
-                            }
+                            _cloudBackupWakeWords.value = remoteWakeDocs
                         }
                     }
                 }
 
-                // 4. Listen for real-time remote message changes from Firestore -> Room (Last-Write-Wins)
+                // 4. Observe remote message backups for the Cloud Backup & Restore Vault.
                 launch {
                     runCatching {
                         syncRepo.observeMessages(userId).collect { remoteMsgDocs ->
-                            for (doc in remoteMsgDocs) {
-                                val remoteMsg = doc.toChatMessage()
-                                if (remoteMsg.id > 0L && remoteMsg.chatId > 0L && remoteMsg.content.isNotBlank()) {
-                                    messageRepository.upsertRemoteMessage(remoteMsg)
-                                }
-                            }
+                            _cloudBackupMessages.value = remoteMsgDocs
                         }
                     }
                 }
@@ -326,6 +316,203 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _cloudSyncStatus.value = "Offline cache active (Cloud sync paused)"
             }
         }
+    }
+
+    /**
+     * Explicitly restores a backed-up chat and all its messages/wake words from Firestore
+     * into the local Room database, preloads the chat buffer, and opens the restored chat.
+     */
+    fun seedCloudBackupStateForTest(
+        chats: List<com.example.data.firebase.FirestoreChatDoc>,
+        messages: List<com.example.data.firebase.FirestoreMessageDoc> = emptyList(),
+        wakeWords: List<com.example.data.firebase.FirestoreWakeWordDoc> = emptyList()
+    ) {
+        _cloudBackupChats.value = chats
+        _cloudBackupMessages.value = messages
+        _cloudBackupWakeWords.value = wakeWords
+    }
+
+    fun restoreChatFromCloud(
+        chatDoc: com.example.data.firebase.FirestoreChatDoc,
+        onComplete: ((Long) -> Unit)? = null
+    ) {
+        viewModelScope.launch {
+            val restoredChatId = restoreChatFromCloudSuspend(chatDoc)
+            onComplete?.invoke(restoredChatId)
+        }
+    }
+
+    suspend fun restoreChatFromCloudSuspend(
+        chatDoc: com.example.data.firebase.FirestoreChatDoc,
+        chatRepoOverride: ChatRepository = repository,
+        messageRepoOverride: MessageRepository = messageRepository,
+        wakeRepoOverride: WakeWordRepository = wakeWordRepository
+    ): Long {
+        val uid = _currentUserUid.value
+        _isCloudOperationInProgress.value = true
+        _cloudVaultStatusMessage.value = "Restoring \"${chatDoc.title}\" to device..."
+        val restoredChatId = withContext(Dispatchers.IO) {
+            try {
+                val bundle = if (!uid.isNullOrBlank()) {
+                    val syncRepo = firebaseSyncRepository
+                    if (syncRepo != null) {
+                        runCatching { syncRepo.fetchChatBackupBundle(uid, chatDoc) }.getOrNull()
+                    } else {
+                        null
+                    }
+                } else {
+                    null
+                }
+                val effectiveChatDoc = bundle?.chatDoc ?: chatDoc
+                val remoteSession = effectiveChatDoc.toChatSession()
+                val targetOriginalLocalId = if (effectiveChatDoc.localChatId > 0L) {
+                    effectiveChatDoc.localChatId
+                } else {
+                    remoteSession.id
+                }
+
+                // 1. Explicitly upsert/insert the ChatSession into local Room database first
+                val upsertedLocalChatId = chatRepoOverride.upsertRemoteChat(remoteSession)
+                val finalLocalChatId = if (upsertedLocalChatId > 0L) {
+                    upsertedLocalChatId
+                } else {
+                    chatRepoOverride.saveChat(remoteSession.copy(id = 0L, isDeleted = false))
+                }
+
+                // Ensure the chat is marked active (not soft-deleted) in Room
+                val verifiedLocalChat = chatRepoOverride.getChatByIdSync(finalLocalChatId)
+                if (verifiedLocalChat == null) {
+                    chatRepoOverride.saveChat(remoteSession.copy(id = finalLocalChatId, isDeleted = false))
+                }
+
+                // 2. Restore all associated messages (from fetched bundle + cached cloud stream) into local Room DB
+                val combinedMessages = (
+                    bundle?.messages.orEmpty() +
+                        _cloudBackupMessages.value.filter { it.localChatId == targetOriginalLocalId || it.localChatId == finalLocalChatId }
+                    ).distinctBy { it.id.ifBlank { "${it.localMessageId}_${it.messageTimestamp}" } }
+                    .sortedBy { it.messageTimestamp }
+
+                for (msgDoc in combinedMessages) {
+                    val chatMsg = msgDoc.toChatMessage().copy(
+                        chatId = finalLocalChatId,
+                        isDeleted = false
+                    )
+                    if (chatMsg.content.isNotBlank()) {
+                        messageRepoOverride.upsertRemoteMessage(chatMsg)
+                    }
+                }
+
+                // 3. Restore all associated wake words into local Room DB
+                val combinedWakeWords = (
+                    bundle?.wakeWords.orEmpty() +
+                        _cloudBackupWakeWords.value.filter { it.chatId == targetOriginalLocalId || it.chatId == finalLocalChatId }
+                    ).distinctBy { it.id.ifBlank { it.phrase.lowercase() } }
+
+                for (wakeDoc in combinedWakeWords) {
+                    val wakeWord = wakeDoc.toWakeWord().copy(
+                        chatId = finalLocalChatId,
+                        isDeleted = false
+                    )
+                    if (wakeWord.phrase.isNotBlank()) {
+                        wakeRepoOverride.upsertRemoteWakeWord(wakeWord)
+                    }
+                }
+
+                // Ensure primary wake word from chat session is also synced locally
+                wakeRepoOverride.syncChatWakeWordFromSession(
+                    chatId = finalLocalChatId,
+                    chatTitle = remoteSession.title,
+                    wakeWord = remoteSession.wakeWord,
+                    sensitivity = _wakeWordSensitivity.value
+                )
+
+                if (chatRepoOverride === repository) {
+                    bufferManager.preloadAndAttachChat(finalLocalChatId)
+                }
+                finalLocalChatId
+            } catch (e: Exception) {
+                android.util.Log.e("MainViewModel", "Failed to restore chat from cloud: ${e.message}", e)
+                -1L
+            }
+        }
+        _isCloudOperationInProgress.value = false
+        if (restoredChatId > 0L) {
+            _cloudVaultStatusMessage.value = "Restored \"${chatDoc.title}\" to device"
+            _currentChatId.value = restoredChatId
+            if (chatRepoOverride === repository) {
+                selectChat(restoredChatId)
+            }
+        } else {
+            _cloudVaultStatusMessage.value = "Failed to restore \"${chatDoc.title}\""
+        }
+        return restoredChatId
+    }
+
+    /**
+     * Permanently deletes a backed-up chat, its messages, and its wake words from Cloud Firestore
+     * when the user confirms "Delete from Cloud" in the Cloud Backup Vault.
+     */
+    fun deleteChatFromCloud(
+        chatDoc: com.example.data.firebase.FirestoreChatDoc,
+        onComplete: ((Boolean) -> Unit)? = null
+    ) {
+        viewModelScope.launch {
+            val succeeded = deleteChatFromCloudSuspend(chatDoc)
+            onComplete?.invoke(succeeded)
+        }
+    }
+
+    suspend fun deleteChatFromCloudSuspend(
+        chatDoc: com.example.data.firebase.FirestoreChatDoc
+    ): Boolean {
+        val uid = _currentUserUid.value
+        _isCloudOperationInProgress.value = true
+        _cloudVaultStatusMessage.value = "Deleting \"${chatDoc.title}\" from Cloud Firestore..."
+        val targetLocalId = if (chatDoc.localChatId > 0L) chatDoc.localChatId else chatDoc.toChatSession().id
+        val cachedMsgs = _cloudBackupMessages.value.filter { it.localChatId == targetLocalId }
+        val cachedWakes = _cloudBackupWakeWords.value.filter { it.chatId == targetLocalId }
+
+        val succeeded = withContext(Dispatchers.IO) {
+            try {
+                if (!uid.isNullOrBlank()) {
+                    val syncRepo = firebaseSyncRepository
+                    if (syncRepo != null) {
+                        syncRepo.deleteChatBackupFromCloud(
+                            userId = uid,
+                            chatDoc = chatDoc,
+                            cachedMessagesForChat = cachedMsgs,
+                            cachedWakeWordsForChat = cachedWakes
+                        )
+                    }
+                }
+                true
+            } catch (e: Exception) {
+                android.util.Log.e("MainViewModel", "Failed to delete chat from cloud: ${e.message}", e)
+                false
+            }
+        }
+
+        // Immediately remove from in-memory cloud backup vault state
+        _cloudBackupChats.update { list ->
+            list.filterNot {
+                (chatDoc.id.isNotBlank() && it.id == chatDoc.id) ||
+                    (targetLocalId > 0L && it.localChatId == targetLocalId)
+            }
+        }
+        _cloudBackupMessages.update { list ->
+            list.filterNot { it.localChatId == targetLocalId }
+        }
+        _cloudBackupWakeWords.update { list ->
+            list.filterNot { it.chatId == targetLocalId }
+        }
+
+        _isCloudOperationInProgress.value = false
+        _cloudVaultStatusMessage.value = if (succeeded) {
+            "Deleted \"${chatDoc.title}\" from Cloud Firestore"
+        } else {
+            "Removed \"${chatDoc.title}\" from Cloud Backup view"
+        }
+        return succeeded
     }
 
     private fun syncChatToCloudIfSignedIn(chatId: Long) {
@@ -486,6 +673,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val requiresAudioPermission: StateFlow<Boolean> = _requiresAudioPermission.asStateFlow()
 
     private var pendingWakeStartAfterPermission: Boolean = false
+    private var pendingInChatDictationAfterPermission: Boolean = false
     private var lastPartialWakeMatchMs: Long = 0L
 
     private val _wakeRetriggerEventId = MutableStateFlow(0L)
@@ -583,6 +771,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
      * Handles the runtime RECORD_AUDIO permission result from the Activity/Compose launcher.
+     * Automatically invokes `speechRecognitionCoordinator.startListening()` when granted so
+     * the user never needs to tap the radar toggle or mic button a second time.
      */
     fun onAudioPermissionResult(granted: Boolean) {
         if (permissionGrantedOverrideForTest != null) {
@@ -591,13 +781,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _hasRecordAudioPermission.value = granted
         _requiresAudioPermission.value = false
         if (granted) {
-            val shouldStart = pendingWakeStartAfterPermission || _isHandsFreeActive.value
+            // Returning from the system permission dialog restores foreground window focus
+            _hasWindowFocus.value = true
+            speechRecognitionCoordinator.setWindowFocused(true)
+            wakeWordManager.setWindowFocused(true)
+
+            val shouldStartInChat = pendingInChatDictationAfterPermission
+            pendingInChatDictationAfterPermission = false
+            val shouldStartWake = pendingWakeStartAfterPermission || _isHandsFreeActive.value
             pendingWakeStartAfterPermission = false
-            if (shouldStart) {
-                startContinuousWakeWordListening()
+
+            if (shouldStartInChat) {
+                if (!_isInChatDictationActive.value) {
+                    toggleInChatDictation()
+                } else {
+                    speechRecognitionCoordinator.startListening(userInitiated = true)
+                }
+            } else if (shouldStartWake) {
+                audioRecorder.setIntentionallyPaused(false)
+                speechRecognitionCoordinator.setIntentionallyPaused(false)
+                if (_isHandsFreeActive.value && !_isSleepMode.value) {
+                    com.example.voice.WakeWordVoiceService.startServiceSafely(
+                        context = getApplication(),
+                        action = com.example.voice.WakeWordVoiceService.ACTION_START_VOICE_SERVICE
+                    )
+                }
+                speechRecognitionCoordinator.startListening(userInitiated = true)
+                startContinuousWakeWordListening(userInitiated = true)
             }
         } else {
             pendingWakeStartAfterPermission = false
+            pendingInChatDictationAfterPermission = false
             stopContinuousWakeWordListening()
             wakeWordManager.setStatusMessage("Microphone permission denied — wake-word listening disabled")
         }
@@ -712,6 +926,208 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     )
 
+    private val _selectedCategoryFilter = MutableStateFlow<String?>(null)
+    val selectedCategoryFilter: StateFlow<String?> = _selectedCategoryFilter.asStateFlow()
+
+    fun setSelectedCategoryFilter(category: String?) {
+        _selectedCategoryFilter.value = category
+    }
+
+    val voiceCommandDispatcher = com.example.voice.VoiceCommandDispatcher(speechRecognitionCoordinator)
+
+    private val voiceCommandCallbacks = object : com.example.voice.VoiceCommandDispatcher.Callbacks {
+        override fun onNavigateToScreen(
+            destination: com.example.voice.VoiceScreenDestination,
+            rawTranscript: String
+        ): Boolean {
+            dispatchVoiceNavigationCommand(
+                route = destination.route,
+                rawTranscript = rawTranscript
+            )
+            return true
+        }
+
+        override fun onSelectCategoryFilter(
+            category: String?,
+            displayLabel: String,
+            rawTranscript: String
+        ): Boolean {
+            _selectedCategoryFilter.value = category
+            _currentDraftText.value = ""
+            _pendingWakeQuery.value = null
+            wakeWordManager.setUserVoiceTurn(false)
+            webLinkHistoryManager.recordVoiceCommand(
+                commandType = VoiceCommandType.WAKE_WORD,
+                triggerPhrase = "Category Filter ($displayLabel)",
+                recognizedTranscript = rawTranscript.ifBlank { "Filter by $displayLabel" },
+                chatTitle = currentChat.value?.title ?: "Home"
+            )
+            wakeWordManager.setStatusMessage("Category filter: $displayLabel")
+            _pendingVoiceNavigationRoute.value = com.example.voice.VoiceScreenDestination.HOME.route
+            return true
+        }
+
+        override fun onClearChatHistory(targetChatId: Long?): Boolean {
+            val chatId = targetChatId ?: _currentChatId.value ?: allChats.value.firstOrNull()?.id ?: return false
+            clearChatHistory(chatId)
+            wakeWordManager.setStatusMessage("Cleared chat history via voice command")
+            return true
+        }
+
+        override fun onReadLastReply(targetChatId: Long?): Boolean {
+            val lastAiReply = rawCurrentMessages.value
+                .lastOrNull { it.sender != "user" && it.content.isNotBlank() }
+                ?.content
+            if (!lastAiReply.isNullOrBlank()) {
+                speakMessage(lastAiReply)
+                wakeWordManager.setStatusMessage("Reading last reply aloud")
+            }
+            return true
+        }
+
+        override fun onSetChatPinned(targetChatId: Long?, pinned: Boolean): Boolean {
+            val chatId = targetChatId ?: _currentChatId.value ?: allChats.value.firstOrNull()?.id ?: return false
+            if (pinned) {
+                if (!pinnedChatIds.value.contains(chatId)) {
+                    togglePinnedChat(chatId)
+                }
+                wakeWordManager.setStatusMessage("Pinned chat to top of list")
+            } else {
+                if (pinnedChatIds.value.contains(chatId)) {
+                    togglePinnedChat(chatId)
+                }
+                wakeWordManager.setStatusMessage("Unpinned chat")
+            }
+            return true
+        }
+
+        override fun onSetThemeMode(theme: AppTheme, label: String): Boolean {
+            val chatId = _currentChatId.value ?: allChats.value.firstOrNull()?.id ?: return false
+            updateChatTheme(chatId, theme)
+            wakeWordManager.setStatusMessage("Switched chat to $label theme")
+            return true
+        }
+
+        override fun onSetThemePalette(
+            paletteId: String,
+            backgroundStyle: String,
+            primaryHex: String,
+            label: String
+        ): Boolean {
+            val chatId = _currentChatId.value ?: allChats.value.firstOrNull()?.id ?: return false
+            when (paletteId.lowercase(java.util.Locale.US)) {
+                "blue" -> {
+                    updateChatAppearance(chatId, "OCEAN_CYAN", "DEFAULT", "#38BDF8")
+                    wakeWordManager.setStatusMessage("Applied Ocean Cyan palette")
+                }
+                "green" -> {
+                    updateChatAppearance(chatId, "EMERALD_FOREST", "AURORA_MESH", "#10B981")
+                    wakeWordManager.setStatusMessage("Applied Emerald Forest palette")
+                }
+                "orange" -> {
+                    updateChatAppearance(chatId, "SUNSET_AMBER", "WARM_DUSK", "#F59E0B")
+                    wakeWordManager.setStatusMessage("Applied Sunset Amber palette")
+                }
+                "purple" -> {
+                    updateChatAppearance(chatId, "ROYAL_VIOLET", "NEBULA_GLOW", "#A855F7")
+                    wakeWordManager.setStatusMessage("Applied Royal Violet & Nebula Glow theme")
+                }
+                "pink" -> {
+                    updateChatAppearance(chatId, "ROSE_QUARTZ", "WARM_DUSK", "#F43F5E")
+                    wakeWordManager.setStatusMessage("Applied Rose Quartz palette")
+                }
+                else -> {
+                    updateChatAppearance(chatId, paletteId, backgroundStyle, primaryHex)
+                    wakeWordManager.setStatusMessage("Applied $label theme")
+                }
+            }
+            return true
+        }
+
+        override fun onOpenExternalUrl(urlOrQuery: String, rawTranscript: String): Boolean {
+            return openExternalUrlWithTransientGuard(
+                context = getApplication(),
+                rawUrlOrQuery = urlOrQuery
+            )
+        }
+
+        override fun onCommandCompletedAndRearm(
+            action: com.example.voice.VoiceCommandAction,
+            reason: String
+        ) {
+            completeVoiceCommandAndRearm(reason)
+        }
+    }
+
+    /**
+     * Passively stages chat data, messages, and optional URL payload in both
+     * [LocalSyncRelayServer] (`127.0.0.1:8765`) and [ChromeBridgeSocketManager] without
+     * ever launching an external browser activity.
+     */
+    fun stageChatAndUrlPassively(
+        chat: ChatSession? = currentChat.value ?: allChats.value.firstOrNull { it.id == _currentChatId.value },
+        messages: List<ChatMessage> = rawCurrentMessages.value,
+        stagedUrl: String? = null
+    ) {
+        localSyncServer.stageChatAndUrlPayload(
+            chat = chat,
+            messages = messages,
+            stagedUrl = stagedUrl
+        )
+        if (chat != null) {
+            chromeBridge.stageChatForChrome(
+                chat = chat,
+                messages = messages,
+                stagedUrl = stagedUrl
+            )
+        } else {
+            ChromeBridgeSocketManager.stageChatAndUrlPayload(
+                context = getApplication(),
+                chatSession = null,
+                messages = messages,
+                urlPayload = stagedUrl
+            )
+        }
+    }
+
+    /**
+     * Passively stages a URL or search query in [WebLinkHistoryManager], [LocalSyncRelayServer],
+     * and [ChromeBridgeSocketManager] without launching any external browser activity, keeping
+     * Hands-Free Radar active in the foreground.
+     */
+    fun openExternalUrlWithTransientGuard(
+        context: android.content.Context = getApplication(),
+        rawUrlOrQuery: String
+    ): Boolean {
+        val trimmed = rawUrlOrQuery.trim()
+        if (trimmed.isBlank()) return false
+        speechRecognitionCoordinator.pauseForCommandDispatch("passive_url_stage")
+        return try {
+            val entry = submitWebSearchOrUrl(trimmed)
+            val staged = com.example.util.WebLinkHistoryManager.openUrlInDefaultBrowser(
+                context = context,
+                rawUrlOrQuery = trimmed
+            )
+            stageChatAndUrlPassively(stagedUrl = entry?.url ?: com.example.util.WebLinkHistoryManager.normalizeInputToUrl(trimmed))
+            staged
+        } finally {
+            completeVoiceCommandAndRearm("passive_url_stage_completed")
+        }
+    }
+
+    /**
+     * Resets `isProcessingCommand = false` and re-arms continuous hands-free listening without
+     * requiring a manual radar toggle.
+     */
+    fun completeVoiceCommandAndRearm(reason: String = "voice_command_completed") {
+        wakeWordManager.setUserVoiceTurn(false)
+        com.example.voice.WakeWordVoiceService.resumeMicrophoneAfterCommandNavigation(getApplication())
+        speechRecognitionCoordinator.completeCommandProcessingAndRearm(
+            delayMs = com.example.voice.SpeechRecognitionCoordinator.AUDIOFOCUS_GAIN_REARM_DEBOUNCE_MS,
+            reason = reason
+        )
+    }
+
     private var lastDirectVoiceDispatchPrompt: String = ""
     private var lastDirectVoiceDispatchAtMs: Long = 0L
     private var lastSentWakeMessagePrompt: String = ""
@@ -731,11 +1147,40 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         lastPartialWakeMatchMs = now
         com.example.voice.AudioCommandSanitizer.playWakeWordHaptic(getApplication(), matchedWake)
-        stopSpeechRecognizerInternal()
+        stopSpeechRecognizerInternal(markIntentionallyPaused = false)
         _lastDispatchedVoicePrompt.value = cleanPrompt
         _pendingWakeQuery.value = cleanPrompt
         // Do NOT assign recognized speech to _currentDraftText—keep draft state and bottom input field blank.
         _currentDraftText.value = ""
+
+        val activeWakeWords = (
+            allChats.value.mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
+                wakeWordManager.getActiveChats().mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
+                allWakeWords.value.filter { it.isEnabled }.map { it.phrase }
+            ).distinct()
+        val parsedCommand = voiceCommandDispatcher.parseCommand(
+            rawTranscript = cleanPrompt,
+            customWakeWords = activeWakeWords,
+            availableCategories = availableCategories.value
+        )
+        if (parsedCommand is com.example.voice.VoiceCommandAction.NavigateToScreen ||
+            parsedCommand is com.example.voice.VoiceCommandAction.SelectCategoryFilter ||
+            parsedCommand is com.example.voice.VoiceCommandAction.OpenExternalUrl
+        ) {
+            _pendingWakeQuery.value = null
+            lastDirectVoiceDispatchPrompt = cleanPrompt
+            lastDirectVoiceDispatchAtMs = System.currentTimeMillis()
+            val handled = voiceCommandDispatcher.executeAction(
+                action = parsedCommand,
+                targetChatId = _currentChatId.value,
+                callbacks = voiceCommandCallbacks
+            )
+            if (handled) {
+                wakeWordManager.setUserVoiceTurn(false)
+                _currentDraftText.value = ""
+                return true
+            }
+        }
 
         val routingDecision = com.example.voice.WakeWordRoutingEngine.resolveTargetChatForWakeWord(
             spokenWakePhrase = matchedWake,
@@ -764,9 +1209,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // Execute in-chat voice action command if matched, otherwise directly invoke sendMessage(text = queryToDispatch, triggeredByWakeWord = true)
         lastDirectVoiceDispatchPrompt = queryToDispatch
         lastDirectVoiceDispatchAtMs = System.currentTimeMillis()
-        if (!executeInChatVoiceActionCommand(queryToDispatch, resolvedTargetId)) {
-            sendMessage(text = queryToDispatch, triggeredByWakeWord = true)
+        val handledAsActionCommand = executeInChatVoiceActionCommand(queryToDispatch, resolvedTargetId)
+        if (handledAsActionCommand) {
+            wakeWordManager.setUserVoiceTurn(false)
+            _currentDraftText.value = ""
+            return true
         }
+
+        sendMessage(text = queryToDispatch, triggeredByWakeWord = true)
 
         wakeWordManager.onKeywordHit(
             keyword = matchedWake,
@@ -831,8 +1281,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             details = "route=$cleanRoute transcript=\"${cleanedTranscript.take(50)}\" locking audio mutex before navigation"
         )
 
-        // 1. Immediately pause/suspend active microphone listening loops and release AudioRecord handles
-        //    BEFORE emitting the navigation state to prevent Samsung One UI audio policy conflicts.
+        // If navigating to "chat" or "chat/{id}", ensure a target chat session is selected and passively staged
+        if (cleanRoute.equals("chat", ignoreCase = true) || cleanRoute.startsWith("chat/", ignoreCase = true)) {
+            val explicitId = cleanRoute.removePrefix("chat/").toLongOrNull()
+            val resolvedChatId = explicitId
+                ?: _currentChatId.value
+                ?: allChats.value.firstOrNull { it.isDefaultWakeChat }?.id
+                ?: allChats.value.firstOrNull()?.id
+                ?: 1L
+            if (_currentChatId.value != resolvedChatId) {
+                selectChat(resolvedChatId)
+            } else {
+                stageChatAndUrlPassively()
+            }
+        }
+
+        // 1. Pause active utterance recognition transiently while retaining foreground audio focus
+        //    so handsFreeMode and the SpeechRecognizer listening loop stay active across internal screens.
         awaitingVoiceNavigationCommitRoute = cleanRoute
         _isNavigatingViaVoiceCommand.value = true
         _isInChatDictationActive.value = false
@@ -842,7 +1307,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         wakeWordManager.setUserVoiceTurn(false)
         audioRecorder.stopAndReleaseHardware()
         wakeWordManager.stopAndReleaseAudioRecordSynchronously()
-        wakeWordManager.abandonExclusiveAudioFocus()
         com.example.voice.WakeWordVoiceService.pauseMicrophoneForCommandDispatch(getApplication())
 
         // 2. Clear any stale draft or pending wake query so it cannot auto-send
@@ -850,25 +1314,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _pendingWakeQuery.value = null
 
         // 3. Record command in Voice Command History
+        val destinationTitle = com.example.voice.VoiceScreenDestination.entries
+            .firstOrNull { it.route.equals(cleanRoute, ignoreCase = true) }
+            ?.displayTitle
+            ?: cleanRoute.replaceFirstChar { if (it.isLowerCase()) it.titlecase(java.util.Locale.US) else it.toString() }
         webLinkHistoryManager.recordVoiceCommand(
             commandType = VoiceCommandType.WAKE_WORD,
-            triggerPhrase = "Voice History",
+            triggerPhrase = "Voice Navigation ($destinationTitle)",
             recognizedTranscript = cleanedTranscript,
-            chatTitle = currentChat.value?.title ?: "History Navigation"
+            chatTitle = currentChat.value?.title ?: "$destinationTitle Navigation"
         )
-        wakeWordManager.setStatusMessage("Opening History...")
+        wakeWordManager.setStatusMessage("Opening $destinationTitle...")
 
         // 4. Emit in-memory navigation route consumed by root NavController in MainActivity
         _pendingVoiceNavigationRoute.value = cleanRoute
 
-        // 5. Fallback settle timer (650ms) in case NavController is already on destination or running in headless test
+        // 5. Fallback settle timer (500ms) in case NavController is already on destination or running in headless test
         voiceNavigationSettleJob?.cancel()
         voiceNavigationSettleJob = viewModelScope.launch(Dispatchers.Main.immediate) {
-            kotlinx.coroutines.delay(650L)
+            kotlinx.coroutines.delay(500L)
             if (_isNavigatingViaVoiceCommand.value) {
                 completeVoiceNavigationMutexResume(
                     committedRoute = cleanRoute,
-                    triggerSource = "fallback_settle_timer_650ms"
+                    triggerSource = "fallback_settle_timer_500ms"
                 )
             }
         }
@@ -876,7 +1344,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
      * Invoked by [com.example.MainActivity] after `NavController` commits the target route
-     * (e.g., `"history"`) and the UI frame has settled. Schedules a post-commit settle delay
+     * (e.g., `"history"`, `"chat"`) and the UI frame has settled. Schedules a post-commit settle delay
      * (`450ms`) before unlocking the microphone mutex and resuming passive wake listening.
      */
     fun onVoiceNavigationDestinationCommitted(committedRoute: String, settleDelayMs: Long = 450L) {
@@ -905,18 +1373,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             stage = "VOICE_NAV_MUTEX_RESUMED",
             details = "route=$committedRoute source=$triggerSource handsFree=${_isHandsFreeActive.value} sleep=${_isSleepMode.value} autoResume=$shouldResumeListening"
         )
-        if (shouldResumeListening) {
-            speechRecognitionCoordinator.resumeAfterCommandNavigation(
-                delayMs = com.example.voice.SpeechRecognitionCoordinator.MIN_RESTART_DEBOUNCE_MS,
-                reason = "$triggerSource:$committedRoute"
-            )
-        }
+        speechRecognitionCoordinator.resumeAfterCommandNavigation(
+            delayMs = com.example.voice.SpeechRecognitionCoordinator.AUDIOFOCUS_GAIN_REARM_DEBOUNCE_MS,
+            reason = "$triggerSource:$committedRoute"
+        )
     }
 
     /**
-     * Parses and executes in-chat voice action commands after a wake word is spoken or during in-chat voice control
-     * (e.g., opening voice history, clearing chat history, reading the last reply aloud, pinning/unpinning the chat, or switching themes).
-     * Returns true if a dedicated voice action command was handled, or false if the transcript should be sent as a prompt.
+     * Parses and executes in-app voice navigation, category filtering, in-chat voice actions,
+     * and transient-guarded external URL commands via [voiceCommandDispatcher].
+     * Returns true if a dedicated voice command was handled, or false if the transcript should be sent as a prompt.
      */
     fun executeInChatVoiceActionCommand(rawTranscript: String, targetChatId: Long? = _currentChatId.value): Boolean {
         val normalized = rawTranscript.trim().lowercase(java.util.Locale.US)
@@ -934,55 +1400,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return true
         }
 
+        if (voiceCommandDispatcher.dispatch(
+                rawTranscript = rawTranscript,
+                targetChatId = targetChatId,
+                customWakeWords = activeWakeWords,
+                availableCategories = availableCategories.value,
+                callbacks = voiceCommandCallbacks
+            )
+        ) {
+            return true
+        }
+
         val chatId = targetChatId ?: _currentChatId.value ?: allChats.value.firstOrNull()?.id ?: return false
 
-        return when {
-            normalized == "clear chat" ||
-                normalized == "clear history" ||
-                normalized == "clear chat history" ||
+        val legacyHandled = when {
+            normalized == "clear chat history" ||
                 normalized == "delete chat history" -> {
                 clearChatHistory(chatId)
                 wakeWordManager.setStatusMessage("Cleared chat history via voice command")
                 true
             }
-            normalized == "read last reply" ||
-                normalized == "read reply" ||
-                normalized == "read response" ||
-                normalized == "read last message" ||
-                normalized == "speak last reply" -> {
+            normalized == "read response" -> {
                 val lastAiReply = rawCurrentMessages.value.lastOrNull { it.sender != "user" && it.content.isNotBlank() }?.content
                 if (!lastAiReply.isNullOrBlank()) {
                     speakMessage(lastAiReply)
                     wakeWordManager.setStatusMessage("Reading last reply aloud")
                 }
-                true
-            }
-            normalized == "pin chat" ||
-                normalized == "pin this chat" ||
-                normalized == "pin conversation" -> {
-                if (!pinnedChatIds.value.contains(chatId)) {
-                    togglePinnedChat(chatId)
-                }
-                wakeWordManager.setStatusMessage("Pinned chat to top of list")
-                true
-            }
-            normalized == "unpin chat" ||
-                normalized == "unpin this chat" ||
-                normalized == "unpin conversation" -> {
-                if (pinnedChatIds.value.contains(chatId)) {
-                    togglePinnedChat(chatId)
-                }
-                wakeWordManager.setStatusMessage("Unpinned chat")
-                true
-            }
-            normalized == "dark theme" || normalized == "switch to dark theme" -> {
-                updateChatTheme(chatId, AppTheme.DARK)
-                wakeWordManager.setStatusMessage("Switched chat to Dark theme")
-                true
-            }
-            normalized == "light theme" || normalized == "switch to light theme" -> {
-                updateChatTheme(chatId, AppTheme.LIGHT)
-                wakeWordManager.setStatusMessage("Switched chat to Light theme")
                 true
             }
             normalized.contains("ocean theme") || normalized.contains("cyan theme") -> {
@@ -1010,15 +1453,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 wakeWordManager.setStatusMessage("Applied Rose Quartz palette")
                 true
             }
-            normalized == "open diagnostics" ||
-                normalized == "show diagnostics" ||
-                normalized == "open diagnostic log" ||
-                normalized == "diagnostic log" -> {
-                dispatchVoiceNavigationCommand(route = "diagnostics", rawTranscript = rawTranscript)
-                true
-            }
             else -> false
         }
+        if (legacyHandled) {
+            completeVoiceCommandAndRearm("legacy_in_chat_command")
+        }
+        return legacyHandled
     }
 
     val isSpeechRecognizerListening: StateFlow<Boolean>
@@ -1345,7 +1785,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return false
         }
 
-        // 0c. Check Voice History Navigation Command ("open history", "show history", "voice history")
+        // 0c. Check Voice History or Screen/Category Navigation Commands ("open history", "open settings", "filter by work", etc.)
         //     Suspends active microphone/AudioRecord FIRST and navigates purely in-app via StateFlow.
         val activeWakeWordsForHistory = (
             allChats.value.mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
@@ -1368,6 +1808,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 dispatchVoiceNavigationCommand(
                     route = "history",
                     rawTranscript = matchedHistoryCandidate
+                )
+                return true
+            }
+            return false
+        }
+
+        val matchedNavigationOrCategoryCandidate = rawList.firstOrNull { candidate ->
+            val action = voiceCommandDispatcher.parseCommand(
+                rawTranscript = candidate,
+                customWakeWords = activeWakeWordsForHistory,
+                availableCategories = availableCategories.value
+            )
+            action is com.example.voice.VoiceCommandAction.NavigateToScreen ||
+                action is com.example.voice.VoiceCommandAction.SelectCategoryFilter ||
+                action is com.example.voice.VoiceCommandAction.OpenExternalUrl
+        }
+        if (matchedNavigationOrCategoryCandidate != null) {
+            wakeWordManager.updateLastHeardText(matchedNavigationOrCategoryCandidate)
+            if (isFinal) {
+                com.example.voice.AudioCommandSanitizer.playVoiceCommandHaptic(
+                    getApplication(),
+                    "Voice Navigation (\"$matchedNavigationOrCategoryCandidate\")"
+                )
+                executeInChatVoiceActionCommand(
+                    rawTranscript = matchedNavigationOrCategoryCandidate,
+                    targetChatId = _currentChatId.value
                 )
                 return true
             }
@@ -1470,6 +1936,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         sendMessage(text = cleanPrompt, triggeredByWakeWord = true)
                     }
                     if (_isHandsFreeActive.value && !_isSleepMode.value) {
+                        com.example.voice.WakeWordVoiceService.resumeMicrophoneAfterCommandNavigation(getApplication())
                         scheduleSpeechRecognizerRestart(
                             delayMs = com.example.voice.SpeechRecognitionCoordinator.DEFAULT_RESTART_DEBOUNCE_MS,
                             allowDuringUserVoiceTurn = true
@@ -1511,7 +1978,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     getApplication(),
                     wakeMatch.matchedWakeWord
                 )
-                stopSpeechRecognizerInternal()
+                stopSpeechRecognizerInternal(markIntentionallyPaused = false)
                 _currentDraftText.value = ""
                 if (strippedFollowUp != null) {
                     _lastDispatchedVoicePrompt.value = strippedFollowUp
@@ -1521,9 +1988,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     if (validatedPending != null) {
                         lastDirectVoiceDispatchPrompt = validatedPending
                         lastDirectVoiceDispatchAtMs = System.currentTimeMillis()
-                        if (!executeInChatVoiceActionCommand(validatedPending, wakeMatch.matchedChat?.id ?: _currentChatId.value)) {
-                            sendMessage(text = validatedPending, triggeredByWakeWord = true)
+                        val handledAsAction = executeInChatVoiceActionCommand(
+                            validatedPending,
+                            wakeMatch.matchedChat?.id ?: _currentChatId.value
+                        )
+                        if (handledAsAction) {
+                            wakeWordManager.setUserVoiceTurn(false)
+                            _currentDraftText.value = ""
+                            return true
                         }
+                        sendMessage(text = validatedPending, triggeredByWakeWord = true)
                     }
                 } else {
                     _pendingWakeQuery.value = null
@@ -1880,15 +2354,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val voiceCommandHistory: StateFlow<List<VoiceCommandHistoryEntry>> = webLinkHistoryManager.voiceCommandEntries
 
     fun submitWebSearchOrUrl(input: String): WebLinkHistoryEntry? {
-        return webLinkHistoryManager.recordSearchOrUrl(input)
+        val entry = webLinkHistoryManager.recordSearchOrUrl(input)
+        if (entry != null) {
+            stageChatAndUrlPassively(stagedUrl = entry.url)
+        }
+        return entry
     }
 
     fun recordChatLinkOpened(url: String, label: String? = null, chatTitle: String? = null): WebLinkHistoryEntry? {
-        return webLinkHistoryManager.recordChatLink(url, label, chatTitle)
+        val entry = webLinkHistoryManager.recordChatLink(url, label, chatTitle)
+        if (entry != null) {
+            stageChatAndUrlPassively(stagedUrl = entry.url)
+        }
+        return entry
     }
 
     fun recordIncomingExternalLink(url: String): WebLinkHistoryEntry? {
-        return webLinkHistoryManager.recordIncomingExternalLink(url)
+        val entry = webLinkHistoryManager.recordIncomingExternalLink(url)
+        if (entry != null) {
+            stageChatAndUrlPassively(stagedUrl = entry.url)
+        }
+        return entry
     }
 
     fun deleteWebHistoryEntry(id: String) {
@@ -2194,11 +2680,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Keep memory buffer synced with repository messages
+        // Keep memory buffer and passive Chrome Bridge staging synced with repository messages
         viewModelScope.launch {
             rawCurrentMessages.collect { messages ->
                 _currentChatId.value?.let { id ->
                     bufferManager.updateFullMessageList(id, messages)
+                    val activeChat = currentChat.value ?: allChats.value.firstOrNull { it.id == id }
+                    stageChatAndUrlPassively(chat = activeChat, messages = messages)
                 }
             }
         }
@@ -2579,11 +3067,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Start the background sync relay server for automatic Chrome synchronization
+        // Wire audio focus changes to SpeechRecognitionCoordinator (ignore CAN_DUCK, 500ms debounce on GAIN)
+        wakeWordManager.onAudioFocusChangeCallback = { focusChange ->
+            speechRecognitionCoordinator.handleAudioFocusChange(focusChange)
+        }
+
+        // Start the background sync relay server and local Chrome Bridge socket for passive staging
         localSyncServer.setChatDataProvider {
-            currentChat.value to rawCurrentMessages.value
+            val activeChat = currentChat.value ?: allChats.value.firstOrNull { it.id == _currentChatId.value }
+            activeChat to rawCurrentMessages.value
         }
         localSyncServer.start(8765)
+        ChromeBridgeSocketManager.start(application)
 
         // Observe progress and results from both direct ChatImportWorker and background FileProcessingService
         viewModelScope.launch {
@@ -2654,8 +3149,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _liveTrackedSeconds.update { it + (chatId to 0L) }
             startTickerIfNeeded()
 
-            viewModelScope.launch {
+            viewModelScope.launch(Dispatchers.IO) {
+                if (_cloudBackupChats.value.isNotEmpty()) {
+                    val existingLocal = repository.getChatByIdSync(chatId)
+                    if (existingLocal == null) {
+                        val candidateFromCloud = _cloudBackupChats.value.firstOrNull {
+                            it.localChatId == chatId || it.toChatSession().id == chatId
+                        }
+                        if (candidateFromCloud != null) {
+                            repository.upsertRemoteChat(candidateFromCloud.toChatSession().copy(id = chatId, isDeleted = false))
+                            val cloudMsgs = _cloudBackupMessages.value.filter { it.localChatId == chatId }
+                            for (msgDoc in cloudMsgs) {
+                                val chatMsg = msgDoc.toChatMessage().copy(chatId = chatId, isDeleted = false)
+                                if (chatMsg.content.isNotBlank()) {
+                                    messageRepository.upsertRemoteMessage(chatMsg)
+                                }
+                            }
+                        }
+                    }
+                }
                 bufferManager.preloadAndAttachChat(chatId)
+                val targetChat = repository.getChatByIdSync(chatId) ?: allChats.value.firstOrNull { it.id == chatId }
+                val msgs = messageRepository.getMessagesForChatSync(chatId).filter { !it.isDeleted }
+                stageChatAndUrlPassively(chat = targetChat, messages = msgs)
             }
         } else {
             // Chat is CLOSED: Reset and cancel open chat timer so it only persists as long as the chat is open
@@ -2740,9 +3256,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openCurrentChatInChrome() {
-        val chat = currentChat.value ?: return
+        val chat = currentChat.value ?: allChats.value.firstOrNull { it.id == _currentChatId.value } ?: return
         val messages = rawCurrentMessages.value
-        chromeBridge.openChatInChrome(chat, messages)
+        stageChatAndUrlPassively(chat = chat, messages = messages)
     }
 
     fun getChromeBridgePayload(): String {
@@ -2964,10 +3480,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
      * Toggles in-chat voice dictation strictly via the internal [speechRecognitionCoordinator]
-     * (`stopListening()` when listening, `startListening()` when idle) with zero external intents,
-     * keeping the app 100% pinned to the foreground.
+     * (`stopListening()` when listening, `startListening()` when idle) with zero external intents
+     * and zero `startActivity` calls, using the app's existing audio permissions.
      */
-    fun toggleInChatDictation(manualDraftText: String = ""): Boolean {
+    fun toggleInternalDictation(manualDraftText: String = ""): Boolean {
         return if (_isInChatDictationActive.value || speechRecognitionCoordinator.isInChatDictationMode) {
             val capturedSpeech = manualDraftText.trim()
                 .ifBlank { _currentDraftText.value.trim() }
@@ -2997,13 +3513,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             if (_isHandsFreeActive.value && !_isSleepMode.value) {
+                com.example.voice.WakeWordVoiceService.resumeAfterInternalDictationInMemory()
                 speechRecognitionCoordinator.scheduleDebouncedRestart(
                     delayMs = com.example.voice.SpeechRecognitionCoordinator.DEFAULT_RESTART_DEBOUNCE_MS
                 )
             }
             false
         } else {
-            if (!_hasWindowFocus.value || !speechRecognitionCoordinator.isWindowFocused || !checkRecordAudioPermission()) {
+            if (!checkRecordAudioPermission()) {
+                pendingInChatDictationAfterPermission = true
+                _requiresAudioPermission.value = true
+                wakeWordManager.setStatusMessage("Microphone permission required for in-chat voice dictation")
+                return false
+            }
+            if (!_hasWindowFocus.value || !speechRecognitionCoordinator.isWindowFocused) {
                 return false
             }
             if (textToSpeechManager.isSpeaking.value) {
@@ -3012,14 +3535,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (streamingVoicePlayer.isPlaying.value) {
                 streamingVoicePlayer.stop()
             }
-            // Completely stop any existing background service listener and native AudioRecord handles
-            // before requesting interactive speech recognition to prevent Samsung audio focus contention.
-            com.example.voice.WakeWordVoiceService.pauseMicrophoneForCommandDispatch(getApplication())
-            try {
-                getApplication<Application>().stopService(
-                    android.content.Intent(getApplication(), com.example.voice.WakeWordVoiceService::class.java)
-                )
-            } catch (_: Exception) {}
+            // Pause any existing background service listener and native AudioRecord handles purely in memory
+            // without constructing or firing any Android Intent or external Activity.
+            com.example.voice.WakeWordVoiceService.pauseForInternalDictationInMemory()
             wakeWordManager.stopContinuousListening()
             releaseAllNativeAudioRecordTracksForSpeechRecognizer()
             wakeWordManager.abandonExclusiveAudioFocus()
@@ -3038,11 +3556,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
+     * Alias for [toggleInternalDictation] preserving backward compatibility across internal call sites.
+     */
+    fun toggleInChatDictation(manualDraftText: String = ""): Boolean {
+        return toggleInternalDictation(manualDraftText)
+    }
+
+    /**
      * Starts or toggles an in-chat dictation turn via the in-process [speechRecognitionCoordinator].
      */
     fun startVoiceRecording() {
         if (!_isInChatDictationActive.value) {
-            toggleInChatDictation()
+            toggleInternalDictation()
         }
     }
 
@@ -3408,101 +3933,103 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        viewModelScope.launch {
-            _errorMessage.value = null
-            val resolvedChatId = resolveOrEnsureTargetChatId(chatId)
-            if (_currentChatId.value == null || _currentChatId.value != resolvedChatId) {
-                _currentChatId.value = resolvedChatId
-                bufferManager.preloadAndAttachChat(resolvedChatId)
-            }
-            val now = WakeWordManager.resolvePresentationTimestamp(outgoingTimestamp)
+        activeGenerationJob?.cancel()
+        activeGenerationJob = viewModelScope.launch {
+            var resolvedChatId = chatId.takeIf { it > 0L } ?: _currentChatId.value ?: 0L
+            try {
+                _errorMessage.value = null
+                _isGenerating.value = true
+                _streamingText.value = ""
 
-            val resolvedUserText = when {
-                trimmed.isNotEmpty() && !ChatMessage.isLegacyAudioPlaceholder(trimmed) -> trimmed
-                validAudioBytes != null -> {
-                    val transcribedRaw = try {
-                        geminiService.transcribeAudioSnippet(validAudioBytes, "audio/pcm").trim()
-                    } catch (_: Exception) {
-                        ""
-                    }
-                    com.example.voice.SpeechRecognitionCoordinator.extractWakeTriggeredTranscript(
-                        rawTranscript = transcribedRaw,
-                        customWakeWords = activeWakeWords
-                    ).second.takeUnless { ChatMessage.isLegacyAudioPlaceholder(it) }
-                        ?.ifBlank { trimmed.takeUnless { t -> ChatMessage.isLegacyAudioPlaceholder(t) }.orEmpty() }
-                        .orEmpty()
+                resolvedChatId = resolveOrEnsureTargetChatId(chatId)
+                if (_currentChatId.value == null || _currentChatId.value != resolvedChatId) {
+                    _currentChatId.value = resolvedChatId
+                    bufferManager.preloadAndAttachChat(resolvedChatId)
                 }
-                else -> ""
-            }
+                val now = WakeWordManager.resolvePresentationTimestamp(outgoingTimestamp)
 
-            if (resolvedUserText.isNotBlank()) {
-                _lastDispatchedVoicePrompt.value = resolvedUserText
-            }
+                val resolvedUserText = when {
+                    trimmed.isNotEmpty() && !ChatMessage.isLegacyAudioPlaceholder(trimmed) -> trimmed
+                    validAudioBytes != null -> {
+                        val transcribedRaw = try {
+                            geminiService.transcribeAudioSnippet(validAudioBytes, "audio/pcm").trim()
+                        } catch (_: Exception) {
+                            ""
+                        }
+                        com.example.voice.SpeechRecognitionCoordinator.extractWakeTriggeredTranscript(
+                            rawTranscript = transcribedRaw,
+                            customWakeWords = activeWakeWords
+                        ).second.takeUnless { ChatMessage.isLegacyAudioPlaceholder(it) }
+                            ?.ifBlank { trimmed.takeUnless { t -> ChatMessage.isLegacyAudioPlaceholder(t) }.orEmpty() }
+                            .orEmpty()
+                    }
+                    else -> ""
+                }
 
-            val userMsg = ChatMessage(
-                chatId = resolvedChatId,
-                sender = "user",
-                content = resolvedUserText,
-                timestamp = now,
-                triggeredByWakeWord = effectiveTriggeredByWakeWord,
-                attachmentUri = attachment?.uri?.toString(),
-                attachmentName = attachment?.fileName,
-                attachmentMimeType = attachment?.mimeType,
-                attachmentSizeBytes = attachment?.sizeBytes
-            ).sanitizeForPersistence()
+                if (resolvedUserText.isNotBlank()) {
+                    _lastDispatchedVoicePrompt.value = resolvedUserText
+                }
 
-            if (!userMsg.hasPersistableContent) {
-                // Never insert empty or legacy audio-placeholder-only messages into Room or memory buffer
-                return@launch
-            }
+                val userMsg = ChatMessage(
+                    chatId = resolvedChatId,
+                    sender = "user",
+                    content = resolvedUserText,
+                    timestamp = now,
+                    triggeredByWakeWord = effectiveTriggeredByWakeWord,
+                    attachmentUri = attachment?.uri?.toString(),
+                    attachmentName = attachment?.fileName,
+                    attachmentMimeType = attachment?.mimeType,
+                    attachmentSizeBytes = attachment?.sizeBytes
+                ).sanitizeForPersistence()
 
-            // Immediately append optimistic userMsg into ChatMemoryBufferManager.hotMessages before Room insertion
-            bufferManager.appendMessage(userMsg)
+                if (!userMsg.hasPersistableContent) {
+                    // Never insert empty or legacy audio-placeholder-only messages into Room or memory buffer
+                    return@launch
+                }
 
-            // Prompt text sent alongside structured inlineData parts
-            val apiPrompt = when {
-                userMsg.sanitizedTextContent.isNotEmpty() -> userMsg.sanitizedTextContent
-                attachment != null -> "Please analyze this attached file."
-                else -> ""
-            }
+                // Immediately append optimistic userMsg into ChatMemoryBufferManager.hotMessages before Room insertion
+                bufferManager.appendMessage(userMsg)
 
-            // 1. Insert user message into Room safely via MessageDao (@Insert(onConflict = IGNORE))
-            //    which also atomically increments ChatSession.totalVoiceCommands when triggeredByWakeWord = true.
-            val userMsgId = messageRepository.insertMessage(userMsg)
-            if (userMsgId <= 0) {
-                // Duplicate [chatId, timestamp, sender] turn ignored or parent chat missing; abort duplicate AI generation
-                return@launch
-            }
-            val savedUserMsg = userMsg.copy(id = userMsgId)
-            com.example.util.AppSettingsManager.applyCategoryToMessage(
-                context = getApplication(),
-                messageId = userMsgId,
-                chatId = resolvedChatId
-            )
-            bufferManager.appendMessage(savedUserMsg)
-            localSyncServer.publishOutgoingTurnToSse(savedUserMsg)
-            syncMessageToCloudIfSignedIn(savedUserMsg)
-            syncChatToCloudIfSignedIn(resolvedChatId)
+                // Prompt text sent alongside structured inlineData parts
+                val apiPrompt = when {
+                    userMsg.sanitizedTextContent.isNotEmpty() -> userMsg.sanitizedTextContent
+                    attachment != null -> "Please analyze this attached file."
+                    else -> ""
+                }
 
-            // 2. Fetch current chat details for system instruction and full chronological message history
-            val chat = repository.getChatByIdSync(resolvedChatId)
-            val systemPrompt = chat?.systemInstruction ?: "You are Gemini, an intelligent and helpful AI assistant."
-            val history = withContext(Dispatchers.IO) {
-                messageRepository.getMessagesForChatSync(resolvedChatId)
-                    .filter { it.id != userMsgId && !it.isDeleted }
-            }
+                // 1. Insert user message into Room safely via MessageDao (@Insert(onConflict = IGNORE))
+                //    which also atomically increments ChatSession.totalVoiceCommands when triggeredByWakeWord = true.
+                val userMsgId = messageRepository.insertMessage(userMsg)
+                if (userMsgId <= 0) {
+                    // Duplicate [chatId, timestamp, sender] turn ignored or parent chat missing; abort duplicate AI generation
+                    return@launch
+                }
+                val savedUserMsg = userMsg.copy(id = userMsgId)
+                com.example.util.AppSettingsManager.applyCategoryToMessage(
+                    context = getApplication(),
+                    messageId = userMsgId,
+                    chatId = resolvedChatId
+                )
+                bufferManager.appendMessage(savedUserMsg)
+                localSyncServer.publishOutgoingTurnToSse(savedUserMsg)
+                syncMessageToCloudIfSignedIn(savedUserMsg)
+                syncChatToCloudIfSignedIn(resolvedChatId)
 
-            _isGenerating.value = true
-            _streamingText.value = ""
+                // 2. Fetch current chat details for system instruction and full chronological message history
+                val chat = repository.getChatByIdSync(resolvedChatId)
+                val systemPrompt = chat?.systemInstruction ?: "You are Gemini, an intelligent and helpful AI assistant."
+                val history = withContext(Dispatchers.IO) {
+                    messageRepository.getMessagesForChatSync(resolvedChatId)
+                        .filter { it.id != userMsgId && !it.isDeleted }
+                }
+                stageChatAndUrlPassively(chat = chat, messages = history + savedUserMsg)
 
-            activeGenerationJob?.cancel()
-            activeGenerationJob = launch {
                 val fullResponse = StringBuilder()
-                try {
-                    streamingVoicePlayer.stop()
-                    textToSpeechManager.stop()
-                    val requestAudio = _voiceEngineMode.value == com.example.voice.VoiceEngineMode.GEMINI_ORION && _isAutoSpeakEnabled.value
+                runCatching { streamingVoicePlayer.stop() }
+                runCatching { textToSpeechManager.stop() }
+                val requestAudio = _voiceEngineMode.value == com.example.voice.VoiceEngineMode.GEMINI_ORION && _isAutoSpeakEnabled.value
 
+                kotlinx.coroutines.withTimeout(45_000L) {
                     geminiService.streamChatResponse(
                         context = getApplication(),
                         systemInstruction = systemPrompt,
@@ -3521,63 +4048,85 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         fullResponse.append(chunk)
                         _streamingText.value = fullResponse.toString()
                     }
+                }
 
-                    val finalAnswer = fullResponse.toString().trim()
-                    if (finalAnswer.isNotEmpty() && _currentChatId.value == resolvedChatId) {
-                        val aiMsg = ChatMessage(
-                            chatId = resolvedChatId,
+                val finalAnswer = fullResponse.toString().trim()
+                if (finalAnswer.isNotEmpty() && _currentChatId.value == resolvedChatId) {
+                    val aiMsg = ChatMessage(
+                        chatId = resolvedChatId,
+                        sender = "gemini",
+                        content = finalAnswer,
+                        timestamp = WakeWordManager.resolvePresentationTimestamp(System.currentTimeMillis())
+                    )
+                    val aiMsgId = repository.insertMessage(aiMsg)
+                    if (aiMsgId > 0) {
+                        val savedAiMsg = aiMsg.copy(id = aiMsgId)
+                        com.example.util.AppSettingsManager.applyCategoryToMessage(
+                            context = getApplication(),
+                            messageId = aiMsgId,
+                            chatId = resolvedChatId
+                        )
+                        bufferManager.appendMessage(savedAiMsg)
+                        localSyncServer.publishOutgoingTurnToSse(savedAiMsg)
+                        stageChatAndUrlPassively(chat = chat, messages = history + savedUserMsg + savedAiMsg)
+                        syncMessageToCloudIfSignedIn(savedAiMsg)
+                    }
+                    if (_isAutoSpeakEnabled.value &&
+                        _voiceEngineMode.value != com.example.voice.VoiceEngineMode.MUTED &&
+                        !streamingVoicePlayer.isPlaying.value
+                    ) {
+                        textToSpeechManager.speak(finalAnswer)
+                    }
+                    ReplyNotificationHelper.notifyModelReplyIfBackgroundedOrScreenOff(
+                        context = getApplication(),
+                        notifySettingEnabled = _notifyActiveChatReplies.value,
+                        isAppInForeground = isAppInForeground,
+                        chatId = resolvedChatId,
+                        chatTitle = chat?.title ?: "Gemini Chat",
+                        replyText = finalAnswer
+                    )
+                } else if (finalAnswer.isEmpty()) {
+                    throw IllegalStateException("Gemini returned an empty response.")
+                }
+            } catch (e: Throwable) {
+                if (e is kotlinx.coroutines.CancellationException && e !is kotlinx.coroutines.TimeoutCancellationException) {
+                    throw e
+                }
+                val errorDescription = e.localizedMessage ?: e.message ?: "Failed to generate response."
+                val formattedChatError = "⚠️ Error: $errorDescription"
+                _errorMessage.value = errorDescription
+                withContext(kotlinx.coroutines.NonCancellable) {
+                    val targetErrorChatId = resolvedChatId.takeIf { it > 0L } ?: _currentChatId.value ?: 0L
+                    if (targetErrorChatId > 0L) {
+                        val errorMsg = ChatMessage(
+                            chatId = targetErrorChatId,
                             sender = "gemini",
-                            content = finalAnswer,
+                            content = formattedChatError,
                             timestamp = WakeWordManager.resolvePresentationTimestamp(System.currentTimeMillis())
                         )
-                        val aiMsgId = repository.insertMessage(aiMsg)
-                        if (aiMsgId > 0) {
-                            val savedAiMsg = aiMsg.copy(id = aiMsgId)
-                            com.example.util.AppSettingsManager.applyCategoryToMessage(
-                                context = getApplication(),
-                                messageId = aiMsgId,
-                                chatId = resolvedChatId
-                            )
-                            bufferManager.appendMessage(savedAiMsg)
-                            localSyncServer.publishOutgoingTurnToSse(savedAiMsg)
-                            syncMessageToCloudIfSignedIn(savedAiMsg)
-                        }
-                        if (_isAutoSpeakEnabled.value &&
-                            _voiceEngineMode.value != com.example.voice.VoiceEngineMode.MUTED &&
-                            !streamingVoicePlayer.isPlaying.value
-                        ) {
-                            textToSpeechManager.speak(finalAnswer)
-                        }
-                        ReplyNotificationHelper.notifyModelReplyIfBackgroundedOrScreenOff(
-                            context = getApplication(),
-                            notifySettingEnabled = _notifyActiveChatReplies.value,
-                            isAppInForeground = isAppInForeground,
-                            chatId = resolvedChatId,
-                            chatTitle = chat?.title ?: "Gemini Chat",
-                            replyText = finalAnswer
-                        )
+                        val insertedErrorId = runCatching { repository.insertMessage(errorMsg) }.getOrDefault(0L)
+                        val persistedErrorMsg = if (insertedErrorId > 0L) errorMsg.copy(id = insertedErrorId) else errorMsg
+                        bufferManager.appendMessage(persistedErrorMsg)
                     }
-                } catch (e: Exception) {
-                    _errorMessage.value = e.localizedMessage ?: "Failed to generate response."
-                } finally {
-                    _isGenerating.value = false
-                    _streamingText.value = null
-                    // Post-turn mic behavior:
-                    // - Hands-Free ON: Re-initialize and restart wake-word listening once audio playback has finished
-                    // - Hands-Free OFF (Walkie-Talkie mode): Stay stopped until manually triggered
-                    if (_isHandsFreeActive.value &&
-                        !_isSleepMode.value &&
-                        !streamingVoicePlayer.isPlaying.value &&
-                        !textToSpeechManager.isSpeaking.value
-                    ) {
-                        speechRecognitionCoordinator.setProcessingState(false)
-                        speechRecognitionCoordinator.setIntentionallyPaused(false)
-                        scheduleSpeechRecognizerRestart(
-                            delayMs = com.example.voice.SpeechRecognitionCoordinator.DEFAULT_RESTART_DEBOUNCE_MS,
-                            allowDuringUserVoiceTurn = true
-                        )
-                        wakeWordManager.restartWakeListeningAfterTurn()
-                    }
+                }
+            } finally {
+                _isGenerating.value = false
+                _streamingText.value = null
+                // Post-turn mic behavior:
+                // - Hands-Free ON: Re-initialize and restart wake-word listening once audio playback has finished
+                // - Hands-Free OFF (Walkie-Talkie mode): Stay stopped until manually triggered
+                if (_isHandsFreeActive.value &&
+                    !_isSleepMode.value &&
+                    !streamingVoicePlayer.isPlaying.value &&
+                    !textToSpeechManager.isSpeaking.value
+                ) {
+                    speechRecognitionCoordinator.setProcessingState(false)
+                    speechRecognitionCoordinator.setIntentionallyPaused(false)
+                    scheduleSpeechRecognizerRestart(
+                        delayMs = com.example.voice.SpeechRecognitionCoordinator.DEFAULT_RESTART_DEBOUNCE_MS,
+                        allowDuringUserVoiceTurn = true
+                    )
+                    wakeWordManager.restartWakeListeningAfterTurn()
                 }
             }
         }
@@ -3938,35 +4487,71 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         com.example.voice.AudioCommandSanitizer.playHeartbeatConfirmation(getApplication())
     }
 
+    private var windowFocusDebounceJob: Job? = null
+
     fun onWindowFocusChanged(hasFocus: Boolean) {
         _hasWindowFocus.value = hasFocus
+        windowFocusDebounceJob?.cancel()
+        windowFocusDebounceJob = null
+
         val isHandsFreeModeEnabled = _isHandsFreeActive.value && !_isSleepMode.value
         val isProcessingCommand = speechRecognitionCoordinator.isProcessing ||
             _isGenerating.value ||
             isOrionVoicePlaying.value ||
             textToSpeechManager.isSpeaking.value ||
             _isNavigatingViaVoiceCommand.value
+
         if (hasFocus && isHandsFreeModeEnabled && !isProcessingCommand) {
             audioRecorder.setIntentionallyPaused(false)
             speechRecognitionCoordinator.setIntentionallyPaused(false)
         }
         speechRecognitionCoordinator.setWindowFocused(hasFocus)
         wakeWordManager.setWindowFocused(hasFocus)
-        if (!hasFocus) {
-            _isInChatDictationActive.value = false
-            speechRecognitionCoordinator.stopListening(markIntentionallyPaused = false)
-            releaseAllNativeAudioRecordTracksForSpeechRecognizer()
-        } else if (isAppInForeground &&
-            isHandsFreeModeEnabled &&
-            !isProcessingCommand &&
-            checkRecordAudioPermission()
-        ) {
-            if (!wakeWordManager.isListening.value &&
-                !speechRecognitionCoordinator.isListening.value &&
-                !speechRecognitionCoordinator.hasPendingRestart
+
+        // Enforce a strict 1500ms debounce on windowFocus changes so pulling down the notification shade
+        // or opening a dialog never rapidly cycles startListening/stopListening or recreates SpeechRecognizer.
+        windowFocusDebounceJob = viewModelScope.launch {
+            delay(com.example.voice.SpeechRecognitionCoordinator.WINDOW_FOCUS_DEBOUNCE_MS)
+            if (_hasWindowFocus.value != hasFocus) return@launch
+            val handsFreeNow = _isHandsFreeActive.value && !_isSleepMode.value
+            val processingNow = speechRecognitionCoordinator.isProcessing ||
+                _isGenerating.value ||
+                isOrionVoicePlaying.value ||
+                textToSpeechManager.isSpeaking.value ||
+                _isNavigatingViaVoiceCommand.value
+            if (!hasFocus) {
+                _isInChatDictationActive.value = false
+                if (!handsFreeNow) {
+                    speechRecognitionCoordinator.stopListening(markIntentionallyPaused = false)
+                    releaseAllNativeAudioRecordTracksForSpeechRecognizer()
+                }
+            } else if (isAppInForeground &&
+                handsFreeNow &&
+                !processingNow &&
+                checkRecordAudioPermission()
             ) {
-                speechRecognitionCoordinator.startListening(userInitiated = false)
+                if (!wakeWordManager.isListening.value &&
+                    !speechRecognitionCoordinator.isListening.value &&
+                    !speechRecognitionCoordinator.hasPendingRestart
+                ) {
+                    speechRecognitionCoordinator.startListening(userInitiated = false)
+                }
             }
+        }
+    }
+
+    /**
+     * Invoked from `MainActivity.onPause()`. Preserves `_isHandsFreeActive` (`TRUE`), never emits
+     * `RADAR_TOGGLE_OFF`, and never invokes `stopListening(markIntentionallyPaused = true)`.
+     */
+    fun onAppPaused() {
+        _isInChatDictationActive.value = false
+        speechRecognitionCoordinator.setInChatDictationMode(false)
+        if (_isHandsFreeActive.value && !_isSleepMode.value && !speechRecognitionCoordinator.isProcessing) {
+            com.example.voice.WakeWordVoiceService.startServiceSafely(
+                context = getApplication(),
+                action = com.example.voice.WakeWordVoiceService.ACTION_START_VOICE_SERVICE
+            )
         }
     }
 
@@ -4084,6 +4669,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     wakeWord = chat.wakeWord,
                     sensitivity = _wakeWordSensitivity.value
                 )
+                val savedChat = chat.copy(id = id)
+                val existingMessages = withContext(Dispatchers.IO) {
+                    messageRepository.getMessagesForChatSync(id).filter { !it.isDeleted }
+                }
+                stageChatAndUrlPassively(chat = savedChat, messages = existingMessages)
                 syncChatToCloudIfSignedIn(id)
             }
             onComplete?.invoke(id)
@@ -4240,12 +4830,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             com.example.util.AppSettingsManager.unpinChat(getApplication(), chatId)
             deleteWakeWordSamples(chatId)
             wakeWordRepository.deleteWakeWordsForChat(chatId)
+            // Strictly delete from local Room database only; Cloud Firestore backups are preserved
+            // unless explicitly deleted by the user in the Cloud Backup & Restore Vault.
             repository.deleteChat(chatId)
-            _currentUserUid.value?.let { uid ->
-                viewModelScope.launch(Dispatchers.IO) {
-                    runCatching { firebaseSyncRepository?.deleteChat(uid, chatId) }
-                }
-            }
         }
     }
 
@@ -4779,6 +5366,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun cleanShutdown(activity: android.app.Activity?) {
         try {
             timerTickerJob?.cancel()
+            cloudSyncJob?.cancel()
+            voiceNavigationSettleJob?.cancel()
+            activeGenerationJob?.cancel()
             destroySpeechRecognizerInternal()
             wakeWordManager.stopContinuousListening()
             wakeWordManager.destroy()
@@ -4788,7 +5378,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             localSyncServer.stop()
             screenshotWatcher.stopWatching()
             networkStatusTracker.stopTracking()
-            activeGenerationJob?.cancel()
+            viewModelScope.coroutineContext.cancelChildren()
         } catch (_: Exception) {}
         activity?.finishAffinity()
     }

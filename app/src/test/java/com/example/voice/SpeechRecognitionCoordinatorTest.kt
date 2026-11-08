@@ -181,8 +181,14 @@ class SpeechRecognitionCoordinatorTest {
         assertEquals("true", parsed.mutexFlags["listening"])
 
         coordinator.pauseForCommandDispatch("test_nav")
-        assertTrue(coordinator.mutexSnapshotFlow.value.isIntentionallyPaused)
+        assertFalse(coordinator.mutexSnapshotFlow.value.isIntentionallyPaused)
         assertTrue(coordinator.mutexSnapshotFlow.value.isProcessing)
+        assertTrue(coordinator.mutexSnapshotFlow.value.isProcessingCommand)
+
+        coordinator.completeCommandProcessingAndRearm(delayMs = 1500L, reason = "test_nav_done")
+        assertFalse(coordinator.mutexSnapshotFlow.value.isProcessing)
+        assertFalse(coordinator.mutexSnapshotFlow.value.isProcessingCommand)
+        assertFalse(coordinator.mutexSnapshotFlow.value.isIntentionallyPaused)
 
         coordinator.clearTraceHistory()
         assertTrue(coordinator.traceHistory.value.isEmpty())
@@ -244,8 +250,14 @@ class SpeechRecognitionCoordinatorTest {
             isContinuousModeEnabled = { true }
         )
 
-        // Simulate a stale background pause
+        // When hands-free is active, losing window focus preserves hands-free listening without setting isIntentionallyPaused
         coordinator.setWindowFocused(false)
+        assertFalse(coordinator.isIntentionallyPaused)
+        assertTrue(
+            coordinator.traceHistory.value.any { it.contains("SET_WINDOW_FOCUSED_BACKGROUND_HANDSFREE") }
+        )
+
+        // Simulate a stale background pause
         coordinator.setIntentionallyPaused(true)
         assertTrue(coordinator.isIntentionallyPaused)
 

@@ -363,11 +363,13 @@ fun TopBarHandsFreeRadarPill(
     }
 
     Surface(
-        shape = RoundedCornerShape(20.dp),
+        shape = RoundedCornerShape(16.dp),
         color = containerColor,
         border = BorderStroke(1.dp, borderColor),
         modifier = modifier
-            .clip(RoundedCornerShape(20.dp))
+            .padding(start = 6.dp)
+            .widthIn(max = 102.dp)
+            .clip(RoundedCornerShape(16.dp))
             .clickable {
                 val now = System.currentTimeMillis()
                 if (lastClickTimestampMs > 0L && (now - lastClickTimestampMs) < MIN_RADAR_PILL_CLICK_DEBOUNCE_MS) {
@@ -382,21 +384,21 @@ fun TopBarHandsFreeRadarPill(
             .testTag("${testTagPrefix}_topbar_hands_free_pill")
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+            modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            // Live green status dot whose scale and halo react directly to audioRmsDb
+            // Compact live green status dot whose scale and halo react directly to audioRmsDb
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
-                    .size(12.dp)
+                    .size(9.dp)
                     .testTag("${testTagPrefix}_topbar_hands_free_dot")
             ) {
                 if (isActive && !isSleepMode) {
                     Box(
                         modifier = Modifier
-                            .size(12.dp)
+                            .size(9.dp)
                             .scale(dotScale)
                             .clip(CircleShape)
                             .background(liveGreen.copy(alpha = 0.25f + smoothedEnergy * 0.35f))
@@ -404,7 +406,7 @@ fun TopBarHandsFreeRadarPill(
                 }
                 Box(
                     modifier = Modifier
-                        .size(7.dp)
+                        .size(5.5.dp)
                         .scale(if (isActive && !isSleepMode) 0.95f + smoothedEnergy * 0.25f else 1f)
                         .clip(CircleShape)
                         .background(
@@ -417,27 +419,26 @@ fun TopBarHandsFreeRadarPill(
                 )
             }
 
-            // 4-bar pulsating wave HUD bound directly to audioRmsDb
+            // Compact pulsating wave HUD bound directly to audioRmsDb
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(2.dp),
+                horizontalArrangement = Arrangement.spacedBy(1.5.dp),
                 modifier = Modifier
-                    .height(14.dp)
+                    .height(11.dp)
                     .testTag("${testTagPrefix}_topbar_rms_wave_hud")
             ) {
-                for (barIdx in 0 until 4) {
+                for (barIdx in 0 until 3) {
                     val waveModulation = if (isActive && !isSleepMode) {
                         val harmonic = ((sin(wavePhase + barIdx * 1.15f) + 1f) * 0.5f)
-                        // Base responsiveness directly driven by smoothedEnergy (from audioRmsDb)
                         (0.22f + smoothedEnergy * (0.45f + 0.33f * harmonic)).coerceIn(0.2f, 1f)
                     } else {
                         0.22f
                     }
                     Box(
                         modifier = Modifier
-                            .width(2.5.dp)
-                            .height((14f * waveModulation).dp)
-                            .clip(RoundedCornerShape(2.dp))
+                            .width(2.dp)
+                            .height((11f * waveModulation).dp)
+                            .clip(RoundedCornerShape(1.dp))
                             .background(
                                 when {
                                     isSleepMode -> MaterialTheme.colorScheme.tertiary.copy(alpha = 0.7f)
@@ -453,22 +454,24 @@ fun TopBarHandsFreeRadarPill(
                 text = when {
                     isSleepMode -> "Sleep"
                     isActive -> if (smoothedEnergy > 0.18f) {
-                        "${audioRmsDb.toInt()} dB"
+                        "${audioRmsDb.toInt()}dB"
                     } else {
-                        "Radar ON"
+                        "Radar"
                     }
                     else -> "Hands-Free"
                 },
                 style = MaterialTheme.typography.labelSmall.copy(
                     fontWeight = FontWeight.Bold,
-                    fontSize = 11.sp
+                    fontSize = 9.5.sp
                 ),
                 color = when {
                     isSleepMode -> MaterialTheme.colorScheme.tertiary
                     isActive -> liveGreen
                     else -> MaterialTheme.colorScheme.onSurfaceVariant
                 },
-                maxLines = 1
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f, fill = false)
             )
 
             Icon(
@@ -479,7 +482,7 @@ fun TopBarHandsFreeRadarPill(
                     isActive -> liveGreen
                     else -> MaterialTheme.colorScheme.onSurfaceVariant
                 },
-                modifier = Modifier.size(14.dp)
+                modifier = Modifier.size(11.dp)
             )
         }
     }

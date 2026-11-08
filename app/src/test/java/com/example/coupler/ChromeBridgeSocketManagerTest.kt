@@ -166,4 +166,60 @@ class ChromeBridgeSocketManagerTest {
         val bridgeUrl = GeminiCouplerBridge.getBridgeUrl()
         assertTrue(bridgeUrl.startsWith("http://127.0.0.1:$port/?nonce=$nonce"))
     }
+
+    @Test
+    fun testPassiveChromeBridgeAndRelayStagingWithoutExternalActivityLaunch() {
+        val app = context as android.app.Application
+        val shadowApp = org.robolectric.Shadows.shadowOf(app)
+        shadowApp.clearNextStartedActivities()
+
+        val chat = com.example.data.model.ChatSession(
+            id = 77L,
+            title = "Passive Relay Chat",
+            wakeWord = "Hey Relay",
+            systemInstruction = "Helpful assistant"
+        )
+        val messages = listOf(
+            com.example.data.model.ChatMessage(
+                id = 1L,
+                chatId = 77L,
+                sender = "user",
+                content = "Stage this conversation passively",
+                timestamp = 1730000001000L
+            )
+        )
+
+        // 1. ChromeBridgeSocketManager.launchChromeBridge stages passively without startActivity()
+        val launched = ChromeBridgeSocketManager.launchChromeBridge(context, chat)
+        assertTrue(launched)
+        org.junit.Assert.assertNull(
+            "launchChromeBridge must never fire startActivity()",
+            shadowApp.nextStartedActivity
+        )
+        val bridgeState = ChromeBridgeSocketManager.bridgeState.value
+        assertEquals(77L, bridgeState.stagedChatId)
+        assertEquals("Passive Relay Chat", bridgeState.stagedChatTitle)
+        assertTrue(bridgeState.stagedUrlPayload.contains("chatId=77"))
+
+        // 2. ChromeAppBridge.openChatInChrome stages HTML & JSON in cache + socket buffer without startActivity()
+        val appBridge = com.example.bridge.ChromeAppBridge(context)
+        appBridge.openChatInChrome(chat, messages)
+        org.junit.Assert.assertNull(
+            "openChatInChrome must never fire startActivity()",
+            shadowApp.nextStartedActivity
+        )
+        assertEquals(1, ChromeBridgeSocketManager.bridgeState.value.stagedMessagesCount)
+        assertTrue(ChromeBridgeSocketManager.stagedJsonPayload.contains("Stage this conversation passively"))
+
+        // 3. LocalSyncRelayServer stages chat and URL payload on 127.0.0.1:8765
+        val relay = com.example.bridge.LocalSyncRelayServer(
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Unconfined),
+            onMessageReceivedFromChrome = {}
+        )
+        relay.stageChatAndUrlPayload(chat, messages, "https://gemini.google.com/app")
+        assertEquals(77L, relay.serverState.value.stagedChatId)
+        assertEquals("Passive Relay Chat", relay.serverState.value.stagedChatTitle)
+        assertEquals("https://gemini.google.com/app", relay.serverState.value.stagedUrlPayload)
+        assertEquals(1, relay.serverState.value.stagedMessageCount)
+    }
 }

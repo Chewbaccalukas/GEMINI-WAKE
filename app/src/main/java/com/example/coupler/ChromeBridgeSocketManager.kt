@@ -1,10 +1,9 @@
 package com.example.coupler
 
-import android.content.ActivityNotFoundException
 import android.content.Context
-import android.content.Intent
 import android.net.Uri
 import android.util.Log
+import com.example.data.model.ChatMessage
 import com.example.data.model.ChatSession
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -13,6 +12,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
@@ -37,7 +38,8 @@ data class BridgePacket(
 )
 
 /**
- * State representing the status of the local Chrome Bridge socket connection.
+ * State representing the status of the local Chrome Bridge socket connection
+ * and passively staged chat/URL payloads.
  */
 data class ChromeBridgeState(
     val isRunning: Boolean = false,
@@ -48,7 +50,12 @@ data class ChromeBridgeState(
     val cacheDirSizeBytes: Long = 0L,
     val lastResetTimestamp: Long = 0L,
     val lastError: String? = null,
-    val isHeartbeatMode: Boolean = false
+    val isHeartbeatMode: Boolean = false,
+    val stagedChatId: Long = 0L,
+    val stagedChatTitle: String = "",
+    val stagedUrlPayload: String = "",
+    val stagedMessagesCount: Int = 0,
+    val lastStagedTimestamp: Long = 0L
 )
 
 /**
@@ -79,8 +86,8 @@ class PacketRingBuffer(private val capacity: Int = 64) {
 }
 
 /**
- * ChromeBridgeSocketManager coordinates external browser connections between Gemini Wake
- * and local browser environments (e.g. Chrome on Android or web tabs).
+ * ChromeBridgeSocketManager coordinates passive background staging between Gemini Wake
+ * and local browser environments (e.g. Chrome extension/client querying the local relay).
  *
  * Key Architecture:
  * 1. Dynamic Ephemeral Port: Binds to ServerSocket(0) on 127.0.0.1 (loopback only) to ensure
@@ -89,16 +96,18 @@ class PacketRingBuffer(private val capacity: Int = 64) {
  *    requests MUST supply ?nonce=... or receive HTTP 403 Forbidden, protecting against local port sniffing.
  * 3. Force Reset & Clear: Closes active client streams, flushes in-memory packet ring buffers,
  *    wipes local bridge cache directories, and immediately rebinds to a fresh random port.
- * 4. Chrome Intent Launch: Directly launches the authenticated bridge link in Google Chrome
- *    (com.android.chrome) with a graceful fallback to the default browser.
+ * 4. Passive Socket Buffer Staging: Passively stages chat sessions, messages, and URL payloads
+ *    in the local socket buffer without ever launching Chrome via Intent or startActivity().
  */
 object ChromeBridgeSocketManager {
 
     private const val TAG = "ChromeBridgeSocket"
-    private const val CHROME_PACKAGE = "com.android.chrome"
     private const val BRIDGE_CACHE_DIR = "chrome_bridge"
+    private const val STAGED_PAYLOAD_FILENAME = "staged_bridge_payload.json"
 
     const val ROUTE_SCREENSHOT = "/screenshot"
+    const val ROUTE_STAGED = "/staged"
+    const val ROUTE_SYNC = "/sync"
     const val FRAME_TYPE_TEXT: Byte = 0x01
     const val FRAME_TYPE_SCREENSHOT: Byte = 0x02
 
@@ -116,6 +125,22 @@ object ChromeBridgeSocketManager {
     val bridgeState: StateFlow<ChromeBridgeState> = _bridgeState.asStateFlow()
 
     private val stateLock = Any()
+
+    @Volatile
+    var stagedChatSession: ChatSession? = null
+        private set
+
+    @Volatile
+    var stagedMessages: List<ChatMessage> = emptyList()
+        private set
+
+    @Volatile
+    var stagedUrlPayload: String = ""
+        private set
+
+    @Volatile
+    var stagedJsonPayload: String = ""
+        private set
 
     /**
      * Initializes and starts the loopback bridge socket on an ephemeral port if not already running.
@@ -166,6 +191,7 @@ object ChromeBridgeSocketManager {
                 summary = "Ephemeral port $port bound with fresh session nonce"
             )
 
+            val prev = _bridgeState.value
             _bridgeState.value = ChromeBridgeState(
                 isRunning = true,
                 boundPort = port,
@@ -175,7 +201,12 @@ object ChromeBridgeSocketManager {
                 cacheDirSizeBytes = calculateCacheDirSize(context),
                 lastResetTimestamp = System.currentTimeMillis(),
                 lastError = null,
-                isHeartbeatMode = false
+                isHeartbeatMode = false,
+                stagedChatId = prev.stagedChatId,
+                stagedChatTitle = prev.stagedChatTitle,
+                stagedUrlPayload = prev.stagedUrlPayload,
+                stagedMessagesCount = prev.stagedMessagesCount,
+                lastStagedTimestamp = prev.lastStagedTimestamp
             )
 
             // Start listening loop
@@ -231,8 +262,19 @@ object ChromeBridgeSocketManager {
         serverSocket = null
 
         if (!preserveDiskCache) {
-            // Full nuclear wipe: flush ring buffer and wipe bridge cache directory
+            // Full nuclear wipe: flush ring buffer, staged payloads, and wipe bridge cache directory
             packetRingBuffer.clear()
+            stagedChatSession = null
+            stagedMessages = emptyList()
+            stagedUrlPayload = ""
+            stagedJsonPayload = ""
+            _bridgeState.value = _bridgeState.value.copy(
+                stagedChatId = 0L,
+                stagedChatTitle = "",
+                stagedUrlPayload = "",
+                stagedMessagesCount = 0,
+                lastStagedTimestamp = 0L
+            )
             try {
                 val cacheDir = getCacheDir(context)
                 if (cacheDir.exists()) {
@@ -343,53 +385,124 @@ object ChromeBridgeSocketManager {
     }
 
     /**
-     * Launches the authenticated bridge URL in Google Chrome via Chrome Intent (com.android.chrome),
-     * falling back to the standard web browser intent if Chrome is not installed.
+     * Passively stages chat data, messages, and URL payload into the local socket buffer and disk cache.
+     * The data sits ready in the local socket buffer for when the user manually opens Chrome later.
+     * Never fires Intent(Intent.ACTION_VIEW) or startActivity().
      */
-    fun launchChromeBridge(context: Context, chatSession: ChatSession? = null): Boolean {
-        // Ensure bridge is active
-        if (!_bridgeState.value.isRunning || serverSocket == null || serverSocket!!.isClosed) {
-            start(context)
+    fun stageChatAndUrlPayload(
+        context: Context,
+        chatSession: ChatSession? = stagedChatSession,
+        messages: List<ChatMessage> = stagedMessages,
+        urlPayload: String? = null,
+        bridgeJsonPayload: String? = null
+    ): String = synchronized(stateLock) {
+        if (!_bridgeState.value.isRunning && !_bridgeState.value.isHeartbeatMode) {
+            bindAndListen(context)
         }
 
-        val baseUrl = getBridgeUrl()
-        val finalUrl = if (chatSession != null) {
-            "$baseUrl&chatTitle=${Uri.encode(chatSession.title)}&wakeWord=${Uri.encode(chatSession.wakeWord)}"
-        } else {
-            baseUrl
+        if (chatSession != null) {
+            stagedChatSession = chatSession
         }
+        if (messages.isNotEmpty() || chatSession != null) {
+            stagedMessages = messages
+        }
+
+        val activeChat = stagedChatSession
+        val activeMessages = stagedMessages
+        val baseUrl = getBridgeUrl()
+        val resolvedUrl = when {
+            !urlPayload.isNullOrBlank() -> urlPayload
+            stagedUrlPayload.isNotBlank() && chatSession == null -> stagedUrlPayload
+            activeChat != null -> "$baseUrl&chatId=${activeChat.id}&chatTitle=${Uri.encode(activeChat.title)}&wakeWord=${Uri.encode(activeChat.wakeWord)}"
+            else -> baseUrl
+        }
+        stagedUrlPayload = resolvedUrl
+
+        val now = System.currentTimeMillis()
+        val jsonString = bridgeJsonPayload ?: buildStagedPayloadJson(
+            chat = activeChat,
+            messages = activeMessages,
+            stagedUrl = resolvedUrl,
+            timestamp = now
+        )
+        stagedJsonPayload = jsonString
+
+        writeCacheRecord(context, STAGED_PAYLOAD_FILENAME, jsonString)
+        val payloadBytes = jsonString.toByteArray(Charsets.UTF_8)
 
         recordPacket(
-            type = "CHROME_INTENT_DISPATCH",
-            sizeBytes = finalUrl.toByteArray().size,
-            summary = "Dispatching Chrome intent to $CHROME_PACKAGE"
+            type = "CHROME_BRIDGE_STAGED",
+            sizeBytes = payloadBytes.size,
+            summary = "Passively staged chat '${activeChat?.title ?: "Default"}' (${activeMessages.size} msgs) & URL payload in local socket buffer"
         )
 
-        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(finalUrl)).apply {
-            setPackage(CHROME_PACKAGE)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
+        _bridgeState.value = _bridgeState.value.copy(
+            stagedChatId = activeChat?.id ?: 0L,
+            stagedChatTitle = activeChat?.title ?: "",
+            stagedUrlPayload = resolvedUrl,
+            stagedMessagesCount = activeMessages.size,
+            lastStagedTimestamp = now,
+            bufferedPacketsCount = packetRingBuffer.size(),
+            cacheDirSizeBytes = calculateCacheDirSize(context)
+        )
+        return resolvedUrl
+    }
 
-        return try {
-            context.startActivity(intent)
-            true
-        } catch (_: ActivityNotFoundException) {
-            // Fallback to default browser
-            Log.w(TAG, "Chrome package not found, falling back to default browser Intent")
-            try {
-                val fallbackIntent = Intent(Intent.ACTION_VIEW, Uri.parse(finalUrl)).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    /**
+     * Passively stages a normalized URL payload in the local socket buffer without launching Chrome.
+     */
+    fun stageUrlPayload(context: Context, normalizedUrl: String): String {
+        return stageChatAndUrlPayload(
+            context = context,
+            chatSession = stagedChatSession,
+            messages = stagedMessages,
+            urlPayload = normalizedUrl
+        )
+    }
+
+    private fun buildStagedPayloadJson(
+        chat: ChatSession?,
+        messages: List<ChatMessage>,
+        stagedUrl: String,
+        timestamp: Long
+    ): String {
+        val msgArray = JSONArray()
+        messages.forEach { msg ->
+            msgArray.put(
+                JSONObject().apply {
+                    put("id", msg.id)
+                    put("chatId", msg.chatId)
+                    put("sender", msg.sender)
+                    put("content", msg.content)
+                    put("timestamp", msg.timestamp)
+                    put("triggeredByWakeWord", msg.triggeredByWakeWord)
                 }
-                context.startActivity(fallbackIntent)
-                true
-            } catch (fallbackEx: Exception) {
-                Log.e(TAG, "Failed to launch browser: ${fallbackEx.message}")
-                false
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error launching Chrome intent: ${e.message}")
-            false
+            )
         }
+        return JSONObject().apply {
+            put("status", "staged")
+            put("boundPort", _bridgeState.value.boundPort)
+            put("chatId", chat?.id ?: 0L)
+            put("chatTitle", chat?.title ?: "Gemini Chat")
+            put("wakeWord", chat?.wakeWord ?: "Hey Gemini")
+            put("systemInstruction", chat?.systemInstruction ?: "")
+            put("stagedUrl", stagedUrl)
+            put("stagedAt", timestamp)
+            put("messages", msgArray)
+        }.toString()
+    }
+
+    /**
+     * Passively stages the authenticated bridge URL and optional [chatSession] in the local socket buffer.
+     * NEVER launches Google Chrome via Intent(Intent.ACTION_VIEW) or context.startActivity().
+     */
+    fun launchChromeBridge(context: Context, chatSession: ChatSession? = null): Boolean {
+        stageChatAndUrlPayload(
+            context = context,
+            chatSession = chatSession ?: stagedChatSession,
+            messages = stagedMessages
+        )
+        return _bridgeState.value.isRunning
     }
 
     /**
@@ -514,6 +627,30 @@ object ChromeBridgeSocketManager {
                         writer.flush()
                     }
                 }
+            } else if (requestLine.contains(" $ROUTE_STAGED", ignoreCase = true) || requestLine.contains(" $ROUTE_SYNC", ignoreCase = true)) {
+                val jsonPayload = stagedJsonPayload.ifBlank {
+                    buildStagedPayloadJson(
+                        chat = stagedChatSession,
+                        messages = stagedMessages,
+                        stagedUrl = stagedUrlPayload.ifBlank { getBridgeUrl() },
+                        timestamp = System.currentTimeMillis()
+                    )
+                }
+                val responseBytes = jsonPayload.toByteArray(Charsets.UTF_8)
+                writer.print("HTTP/1.1 200 OK\r\n")
+                writer.print("Content-Type: application/json; charset=UTF-8\r\n")
+                writer.print("Content-Length: ${responseBytes.size}\r\n")
+                writer.print("Access-Control-Allow-Origin: *\r\n")
+                writer.print("Connection: close\r\n\r\n")
+                writer.flush()
+                client.getOutputStream().write(responseBytes)
+                client.getOutputStream().flush()
+
+                recordPacket(
+                    type = "STAGED_PAYLOAD_SERVED",
+                    sizeBytes = requestSize + responseBytes.size,
+                    summary = "Served passively staged chat & URL payload (HTTP 200)"
+                )
             } else {
                 // Authenticated bridge response
                 val htmlResponse = buildBridgeDashboardHtml(_bridgeState.value.boundPort, expectedNonce)
@@ -548,6 +685,9 @@ object ChromeBridgeSocketManager {
     }
 
     private fun buildBridgeDashboardHtml(port: Int, nonce: String): String {
+        val state = _bridgeState.value
+        val stagedChatTitle = state.stagedChatTitle.ifBlank { "Gemini Chat" }
+        val stagedUrl = state.stagedUrlPayload.ifBlank { "http://127.0.0.1:$port/?nonce=$nonce" }
         return """
             <!DOCTYPE html>
             <html lang="en">
@@ -570,6 +710,9 @@ object ChromeBridgeSocketManager {
                     <h2>Gemini Wake Chrome Coupler</h2>
                     <p>Dynamic loopback socket connected successfully.</p>
                     <p><strong>Ephemeral Port:</strong> $port</p>
+                    <p><strong>Staged Chat:</strong> $stagedChatTitle (${state.stagedMessagesCount} messages)</p>
+                    <p><strong>Staged URL Payload:</strong></p>
+                    <div class="code">$stagedUrl</div>
                     <p><strong>Session Nonce:</strong></p>
                     <div class="code">$nonce</div>
                     <p>Ready to synchronize prompts, snapshots, and piggyback task completions with Gemini Web (gemini.google.com).</p>
