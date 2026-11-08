@@ -353,5 +353,155 @@ class SpeechRecognitionCoordinatorTest {
 
         viewModel.cleanShutdown(null)
     }
+
+    @Test
+    fun audioFocusChangeListener_onLossTransient_setsFlagAndCancelsWithoutRestart_andOnGain_restartsAfter500ms() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        val scope = TestScope(testDispatcher)
+        var startHardwareCalls = 0
+
+        val coordinator = SpeechRecognitionCoordinator(
+            context = context,
+            scope = scope,
+            mainDispatcher = testDispatcher,
+            isContinuousModeEnabled = { true },
+            onPrepareHardwareBeforeStart = { startHardwareCalls++ }
+        )
+
+        coordinator.recognitionListener.onReadyForSpeech(Bundle())
+        assertTrue(coordinator.isListening.value)
+        assertFalse(coordinator.isTransientAudioFocusLoss)
+
+        // 1. AUDIOFOCUS_LOSS_TRANSIENT (-2): sets transient loss flag, cancels recognizer, and does NOT restart immediately
+        coordinator.audioFocusChangeListener.onAudioFocusChange(AudioManager.AUDIOFOCUS_LOSS_TRANSIENT)
+        assertTrue(
+            "AUDIOFOCUS_LOSS_TRANSIENT (-2) must set isTransientAudioFocusLoss = true",
+            coordinator.isTransientAudioFocusLoss
+        )
+        assertFalse(coordinator.isListening.value)
+        assertFalse(
+            "AUDIOFOCUS_LOSS_TRANSIENT (-2) must NOT queue an immediate restart",
+            coordinator.hasPendingRestart
+        )
+
+        // Even if SpeechRecognizer emits an error after cancel(), it must NOT restart while isTransientAudioFocusLoss is true
+        coordinator.recognitionListener.onError(SpeechRecognizer.ERROR_CLIENT)
+        assertFalse(coordinator.hasPendingRestart)
+        assertEquals(0, startHardwareCalls)
+
+        // 2. AUDIOFOCUS_GAIN (1): checks transient loss flag, clears it, and schedules a 500ms debounced restart
+        coordinator.audioFocusChangeListener.onAudioFocusChange(AudioManager.AUDIOFOCUS_GAIN)
+        assertFalse(
+            "AUDIOFOCUS_GAIN (1) must clear isTransientAudioFocusLoss",
+            coordinator.isTransientAudioFocusLoss
+        )
+        assertTrue(
+            "AUDIOFOCUS_GAIN (1) must schedule a 500ms debounced restart",
+            coordinator.hasPendingRestart
+        )
+        // Before 500ms elapses, must not have restarted yet
+        advanceTimeBy(300L)
+        runCurrent()
+        assertEquals(0, startHardwareCalls)
+
+        // After 500ms elapses, restart fires
+        advanceTimeBy(250L)
+        runCurrent()
+        assertTrue(
+            coordinator.traceHistory.value.any { it.contains("AUDIOFOCUS_GAIN_REARM_FIRING") }
+        )
+    }
+
+    @Test
+    fun uiDictationMicButton_synchronouslyStopsAndReleasesWakeWordVoiceServiceAudioRecordBeforeStartListening() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val serviceController = org.robolectric.Robolectric.buildService(
+            WakeWordVoiceService::class.java,
+            android.content.Intent(app, WakeWordVoiceService::class.java)
+        )
+        val service = serviceController.create().startCommand(0, 1).get()
+        val viewModel = com.example.ui.MainViewModel(app)
+        viewModel.setPermissionGrantedOverrideForTest(true)
+
+        try {
+            val initialHandoffs = WakeWordVoiceService.synchronousDictationHandoffReleaseCount
+            var servicePausedWhenRecognizerPrepared = false
+            var serviceMicReleasedWhenRecognizerPrepared = false
+
+            // Tap UI dictation mic button
+            val started = viewModel.toggleInChatDictation()
+            assertTrue(started)
+            assertTrue(
+                "Tapping UI mic button must synchronously invoke stopAndReleaseServiceAudioRecordSynchronously()",
+                WakeWordVoiceService.synchronousDictationHandoffReleaseCount > initialHandoffs
+            )
+            servicePausedWhenRecognizerPrepared = WakeWordVoiceService.isIntentionallyPaused
+            serviceMicReleasedWhenRecognizerPrepared = !WakeWordVoiceService.isMicrophoneInitialized.value
+            assertTrue(
+                "WakeWordVoiceService must be marked paused before SpeechRecognizer.startListening()",
+                servicePausedWhenRecognizerPrepared
+            )
+            assertTrue(
+                "WakeWordVoiceService AudioRecord must be synchronously released before SpeechRecognizer.startListening()",
+                serviceMicReleasedWhenRecognizerPrepared
+            )
+        } finally {
+            viewModel.cleanShutdown(null)
+            serviceController.destroy()
+        }
+    }
+
+    @Test
+    fun featureTurnOffAndAppBackgrounded_callsSpeechRecognizerDestroyAndReleasesProcessingMutex() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val viewModel = com.example.ui.MainViewModel(app)
+        viewModel.setPermissionGrantedOverrideForTest(true)
+        val coordinator = viewModel.speechRecognitionCoordinator
+
+        // Enable Hands-Free and simulate an active processing mutex lock
+        viewModel.resetHandsFreeToggleDebounceForTest()
+        viewModel.toggleHandsFreeVoice(enabled = true)
+        coordinator.setProcessingState(true)
+        assertTrue(coordinator.isProcessing)
+        val destroyCountBeforeOff = coordinator.destroyCount
+
+        // 1. Turning feature OFF must call SpeechRecognizer.destroy() and release the Processing Mutex
+        viewModel.resetHandsFreeToggleDebounceForTest()
+        viewModel.toggleHandsFreeVoice(enabled = false)
+        assertTrue(
+            "Turning Hands-Free OFF must call SpeechRecognizer.destroy()",
+            coordinator.destroyCount > destroyCountBeforeOff
+        )
+        assertFalse(
+            "Turning Hands-Free OFF must release the Processing Mutex (isProcessing = false)",
+            coordinator.isProcessing
+        )
+        assertFalse(coordinator.hasActiveRecognizerInstance)
+
+        // 2. Backgrounding the app must also call SpeechRecognizer.destroy() and release the Processing Mutex
+        viewModel.resetHandsFreeToggleDebounceForTest()
+        viewModel.toggleHandsFreeVoice(enabled = true)
+        coordinator.setProcessingState(true)
+        assertTrue(coordinator.isProcessing)
+        val destroyCountBeforeBg = coordinator.destroyCount
+
+        viewModel.onAppBackgrounded()
+        assertTrue(
+            "Backgrounding the app must call SpeechRecognizer.destroy()",
+            coordinator.destroyCount > destroyCountBeforeBg
+        )
+        assertFalse(
+            "Backgrounding the app must release the Processing Mutex (isProcessing = false)",
+            coordinator.isProcessing
+        )
+        assertFalse(coordinator.hasActiveRecognizerInstance)
+        assertTrue(
+            "Backgrounding must preserve isHandsFreeActive = true",
+            viewModel.isHandsFreeActive.value
+        )
+
+        viewModel.cleanShutdown(null)
+    }
 }
+
 

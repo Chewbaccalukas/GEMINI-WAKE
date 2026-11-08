@@ -83,6 +83,8 @@ class WakeWordVoiceService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var repositoryObserverJob: Job? = null
     private var keywordLoopJob: Job? = null
+    private val serviceAudioRecordMutex = Any()
+    @Volatile
     private var serviceAudioRecord: AudioRecord? = null
 
     /**
@@ -177,6 +179,7 @@ class WakeWordVoiceService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        activeInstance = this
         // Immediately promote to foreground with persistent notification so Samsung One UI
         // recognizes active microphone usage and does not put the service into a deep sleep bucket.
         promoteToMicrophoneForeground()
@@ -192,6 +195,7 @@ class WakeWordVoiceService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        activeInstance = this
         if (intent?.action == ACTION_STOP_VOICE_SERVICE) {
             setIntentionallyPaused(true)
             stopKeywordDetectionLoop()
@@ -314,6 +318,9 @@ class WakeWordVoiceService : Service() {
             audioManager?.unregisterAudioRecordingCallback(recordingCallback)
         } catch (_: Exception) {}
         abandonExclusiveAudioFocus()
+        if (activeInstance === this) {
+            activeInstance = null
+        }
         super.onDestroy()
     }
 
@@ -408,10 +415,14 @@ class WakeWordVoiceService : Service() {
 
                 var pcmByteBuffer: ByteArray? = null
                 if (hasRecordAudioPerm && !isAppRecordingActive && !isIntentionallyPaused && !_isSleepModeGlobal.value) {
-                    val record = initializeMicrophoneRecord()
-                    if (record != null) {
-                        serviceAudioRecord = record
-                        pcmByteBuffer = ByteArray(2048)
+                    synchronized(serviceAudioRecordMutex) {
+                        if (!isIntentionallyPaused && !isAppRecordingActive) {
+                            val record = initializeMicrophoneRecord()
+                            if (record != null) {
+                                serviceAudioRecord = record
+                                pcmByteBuffer = ByteArray(2048)
+                            }
+                        }
                     }
                 }
 
@@ -616,17 +627,23 @@ class WakeWordVoiceService : Service() {
     }
 
     internal fun releaseServiceMicrophoneRecord() {
-        val record = serviceAudioRecord ?: return
-        serviceAudioRecord = null
-        _isMicrophoneInitialized.value = false
-        try {
-            if (record.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                record.stop()
+        val record = synchronized(serviceAudioRecordMutex) {
+            val current = serviceAudioRecord
+            serviceAudioRecord = null
+            _isMicrophoneInitialized.value = false
+            _serviceMicRms.value = 0f
+            if (current != null) {
+                try {
+                    if (current.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                        current.stop()
+                    }
+                } catch (_: Throwable) {}
+                try {
+                    current.release()
+                } catch (_: Throwable) {}
             }
-        } catch (_: Throwable) {}
-        try {
-            record.release()
-        } catch (_: Throwable) {}
+            current
+        } ?: return
         promoteToMicrophoneForeground(false)
     }
 
@@ -821,6 +838,13 @@ class WakeWordVoiceService : Service() {
          * When `true`, the service's [AudioRecord] hardware is strictly released.
          */
         @Volatile
+        private var activeInstance: WakeWordVoiceService? = null
+
+        @Volatile
+        var synchronousDictationHandoffReleaseCount: Int = 0
+            private set
+
+        @Volatile
         var isIntentionallyPaused: Boolean = false
             private set
 
@@ -830,16 +854,37 @@ class WakeWordVoiceService : Service() {
 
         fun setIntentionallyPaused(paused: Boolean) {
             isIntentionallyPaused = paused
+            if (paused) {
+                activeInstance?.releaseServiceMicrophoneRecord()
+            }
         }
 
         /**
-         * Pauses the service's microphone state purely in memory without creating or firing any Intent
-         * so in-chat dictation stays 100% internal to the app process.
+         * Synchronously stops and releases the active [WakeWordVoiceService]'s [AudioRecord] instance
+         * under an exclusive mutex lock and abandons its audio focus before the UI dictation button
+         * invokes `SpeechRecognizer.startListening()`.
          */
-        fun pauseForInternalDictationInMemory() {
+        fun stopAndReleaseServiceAudioRecordSynchronously(reason: String = "ui_dictation_mutex_handoff") {
+            synchronousDictationHandoffReleaseCount++
             isProcessingCommand = true
             isIntentionallyPaused = true
             _isInputFocusPaused.value = true
+            _isMicrophoneInitialized.value = false
+            _serviceMicRms.value = 0f
+            val instance = activeInstance
+            if (instance != null) {
+                instance.releaseServiceMicrophoneRecord()
+                instance.abandonExclusiveAudioFocus()
+            }
+        }
+
+        /**
+         * Pauses the service's microphone state purely in memory and synchronously releases
+         * any active [AudioRecord] handle without creating or firing any Intent so in-chat
+         * dictation stays 100% internal to the app process.
+         */
+        fun pauseForInternalDictationInMemory() {
+            stopAndReleaseServiceAudioRecordSynchronously("internal_dictation_in_memory")
         }
 
         /**

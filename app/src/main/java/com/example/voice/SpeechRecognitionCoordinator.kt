@@ -176,6 +176,12 @@ class SpeechRecognitionCoordinator(
     var recognizerRecreationCount: Int = 0
         private set
 
+    var destroyCount: Int = 0
+        private set
+
+    val hasActiveRecognizerInstance: Boolean
+        get() = speechRecognizer != null
+
     /**
      * Window focus guard: `startListening()` and `AudioRecord.startRecording()` fallback are blocked
      * whenever `MainActivity` does not have active window focus.
@@ -192,6 +198,15 @@ class SpeechRecognitionCoordinator(
      */
     @Volatile
     var isTransientFocusLoss: Boolean = false
+        internal set
+
+    /**
+     * Transient audio focus loss flag set on `AUDIOFOCUS_LOSS_TRANSIENT` (-2) when
+     * `SpeechRecognizer.cancel()` is invoked. Prevents immediate restarts and is checked on
+     * `AUDIOFOCUS_GAIN` (1) before scheduling the 500ms debounced restart.
+     */
+    @Volatile
+    var isTransientAudioFocusLoss: Boolean = false
         internal set
 
     /**
@@ -661,10 +676,10 @@ class SpeechRecognitionCoordinator(
             return false
         }
 
-        if (!userInitiated && isTransientFocusLoss) {
+        if (!userInitiated && (isTransientFocusLoss || isTransientAudioFocusLoss)) {
             recordTrace(
                 "START_LISTENING_ABORTED_TRANSIENT_FOCUS_LOSS",
-                "userInitiated=false isTransientFocusLoss=true"
+                "userInitiated=false isTransientFocusLoss=$isTransientFocusLoss isTransientAudioFocusLoss=$isTransientAudioFocusLoss"
             )
             return false
         }
@@ -673,6 +688,7 @@ class SpeechRecognitionCoordinator(
             if (isWindowFocused && hasActiveWindowFocus()) {
                 isTransientFocusLoss = false
             }
+            isTransientAudioFocusLoss = false
             isIntentionallyPaused = false
             consecutiveIdleTimeouts = 0
             consecutiveTransientErrors = 0
@@ -766,10 +782,10 @@ class SpeechRecognitionCoordinator(
         restartJob?.cancel()
         restartJob = null
 
-        if (isTransientFocusLoss || shouldAbortListening() || !isContinuousModeEnabled()) {
+        if (isTransientFocusLoss || isTransientAudioFocusLoss || shouldAbortListening() || !isContinuousModeEnabled()) {
             recordTrace(
                 "SCHEDULE_RESTART_SKIPPED",
-                "delayMs=$delayMs transientLoss=$isTransientFocusLoss continuous=${isContinuousModeEnabled()}"
+                "delayMs=$delayMs transientLoss=$isTransientFocusLoss transientAudioLoss=$isTransientAudioFocusLoss continuous=${isContinuousModeEnabled()}"
             )
             return
         }
@@ -778,33 +794,71 @@ class SpeechRecognitionCoordinator(
         recordTrace("SCHEDULE_RESTART_QUEUED", "safeDelayMs=$safeDelayMs")
         restartJob = scope.launch(mainDispatcher) {
             delay(safeDelayMs)
-            if (!isTransientFocusLoss && !shouldAbortListening() && isContinuousModeEnabled() && !_isListening.value) {
+            if (!isTransientFocusLoss && !isTransientAudioFocusLoss && !shouldAbortListening() && isContinuousModeEnabled() && !_isListening.value) {
                 recordTrace("SCHEDULE_RESTART_FIRING", "afterDelayMs=$safeDelayMs")
                 startListening(userInitiated = false)
             } else {
                 recordTrace(
                     "SCHEDULE_RESTART_CANCELLED_AT_FIRE",
-                    "afterDelayMs=$safeDelayMs transientLoss=$isTransientFocusLoss continuous=${isContinuousModeEnabled()}"
+                    "afterDelayMs=$safeDelayMs transientLoss=$isTransientFocusLoss transientAudioLoss=$isTransientAudioFocusLoss continuous=${isContinuousModeEnabled()}"
                 )
             }
         }
     }
 
     /**
+     * Dedicated [AudioManager.OnAudioFocusChangeListener] for [SpeechRecognizer] audio focus handling.
+     */
+    val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        handleAudioFocusChange(focusChange)
+    }
+
+    /**
+     * Cancels the active [SpeechRecognizer] session immediately on transient audio focus loss
+     * (`AUDIOFOCUS_LOSS_TRANSIENT = -2`) without calling `stopListening()` or triggering an immediate restart.
+     */
+    private fun cancelRecognizerOnTransientAudioFocusLoss() {
+        restartJob?.cancel()
+        restartJob = null
+        trailingSilenceDebounceJob?.cancel()
+        trailingSilenceDebounceJob = null
+        lastPartialCandidates = emptyList()
+        _isListening.value = false
+        _liveRmsDb.value = 0f
+        restoreSystemStreamAfterStartChime()
+        if (isOnMainThread()) {
+            try {
+                speechRecognizer?.cancel()
+            } catch (_: Exception) {
+            }
+        } else {
+            scope.launch(mainDispatcher) {
+                try {
+                    speechRecognizer?.cancel()
+                } catch (_: Exception) {
+                }
+            }
+        }
+    }
+
+    /**
      * Handles AudioManager audio focus transitions for SpeechRecognizer:
-     * - Only yields on [AudioManager.AUDIOFOCUS_LOSS] and [AudioManager.AUDIOFOCUS_LOSS_TRANSIENT].
+     * - On [AudioManager.AUDIOFOCUS_LOSS_TRANSIENT] (`-2`, and [AudioManager.AUDIOFOCUS_LOSS] `-1`),
+     *   sets [isTransientAudioFocusLoss] = `true` and calls `SpeechRecognizer.cancel()` — does NOT restart immediately.
      * - Does NOT yield on [AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK].
-     * - Uses a 500ms debounce ([AUDIOFOCUS_GAIN_REARM_DEBOUNCE_MS]) before re-arming SpeechRecognizer on [AudioManager.AUDIOFOCUS_GAIN].
+     * - On [AudioManager.AUDIOFOCUS_GAIN] (`1`), checks [isTransientAudioFocusLoss] and only restarts
+     *   listening after a 500ms debounced delay ([AUDIOFOCUS_GAIN_REARM_DEBOUNCE_MS]).
      */
     fun handleAudioFocusChange(focusChange: Int) {
         when (focusChange) {
-            AudioManager.AUDIOFOCUS_LOSS,
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
+            AudioManager.AUDIOFOCUS_LOSS -> {
+                isTransientAudioFocusLoss = true
                 recordTrace(
                     "AUDIOFOCUS_YIELD",
-                    "focusChange=$focusChange -> pausing SpeechRecognizer transiently"
+                    "focusChange=$focusChange isTransientAudioFocusLoss=true -> calling SpeechRecognizer.cancel() without immediate restart"
                 )
-                stopListening(markIntentionallyPaused = false)
+                cancelRecognizerOnTransientAudioFocusLoss()
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
                 recordTrace(
@@ -815,11 +869,15 @@ class SpeechRecognitionCoordinator(
             AudioManager.AUDIOFOCUS_GAIN,
             AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
             AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE -> {
-                recordTrace(
-                    "AUDIOFOCUS_GAIN_DEBOUNCE",
-                    "focusChange=$focusChange -> scheduling 500ms debounced re-arm"
-                )
-                scheduleAudioFocusGainRearm(delayMs = AUDIOFOCUS_GAIN_REARM_DEBOUNCE_MS)
+                val shouldRearmAfterLoss = isTransientAudioFocusLoss || isTransientFocusLoss || !_isListening.value
+                isTransientAudioFocusLoss = false
+                if (shouldRearmAfterLoss) {
+                    recordTrace(
+                        "AUDIOFOCUS_GAIN_DEBOUNCE",
+                        "focusChange=$focusChange -> scheduling 500ms debounced re-arm"
+                    )
+                    scheduleAudioFocusGainRearm(delayMs = AUDIOFOCUS_GAIN_REARM_DEBOUNCE_MS)
+                }
             }
         }
     }
@@ -832,13 +890,14 @@ class SpeechRecognitionCoordinator(
         restartJob?.cancel()
         restartJob = null
 
+        isTransientAudioFocusLoss = false
         if (isWindowFocused) {
             isTransientFocusLoss = false
         }
-        if (isTransientFocusLoss || shouldAbortListening() || !isContinuousModeEnabled()) {
+        if (isTransientFocusLoss || isTransientAudioFocusLoss || shouldAbortListening() || !isContinuousModeEnabled()) {
             recordTrace(
                 "AUDIOFOCUS_GAIN_REARM_SKIPPED",
-                "delayMs=$delayMs transientLoss=$isTransientFocusLoss continuous=${isContinuousModeEnabled()}"
+                "delayMs=$delayMs transientLoss=$isTransientFocusLoss transientAudioLoss=$isTransientAudioFocusLoss continuous=${isContinuousModeEnabled()}"
             )
             return
         }
@@ -847,14 +906,14 @@ class SpeechRecognitionCoordinator(
         recordTrace("AUDIOFOCUS_GAIN_REARM_QUEUED", "debounceMs=$safeDelayMs")
         restartJob = scope.launch(mainDispatcher) {
             delay(safeDelayMs)
-            if (!isTransientFocusLoss && !shouldAbortListening() && isContinuousModeEnabled() && !_isListening.value) {
+            if (!isTransientFocusLoss && !isTransientAudioFocusLoss && !shouldAbortListening() && isContinuousModeEnabled() && !_isListening.value) {
                 lastStartAttemptEpochMs = 0L
                 recordTrace("AUDIOFOCUS_GAIN_REARM_FIRING", "afterDebounceMs=$safeDelayMs")
                 startListening(userInitiated = false)
             } else {
                 recordTrace(
                     "AUDIOFOCUS_GAIN_REARM_CANCELLED_AT_FIRE",
-                    "afterDebounceMs=$safeDelayMs transientLoss=$isTransientFocusLoss continuous=${isContinuousModeEnabled()}"
+                    "afterDebounceMs=$safeDelayMs transientLoss=$isTransientFocusLoss transientAudioLoss=$isTransientAudioFocusLoss continuous=${isContinuousModeEnabled()}"
                 )
             }
         }
@@ -939,29 +998,57 @@ class SpeechRecognitionCoordinator(
     }
 
     /**
-     * Destroys the underlying [SpeechRecognizer] instance and releases all resources.
+     * Destroys the underlying [SpeechRecognizer] instance and fully releases the Processing Mutex
+     * (`isProcessing = false`) and all pending jobs when the feature is turned off or backgrounded.
      */
-    fun destroy() {
-        recordTrace("DESTROY", "destroying SpeechRecognizer instance", warnIfOffMain = true)
+    fun destroy(markIntentionallyPaused: Boolean = true) {
+        destroyCount++
         windowFocusDebounceJob?.cancel()
         windowFocusDebounceJob = null
-        stopListening(markIntentionallyPaused = true)
-        if (isOnMainThread()) {
-            try {
-                speechRecognizer?.destroy()
-            } catch (_: Exception) {
-            }
-            speechRecognizer = null
-        } else {
-            val recognizerToDestroy = speechRecognizer
-            speechRecognizer = null
-            scope.launch(mainDispatcher) {
+        restartJob?.cancel()
+        restartJob = null
+        trailingSilenceDebounceJob?.cancel()
+        trailingSilenceDebounceJob = null
+        lastPartialCandidates = emptyList()
+        isProcessing = false
+        setInChatDictationMode(false)
+        if (markIntentionallyPaused) {
+            isIntentionallyPaused = true
+        }
+        _isListening.value = false
+        _liveRmsDb.value = 0f
+        restoreSystemStreamAfterStartChime()
+        recordTrace(
+            "DESTROY",
+            "markIntentionallyPaused=$markIntentionallyPaused isProcessing=false destroyCount=$destroyCount destroying SpeechRecognizer instance",
+            warnIfOffMain = true
+        )
+        val recognizerToDestroy = speechRecognizer
+        speechRecognizer = null
+        if (recognizerToDestroy != null) {
+            if (isOnMainThread()) {
                 try {
-                    recognizerToDestroy?.destroy()
+                    recognizerToDestroy.cancel()
                 } catch (_: Exception) {
+                }
+                try {
+                    recognizerToDestroy.destroy()
+                } catch (_: Exception) {
+                }
+            } else {
+                scope.launch(mainDispatcher) {
+                    try {
+                        recognizerToDestroy.cancel()
+                    } catch (_: Exception) {
+                    }
+                    try {
+                        recognizerToDestroy.destroy()
+                    } catch (_: Exception) {
+                    }
                 }
             }
         }
+        refreshMutexSnapshotFlow()
     }
 
     /**
@@ -1028,6 +1115,14 @@ class SpeechRecognitionCoordinator(
                 "error=$errorLabel idleTimeouts=$consecutiveIdleTimeouts transientErrors=$consecutiveTransientErrors",
                 warnIfOffMain = true
             )
+
+            if (isTransientAudioFocusLoss && error != SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                recordTrace(
+                    "CB_ON_ERROR_TRANSIENT_AUDIOFOCUS_LOSS_SKIP",
+                    "error=$errorLabel isTransientAudioFocusLoss=true -> returning immediately without restarting"
+                )
+                return
+            }
 
             when (error) {
                 SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {

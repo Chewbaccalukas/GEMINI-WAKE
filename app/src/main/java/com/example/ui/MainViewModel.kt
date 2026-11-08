@@ -2083,11 +2083,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Explicitly stops and releases any active AudioRecord instances in both AudioRecorder
-     * and WakeWordManager before SpeechRecognizer.startListening() is called, guaranteeing
-     * that legacy PCM AudioRecord and SpeechRecognizer NEVER run concurrently.
+     * Explicitly stops and releases any active AudioRecord instances in WakeWordVoiceService,
+     * AudioRecorder, and WakeWordManager before SpeechRecognizer.startListening() is called,
+     * guaranteeing that legacy/service PCM AudioRecord and SpeechRecognizer NEVER run concurrently.
      */
     fun releaseAllNativeAudioRecordTracksForSpeechRecognizer() {
+        com.example.voice.WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("prepare_hardware_for_speech_recognizer")
         audioRecorder.stopAndReleaseHardware()
         wakeWordManager.stopAndReleaseAudioRecordSynchronously()
     }
@@ -2101,9 +2102,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         speechRecognitionCoordinator.stopListening(markIntentionallyPaused = markIntentionallyPaused)
     }
 
-    private fun destroySpeechRecognizerInternal() {
+    private fun destroySpeechRecognizerInternal(markIntentionallyPaused: Boolean = true) {
         wakeWordManager.isExternalSpeechRecognizerActive = false
-        speechRecognitionCoordinator.destroy()
+        speechRecognitionCoordinator.destroy(markIntentionallyPaused = markIntentionallyPaused)
     }
 
     /**
@@ -2143,14 +2144,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
      * Stops continuous wake-word listening across both SpeechRecognizer and WakeWordManager.
+     * When [markIntentionallyPaused] is `true` (feature turned off), destroys the SpeechRecognizer
+     * instance to fully release the Processing Mutex.
      */
     fun stopContinuousWakeWordListening(markIntentionallyPaused: Boolean = true) {
         _isInChatDictationActive.value = false
         speechRecognitionCoordinator.setInChatDictationMode(false)
         if (markIntentionallyPaused) {
             com.example.voice.WakeWordVoiceService.setIntentionallyPaused(true)
+            destroySpeechRecognizerInternal(markIntentionallyPaused = true)
+        } else {
+            stopSpeechRecognizerInternal(markIntentionallyPaused = false)
         }
-        stopSpeechRecognizerInternal(markIntentionallyPaused = markIntentionallyPaused)
         wakeWordManager.stopContinuousListening()
     }
 
@@ -3578,8 +3583,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             if (streamingVoicePlayer.isPlaying.value) {
                 streamingVoicePlayer.stop()
             }
-            // Pause any existing background service listener and native AudioRecord handles purely in memory
-            // without constructing or firing any Android Intent or external Activity.
+            // Exclusive mutex handoff: synchronously stop and release WakeWordVoiceService's AudioRecord
+            // alongside AudioRecorder and WakeWordManager BEFORE invoking SpeechRecognizer.startListening().
+            com.example.voice.WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("ui_dictation_button_handoff")
             com.example.voice.WakeWordVoiceService.pauseForInternalDictationInMemory()
             wakeWordManager.stopContinuousListening()
             releaseAllNativeAudioRecordTracksForSpeechRecognizer()
@@ -4578,8 +4584,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun onAppBackgrounded() {
         isAppInForeground = false
         _hasWindowFocus.value = false
+        _isInChatDictationActive.value = false
         speechRecognitionCoordinator.setWindowFocused(false)
         wakeWordManager.setWindowFocused(false)
+        destroySpeechRecognizerInternal(markIntentionallyPaused = false)
         com.example.voice.BatterySaverMonitorWorker.enqueueImmediateCheck(getApplication())
         if (_heartbeatPingOnlyMode.value) {
             ChromeBridgeSocketManager.enterHeartbeatMode(getApplication())

@@ -1,6 +1,6 @@
 {
-  "summary":  "Plan to update promoteToMicrophoneForeground(isActivelyListening: Boolean = false) in WakeWordVoiceService.kt for dynamic notification text updates in initializeMicrophoneRecord() and releaseServiceMicrophoneRecord(), and remove the background startServiceSafely re-trigger block in MainViewModel.onAppBackgrounded().",
-  "updatedAt":  "2026-11-08T15:24:13.922226168Z",
+  "summary":  "Implementation plan for v10.0 microphone hardware collision fixes: (1) OnAudioFocusChangeListener transient loss flag + SpeechRecognizer.cancel() and 500ms debounced AUDIOFOCUS_GAIN restart, (2) synchronous mutex handoff stopping and releasing WakeWordVoiceService AudioRecord before UI dictation starts SpeechRecognizer, and (3) calling SpeechRecognizer.destroy() and releasing the Processing Mutex when turned off or backgrounded.",
+  "updatedAt":  "2026-11-08T17:58:58.114451486Z",
   "requestFeedback":  true,
   "userFacing":  true
 }
