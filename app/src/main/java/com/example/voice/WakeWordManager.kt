@@ -33,6 +33,7 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.consumeAsFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.atomic.AtomicInteger
@@ -742,6 +743,11 @@ class WakeWordManager(
     private var silenceStartTimestamp = 0L
 
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val windowFocusScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + Dispatchers.Main.immediate
+    )
+    private var windowFocusDebounceJob: kotlinx.coroutines.Job? = null
+
     private val audioFocusGainRunnable = Runnable {
         if (_hasAudioFocus.value) {
             maybeResumeAfterYield()
@@ -757,24 +763,50 @@ class WakeWordManager(
     /**
      * Window focus guard: prevents `AudioRecord.startRecording()` from starting or looping
      * in the background when `MainActivity` does not have active window focus.
-     * Debounces hardware release by [WINDOW_FOCUS_DEBOUNCE_MS] (`1500ms`) so transient focus
-     * losses (notification shade, dialogs) do not cycle listening state.
      */
     @Volatile
     var hasActiveWindowFocus: Boolean = true
         private set
 
+    /**
+     * Strict transient focus loss flag: set to `true` when window focus is lost and only cleared
+     * after the 1500ms focus-gain debounce completes.
+     */
+    @Volatile
+    var isTransientFocusLoss: Boolean = false
+        internal set
+
     fun setWindowFocused(focused: Boolean) {
         hasActiveWindowFocus = focused
+        windowFocusDebounceJob?.cancel()
+        windowFocusDebounceJob = null
         mainHandler.removeCallbacks(windowFocusDebounceRunnable)
-        if (!focused && (!_isHandsFreeMode.value || _isSleepMode.value) && (audioRecord != null || isRecording)) {
-            mainHandler.postDelayed(windowFocusDebounceRunnable, WINDOW_FOCUS_DEBOUNCE_MS)
+        if (!focused) {
+            isTransientFocusLoss = true
+        } else {
+            windowFocusDebounceJob = windowFocusScope.launch {
+                kotlinx.coroutines.delay(WINDOW_FOCUS_DEBOUNCE_MS)
+                if (hasActiveWindowFocus) {
+                    isTransientFocusLoss = false
+                }
+            }
+        }
+    }
+
+    /**
+     * Hard-kills `ERROR_CLIENT` during transient window focus losses so the recognizer is never
+     * recreated or restarted in a loop.
+     */
+    fun onError(error: Int) {
+        if (error == android.speech.SpeechRecognizer.ERROR_CLIENT && isTransientFocusLoss) {
+            return
         }
     }
 
     var onAudioFrameCaptured: ((ByteArray) -> Unit)? = null
     var onAudioPacketCaptured: ((AudioPacket) -> Unit)? = null
     var onWakeAudioHandoff: ((ByteArray) -> Unit)? = null
+    var onStopSpeechRecognizerForWakeHandoff: (() -> Unit)? = null
     var onWakeForceReset: ((chatId: Long, chatTitle: String, keyword: String, sanitizedQuery: String?) -> Unit)? = null
     var onSpeechStarted: (() -> Unit)? = null
     var onSilenceCutoffDetected: (() -> Unit)? = null
@@ -1385,18 +1417,22 @@ class WakeWordManager(
         _lastHeardText.value = sanitizedQuery ?: ""
         _isUserVoiceTurn.value = true
 
+        // Synchronously stop SpeechRecognitionCoordinator and release microphone hardware BEFORE routing to chat / TTS
+        onStopSpeechRecognizerForWakeHandoff?.invoke()
+
         // Synchronously notify ViewModel to clear stale draft text, cancel hung recognizers, and reset UI state
         onWakeForceReset?.invoke(chatId, chatTitle, keyword, sanitizedQuery)
 
         // 1. Consume any buffered wake audio captured prior to handoff
         val capturedWakeBytes = consumeWakePreRollBuffer()
 
-        // 2. Enforce Microphone Mutex: stop and release any existing/hung AudioRecord BEFORE initializing the chat turn stream
-        val wasListening = _isListening.value || audioRecord != null
+        // 2. Enforce Microphone & Audio Focus Release: stop and release any existing/hung AudioRecord
+        // and abandon exclusive audio focus BEFORE Gemini model or TTS engine begins its response.
         isTransitioningAudioState = true
         WakeWordVoiceService.isTransitioningAudioState = true
         try {
             releaseAudioRecordHardware(stopForegroundService = false)
+            abandonExclusiveAudioFocus()
             _wakeHandoffCount.incrementAndGet()
 
             // 3. Transition state to ACTIVE_STREAMING / TRANSCRIBING for the chat turn
@@ -1424,15 +1460,8 @@ class WakeWordManager(
             }
         }
 
-        // 5. Re-initialize single AudioRecord for the active chat turn if we were listening or in hands-free mode
-        // (and no immediate text-only query was already finalized and external SpeechRecognizer is not managing the prompt)
-        if ((wasListening || _isHandsFreeMode.value) &&
-            sanitizedQuery.isNullOrBlank() &&
-            !_isTextInputFocused.value &&
-            !isExternalSpeechRecognizerActive
-        ) {
-            startContinuousListening(forceActiveTurn = true)
-        }
+        // 5. Do NOT re-open AudioRecord or re-request exclusive audio focus here when routing to chat;
+        // the continuous mic and exclusive audio focus must stay released so Gemini TTS can claim audio focus cleanly.
 
         val event = WakeWordTriggerEvent(
             chatId = chatId,
@@ -2903,6 +2932,8 @@ class WakeWordManager(
     }
 
     fun destroy() {
+        windowFocusDebounceJob?.cancel()
+        windowFocusDebounceJob = null
         try {
             audioManager?.unregisterAudioRecordingCallback(audioRecordingCallback)
         } catch (_: Exception) {}

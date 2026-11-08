@@ -1,6 +1,6 @@
 {
-  "summary":  "Implementation plan for the 4 critical Samsung One UI lifecycle, audio, UI overlap, and chat spinner fixes:\n1. 1500ms Window Focus Debounce & Transient Focus Preservation in SpeechRecognitionCoordinator, WakeWordManager, MainViewModel, and MainActivity.\n2. Pure Internal Dictation (viewModel.toggleInternalDictation()) for the Chat Mic Button with zero external Intent or startActivity calls.\n3. Compact TopBarHandsFreeRadarPill with reduced max width, smaller icon, and start padding so the navigation back button is never obstructed.\n4. Fix self-cancelling activeGenerationJob in MainViewModel.sendMessage() and wrap Gemini API execution in a strict try/catch/finally block that prints errors directly to the chat thread and immediately resets isGenerating/isLoading to false.",
-  "updatedAt":  "2026-11-08T08:27:23.068189267Z",
+  "summary":  "Plan to update promoteToMicrophoneForeground(isActivelyListening: Boolean = false) in WakeWordVoiceService.kt for dynamic notification text updates in initializeMicrophoneRecord() and releaseServiceMicrophoneRecord(), and remove the background startServiceSafely re-trigger block in MainViewModel.onAppBackgrounded().",
+  "updatedAt":  "2026-11-08T15:24:13.922226168Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

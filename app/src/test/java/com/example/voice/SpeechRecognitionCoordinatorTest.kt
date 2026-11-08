@@ -250,11 +250,12 @@ class SpeechRecognitionCoordinatorTest {
             isContinuousModeEnabled = { true }
         )
 
-        // When hands-free is active, losing window focus preserves hands-free listening without setting isIntentionallyPaused
+        // When hands-free is active, losing window focus sets isTransientFocusLoss = true without setting isIntentionallyPaused
         coordinator.setWindowFocused(false)
+        assertTrue(coordinator.isTransientFocusLoss)
         assertFalse(coordinator.isIntentionallyPaused)
         assertTrue(
-            coordinator.traceHistory.value.any { it.contains("SET_WINDOW_FOCUSED_BACKGROUND_HANDSFREE") }
+            coordinator.traceHistory.value.any { it.contains("focused=false isTransientFocusLoss=true") }
         )
 
         // Simulate a stale background pause
@@ -263,7 +264,9 @@ class SpeechRecognitionCoordinatorTest {
 
         // Re-focus window while hands-free is enabled and not processing a command
         coordinator.setWindowFocused(true)
+        testScheduler.advanceTimeBy(SpeechRecognitionCoordinator.WINDOW_FOCUS_DEBOUNCE_MS + 100L)
 
+        assertFalse(coordinator.isTransientFocusLoss)
         assertFalse(
             "setWindowFocused(true) must force isIntentionallyPaused = false when hands-free is active and not processing",
             coordinator.isIntentionallyPaused
@@ -271,6 +274,84 @@ class SpeechRecognitionCoordinatorTest {
         assertTrue(
             coordinator.traceHistory.value.any { it.contains("SET_WINDOW_FOCUSED_REARM") }
         )
+    }
+
+    @Test
+    fun onErrorClient_whenIsTransientFocusLossTrue_returnsImmediatelyWithoutRecreatingOrQueueingRestart() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        val scope = TestScope(testDispatcher)
+
+        val coordinator = SpeechRecognitionCoordinator(
+            context = context,
+            scope = scope,
+            mainDispatcher = testDispatcher,
+            isContinuousModeEnabled = { true }
+        )
+
+        // Queue a pending restart first, then lose window focus
+        coordinator.scheduleDebouncedRestart(delayMs = 500L)
+        assertTrue(coordinator.hasPendingRestart)
+
+        coordinator.setWindowFocused(false)
+        assertTrue(coordinator.isTransientFocusLoss)
+        assertFalse(
+            "Losing window focus must immediately cancel any pending restartJob",
+            coordinator.hasPendingRestart
+        )
+
+        val initialRecreations = coordinator.recognizerRecreationCount
+
+        // Fire 20 consecutive ERROR_CLIENT callbacks while isTransientFocusLoss == true
+        repeat(20) {
+            coordinator.recognitionListener.onError(SpeechRecognizer.ERROR_CLIENT)
+        }
+
+        assertEquals(
+            "onError(ERROR_CLIENT) must NEVER recreate SpeechRecognizer while isTransientFocusLoss is true",
+            initialRecreations,
+            coordinator.recognizerRecreationCount
+        )
+        assertFalse(
+            "onError(ERROR_CLIENT) must NEVER queue a restart while isTransientFocusLoss is true",
+            coordinator.hasPendingRestart
+        )
+
+        // Also verify WakeWordManager hard-kills onError(ERROR_CLIENT) during transient focus loss
+        val wakeManager = WakeWordManager(context)
+        wakeManager.setWindowFocused(false)
+        assertTrue(wakeManager.isTransientFocusLoss)
+        wakeManager.onError(SpeechRecognizer.ERROR_CLIENT)
+        assertTrue(wakeManager.isTransientFocusLoss)
+        wakeManager.destroy()
+    }
+
+    @Test
+    fun wakeWordDetection_stopsSpeechRecognitionCoordinatorAndReleasesExclusiveAudioFocusBeforeTts() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val viewModel = com.example.ui.MainViewModel(app)
+        viewModel.setPermissionGrantedOverrideForTest(true)
+
+        val coordinator = viewModel.speechRecognitionCoordinator
+        val wakeManager = viewModel.wakeWordManager
+
+        // Trigger wake word with a spoken prompt routing to chat
+        wakeManager.onKeywordHit("Gemini", initialQuery = "what is the weather today")
+
+        assertFalse(
+            "SpeechRecognitionCoordinator must NOT be listening after wake word handoff",
+            coordinator.isListening.value
+        )
+        assertFalse(
+            "SpeechRecognitionCoordinator must NOT have a pending restart during wake query processing",
+            coordinator.hasPendingRestart
+        )
+        assertFalse(
+            "WakeWordManager must release exclusive audio focus before Gemini / TTS begins",
+            wakeManager.hasAudioFocus.value
+        )
+        assertEquals(0, wakeManager.activeAudioRecordCount)
+
+        viewModel.cleanShutdown(null)
     }
 }
 

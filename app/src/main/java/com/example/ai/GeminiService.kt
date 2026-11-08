@@ -48,8 +48,9 @@ open class GeminiService {
      */
     open suspend fun transcribeAudioSnippet(
         audioBytes: ByteArray,
-        mimeType: String = "audio/pcm"
+        mimeType: String = "audio/pcm",
+        context: android.content.Context? = null
     ): String {
-        return apiService.transcribeAudio(audioBytes, mimeType)
+        return apiService.transcribeAudio(audioBytes, mimeType, context)
     }
 }

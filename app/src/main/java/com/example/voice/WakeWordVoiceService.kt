@@ -600,6 +600,7 @@ class WakeWordVoiceService : Service() {
                 registerOwnAudioSessionId(record.audioSessionId)
                 record.startRecording()
                 _isMicrophoneInitialized.value = true
+                promoteToMicrophoneForeground(true)
                 record
             } else {
                 record.release()
@@ -626,6 +627,7 @@ class WakeWordVoiceService : Service() {
         try {
             record.release()
         } catch (_: Throwable) {}
+        promoteToMicrophoneForeground(false)
     }
 
     fun requestExclusiveAudioFocus(): Boolean {
@@ -683,10 +685,10 @@ class WakeWordVoiceService : Service() {
      * persistent notification so Samsung One UI knows the microphone is actively in use
      * and does not place the app in a deep-sleep bucket.
      */
-    internal fun promoteToMicrophoneForeground() {
+    private fun promoteToMicrophoneForeground(isActivelyListening: Boolean = false) {
         try {
             ensureNotificationChannel()
-            val notification = buildNotification()
+            val notification = buildNotification(isActivelyListening)
             val fgType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
             } else {
@@ -700,7 +702,7 @@ class WakeWordVoiceService : Service() {
             )
         } catch (e: Throwable) {
             try {
-                val notification = buildNotification()
+                val notification = buildNotification(isActivelyListening)
                 startForeground(NOTIFICATION_ID, notification)
             } catch (inner: Throwable) {
                 Log.w(TAG, "Unable to promote WakeWordVoiceService to foreground: ${inner.message}")
@@ -738,7 +740,7 @@ class WakeWordVoiceService : Service() {
         }
     }
 
-    private fun buildNotification(): Notification {
+    private fun buildNotification(isActivelyListening: Boolean = false): Notification {
         val isSleeping = _isSleepModeGlobal.value
         val isBatterySaverPaused = _isBatterySaverPausedGlobal.value
         val title = when {
@@ -746,19 +748,9 @@ class WakeWordVoiceService : Service() {
             isSleeping -> "Gemini Wake • Sleep Mode"
             else -> "Gemini Wake Active"
         }
-        val subtitle = when {
-            isBatterySaverPaused ->
-                "Microphone released to save battery — tap Resume or disable Battery Saver"
-            isSleeping ->
-                "Wake word listener paused — tap Wake Up or say \"Gemini, wake up\""
-            _isInputFocusPaused.value || _isExternalRecordingActive.value ->
-                "Microphone yielded to keyboard / external input"
-            else ->
-                "Listening for wake words (${_serviceActiveWakeWords.value.size} active)"
-        }
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
-            .setContentText(subtitle)
+            .setContentText(if (isActivelyListening) "Listening for wake word..." else "Hands-free standby")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setOngoing(true)
             .setSilent(true)

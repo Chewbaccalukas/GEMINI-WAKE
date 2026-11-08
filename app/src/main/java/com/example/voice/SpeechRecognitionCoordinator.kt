@@ -185,6 +185,16 @@ class SpeechRecognitionCoordinator(
         private set
 
     /**
+     * Strict transient focus loss flag: set to `true` immediately when window focus is lost
+     * (`setWindowFocused(false)`) and only cleared after the 1500ms focus-gain debounce completes.
+     * While `true`, `onError(ERROR_CLIENT)` returns immediately without recreating the recognizer
+     * or queuing any restart.
+     */
+    @Volatile
+    var isTransientFocusLoss: Boolean = false
+        internal set
+
+    /**
      * Guard flag indicating listening was intentionally paused by the user, by UI focus,
      * or by hitting the consecutive idle timeout threshold. When `true`, `startListening()`
      * is completely aborted until explicitly resumed.
@@ -251,6 +261,7 @@ class SpeechRecognitionCoordinator(
     data class CoordinatorMutexSnapshot(
         val isListening: Boolean = false,
         val isWindowFocused: Boolean = true,
+        val isTransientFocusLoss: Boolean = false,
         val isIntentionallyPaused: Boolean = false,
         val isProcessing: Boolean = false,
         val isProcessingCommand: Boolean = false,
@@ -271,6 +282,7 @@ class SpeechRecognitionCoordinator(
         return CoordinatorMutexSnapshot(
             isListening = _isListening.value,
             isWindowFocused = windowFocusedNow,
+            isTransientFocusLoss = isTransientFocusLoss,
             isIntentionallyPaused = isIntentionallyPaused,
             isProcessing = isProcessing,
             isProcessingCommand = isProcessing,
@@ -308,7 +320,7 @@ class SpeechRecognitionCoordinator(
         val onMain = isOnMainThread()
         val windowFocusedNow = isWindowFocused && hasActiveWindowFocus()
         val mutexSnapshot =
-            "listening=${_isListening.value} windowFocus=$windowFocusedNow paused=$isIntentionallyPaused processing=$isProcessing asleep=$isAsleep dictating=$isInChatDictationMode"
+            "listening=${_isListening.value} windowFocus=$windowFocusedNow transientLoss=$isTransientFocusLoss paused=$isIntentionallyPaused processing=$isProcessing asleep=$isAsleep dictating=$isInChatDictationMode"
         val entry =
             "[SR-Trace] stage=$stage | thread=${thread.name}#${thread.id}(main=$onMain) | $mutexSnapshot | $details"
         if (warnIfOffMain && !onMain) {
@@ -324,60 +336,45 @@ class SpeechRecognitionCoordinator(
     }
 
     /**
-     * Updates the active window focus state from `MainActivity.onWindowFocusChanged` with a strict
-     * [WINDOW_FOCUS_DEBOUNCE_MS] (`1500ms`) debounce before stopping or restarting [SpeechRecognizer].
-     * Transient focus losses (e.g., pulling down the notification shade or opening a dialog) do NOT
-     * recreate or restart [SpeechRecognizer].
+     * Updates the active window focus state from `MainActivity.onWindowFocusChanged`.
+     * - When focus is lost (`focused == false`): immediately sets `isTransientFocusLoss = true` and
+     *   cancels `windowFocusDebounceJob` and `restartJob`. Does NOT recreate or restart [SpeechRecognizer].
+     * - When focus is gained (`focused == true`): waits the full [WINDOW_FOCUS_DEBOUNCE_MS] (`1500ms`)
+     *   before clearing `isTransientFocusLoss = false` and re-arming if idle.
      */
     fun setWindowFocused(focused: Boolean) {
         isWindowFocused = focused
         windowFocusDebounceJob?.cancel()
         windowFocusDebounceJob = null
-        recordTrace("SET_WINDOW_FOCUSED", "focused=$focused debounceMs=$WINDOW_FOCUS_DEBOUNCE_MS")
         if (!focused) {
-            val keepHandsFreeActiveInBackground = isContinuousModeEnabled() && !isAsleep && !isProcessing
-            if (keepHandsFreeActiveInBackground) {
-                recordTrace(
-                    "SET_WINDOW_FOCUSED_BACKGROUND_HANDSFREE",
-                    "focused=false handsFree=true isProcessing=false -> keeping hands-free active without pausing"
-                )
-            } else {
-                windowFocusDebounceJob = scope.launch(mainDispatcher) {
-                    delay(WINDOW_FOCUS_DEBOUNCE_MS)
-                    if (!isWindowFocused) {
-                        setInChatDictationMode(false)
-                        val stillKeepHandsFree = isContinuousModeEnabled() && !isAsleep && !isProcessing
-                        if (!stillKeepHandsFree) {
-                            restartJob?.cancel()
-                            restartJob = null
-                            stopListening(markIntentionallyPaused = false)
-                        }
-                    }
-                }
-            }
+            isTransientFocusLoss = true
+            restartJob?.cancel()
+            restartJob = null
+            recordTrace(
+                "SET_WINDOW_FOCUSED",
+                "focused=false isTransientFocusLoss=true -> cancelled windowFocusDebounceJob & restartJob"
+            )
         } else {
-            val isHandsFreeModeEnabled = isContinuousModeEnabled() && !isAsleep
-            val isProcessingCommandNow = isProcessing || isExternalGuardBlocked()
-            if (isHandsFreeModeEnabled && !isProcessingCommandNow) {
-                isIntentionallyPaused = false
-                consecutiveIdleTimeouts = 0
-                consecutiveTransientErrors = 0
-                recordTrace(
-                    "SET_WINDOW_FOCUSED_REARM",
-                    "focused=true isHandsFreeModeEnabled=true isProcessingCommand=false -> debounced 1500ms re-arm"
-                )
-                if (!_isListening.value && !hasPendingRestart) {
-                    windowFocusDebounceJob = scope.launch(mainDispatcher) {
-                        delay(WINDOW_FOCUS_DEBOUNCE_MS)
-                        if (isWindowFocused &&
-                            isContinuousModeEnabled() &&
-                            !isAsleep &&
-                            !isProcessing &&
-                            !isExternalGuardBlocked() &&
-                            !_isListening.value
-                        ) {
-                            startListening(userInitiated = false)
-                        }
+            recordTrace(
+                "SET_WINDOW_FOCUSED",
+                "focused=true isTransientFocusLoss=$isTransientFocusLoss debounceMs=$WINDOW_FOCUS_DEBOUNCE_MS"
+            )
+            windowFocusDebounceJob = scope.launch(mainDispatcher) {
+                delay(WINDOW_FOCUS_DEBOUNCE_MS)
+                if (!isWindowFocused) return@launch
+                isTransientFocusLoss = false
+                val isHandsFreeModeEnabled = isContinuousModeEnabled() && !isAsleep
+                val isProcessingCommandNow = isProcessing || isExternalGuardBlocked()
+                if (isHandsFreeModeEnabled && !isProcessingCommandNow) {
+                    isIntentionallyPaused = false
+                    consecutiveIdleTimeouts = 0
+                    consecutiveTransientErrors = 0
+                    recordTrace(
+                        "SET_WINDOW_FOCUSED_REARM",
+                        "focused=true isTransientFocusLoss=false -> debounced 1500ms re-arm"
+                    )
+                    if (!_isListening.value && !hasPendingRestart) {
+                        startListening(userInitiated = false)
                     }
                 }
             }
@@ -431,6 +428,9 @@ class SpeechRecognitionCoordinator(
         reason: String = "navigation_settled"
     ) {
         isProcessing = false
+        if (isWindowFocused) {
+            isTransientFocusLoss = false
+        }
         if (!isAsleep) {
             isIntentionallyPaused = false
             consecutiveIdleTimeouts = 0
@@ -661,7 +661,18 @@ class SpeechRecognitionCoordinator(
             return false
         }
 
+        if (!userInitiated && isTransientFocusLoss) {
+            recordTrace(
+                "START_LISTENING_ABORTED_TRANSIENT_FOCUS_LOSS",
+                "userInitiated=false isTransientFocusLoss=true"
+            )
+            return false
+        }
+
         if (userInitiated) {
+            if (isWindowFocused && hasActiveWindowFocus()) {
+                isTransientFocusLoss = false
+            }
             isIntentionallyPaused = false
             consecutiveIdleTimeouts = 0
             consecutiveTransientErrors = 0
@@ -755,10 +766,10 @@ class SpeechRecognitionCoordinator(
         restartJob?.cancel()
         restartJob = null
 
-        if (shouldAbortListening() || !isContinuousModeEnabled()) {
+        if (isTransientFocusLoss || shouldAbortListening() || !isContinuousModeEnabled()) {
             recordTrace(
                 "SCHEDULE_RESTART_SKIPPED",
-                "delayMs=$delayMs continuous=${isContinuousModeEnabled()}"
+                "delayMs=$delayMs transientLoss=$isTransientFocusLoss continuous=${isContinuousModeEnabled()}"
             )
             return
         }
@@ -767,13 +778,13 @@ class SpeechRecognitionCoordinator(
         recordTrace("SCHEDULE_RESTART_QUEUED", "safeDelayMs=$safeDelayMs")
         restartJob = scope.launch(mainDispatcher) {
             delay(safeDelayMs)
-            if (!shouldAbortListening() && isContinuousModeEnabled() && !_isListening.value) {
+            if (!isTransientFocusLoss && !shouldAbortListening() && isContinuousModeEnabled() && !_isListening.value) {
                 recordTrace("SCHEDULE_RESTART_FIRING", "afterDelayMs=$safeDelayMs")
                 startListening(userInitiated = false)
             } else {
                 recordTrace(
                     "SCHEDULE_RESTART_CANCELLED_AT_FIRE",
-                    "afterDelayMs=$safeDelayMs continuous=${isContinuousModeEnabled()}"
+                    "afterDelayMs=$safeDelayMs transientLoss=$isTransientFocusLoss continuous=${isContinuousModeEnabled()}"
                 )
             }
         }
@@ -821,10 +832,13 @@ class SpeechRecognitionCoordinator(
         restartJob?.cancel()
         restartJob = null
 
-        if (shouldAbortListening() || !isContinuousModeEnabled()) {
+        if (isWindowFocused) {
+            isTransientFocusLoss = false
+        }
+        if (isTransientFocusLoss || shouldAbortListening() || !isContinuousModeEnabled()) {
             recordTrace(
                 "AUDIOFOCUS_GAIN_REARM_SKIPPED",
-                "delayMs=$delayMs continuous=${isContinuousModeEnabled()}"
+                "delayMs=$delayMs transientLoss=$isTransientFocusLoss continuous=${isContinuousModeEnabled()}"
             )
             return
         }
@@ -833,14 +847,14 @@ class SpeechRecognitionCoordinator(
         recordTrace("AUDIOFOCUS_GAIN_REARM_QUEUED", "debounceMs=$safeDelayMs")
         restartJob = scope.launch(mainDispatcher) {
             delay(safeDelayMs)
-            if (!shouldAbortListening() && isContinuousModeEnabled() && !_isListening.value) {
+            if (!isTransientFocusLoss && !shouldAbortListening() && isContinuousModeEnabled() && !_isListening.value) {
                 lastStartAttemptEpochMs = 0L
                 recordTrace("AUDIOFOCUS_GAIN_REARM_FIRING", "afterDebounceMs=$safeDelayMs")
                 startListening(userInitiated = false)
             } else {
                 recordTrace(
                     "AUDIOFOCUS_GAIN_REARM_CANCELLED_AT_FIRE",
-                    "afterDebounceMs=$safeDelayMs continuous=${isContinuousModeEnabled()}"
+                    "afterDebounceMs=$safeDelayMs transientLoss=$isTransientFocusLoss continuous=${isContinuousModeEnabled()}"
                 )
             }
         }
@@ -1058,11 +1072,11 @@ class SpeechRecognitionCoordinator(
                     consecutiveIdleTimeouts++
                     onSilenceTimeoutDuringVoiceTurn()
 
-                    // Abort immediately if intentionally paused, asleep, processing, or not in continuous mode
-                    if (shouldAbortListening() || !isContinuousModeEnabled()) {
+                    // Abort immediately if transient focus loss, intentionally paused, asleep, processing, or not in continuous mode
+                    if (isTransientFocusLoss || shouldAbortListening() || !isContinuousModeEnabled()) {
                         recordTrace(
                             "CB_ON_ERROR_RESTART_ABORTED",
-                            "error=$errorLabel guard blocked restart after timeout"
+                            "error=$errorLabel transientLoss=$isTransientFocusLoss guard blocked restart after timeout"
                         )
                         return
                     }
@@ -1087,12 +1101,17 @@ class SpeechRecognitionCoordinator(
                 }
 
                 SpeechRecognizer.ERROR_CLIENT -> {
+                    if (isTransientFocusLoss) {
+                        recordTrace(
+                            "CB_ON_ERROR_CLIENT_TRANSIENT_FOCUS_HARD_KILL",
+                            "isTransientFocusLoss=true -> returning immediately without recreating recognizer or queuing restart"
+                        )
+                        return
+                    }
                     if (isInChatDictationMode) {
                         setInChatDictationMode(false)
                     }
                     if (isContinuousModeEnabled() && !isAsleep) {
-                        // Hands-free mode is active: NEVER leave isIntentionallyPaused = true on ERROR_CLIENT(5).
-                        // Only recreate or restart SpeechRecognizer if the window is focused; do NOT recreate on transient focus losses.
                         isIntentionallyPaused = false
                         consecutiveTransientErrors = 0
                         if (isWindowFocused && hasActiveWindowFocus() && !isProcessing && !isExternalGuardBlocked()) {
@@ -1105,7 +1124,7 @@ class SpeechRecognitionCoordinator(
                         } else {
                             recordTrace(
                                 "CB_ON_ERROR_CLIENT_TRANSIENT_FOCUS_SKIP",
-                                "handsFree=true skipped recognizer recreation during transient focus loss"
+                                "handsFree=true skipped recognizer recreation during focus loss"
                             )
                         }
                     } else {
@@ -1114,6 +1133,13 @@ class SpeechRecognitionCoordinator(
                 }
 
                 else -> {
+                    if (isTransientFocusLoss) {
+                        recordTrace(
+                            "CB_ON_ERROR_TRANSIENT_FOCUS_HARD_KILL",
+                            "error=$errorLabel isTransientFocusLoss=true -> returning immediately"
+                        )
+                        return
+                    }
                     consecutiveTransientErrors++
                     _errorCount.update { it + 1 }
 

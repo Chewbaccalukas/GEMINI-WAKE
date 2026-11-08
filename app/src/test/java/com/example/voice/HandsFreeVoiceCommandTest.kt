@@ -1663,5 +1663,58 @@ class HandsFreeVoiceCommandTest {
         viewModel.selectChat(null)
         viewModel.cleanShutdown(null)
     }
+
+    @Test
+    fun testToggleHandsFreeVoiceSynchronizesWakeWordVoiceServiceIntentionallyPausedFlag() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val viewModel = com.example.ui.MainViewModel(app)
+        viewModel.setPermissionGrantedOverrideForTest(true)
+
+        // Simulate service previously paused in memory (e.g. via internal dictation or manual pause)
+        WakeWordVoiceService.pauseForInternalDictationInMemory()
+        WakeWordVoiceService.setIntentionallyPaused(true)
+        assertTrue(WakeWordVoiceService.isIntentionallyPaused)
+        assertTrue(WakeWordVoiceService.isInputFocusPaused.value)
+
+        // Toggling Hands-Free ON must clear WakeWordVoiceService.isIntentionallyPaused and dictation pause
+        viewModel.resetHandsFreeToggleDebounceForTest()
+        viewModel.toggleHandsFreeVoice(enabled = true)
+        assertFalse(
+            "toggleHandsFreeVoice(true) must set WakeWordVoiceService.isIntentionallyPaused to false",
+            WakeWordVoiceService.isIntentionallyPaused
+        )
+        assertFalse(
+            "toggleHandsFreeVoice(true) must clear WakeWordVoiceService.isInputFocusPaused",
+            WakeWordVoiceService.isInputFocusPaused.value
+        )
+
+        // Toggling Hands-Free OFF must set WakeWordVoiceService.isIntentionallyPaused to true
+        viewModel.resetHandsFreeToggleDebounceForTest()
+        viewModel.toggleHandsFreeVoice(enabled = false)
+        assertTrue(
+            "toggleHandsFreeVoice(false) must set WakeWordVoiceService.isIntentionallyPaused to true",
+            WakeWordVoiceService.isIntentionallyPaused
+        )
+
+        // Re-enable Hands-Free, then test window focus regain & diagnostic mutex reset unpausing
+        viewModel.resetHandsFreeToggleDebounceForTest()
+        viewModel.toggleHandsFreeVoice(enabled = true)
+        WakeWordVoiceService.setIntentionallyPaused(true)
+        viewModel.onWindowFocusChanged(true)
+        assertFalse(
+            "onWindowFocusChanged(true) while Hands-Free is active and not processing must unpause WakeWordVoiceService",
+            WakeWordVoiceService.isIntentionallyPaused
+        )
+
+        WakeWordVoiceService.setIntentionallyPaused(true)
+        viewModel.resetDiagnosticAudioMutexLocks()
+        assertFalse(
+            "resetDiagnosticAudioMutexLocks() must unpause WakeWordVoiceService",
+            WakeWordVoiceService.isIntentionallyPaused
+        )
+
+        viewModel.cleanShutdown(null)
+    }
 }
+
 

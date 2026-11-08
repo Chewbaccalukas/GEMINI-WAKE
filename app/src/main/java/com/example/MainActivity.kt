@@ -102,10 +102,9 @@ class MainActivity : ComponentActivity() {
     private var currentScreen by mutableStateOf<Screen>(Screen.Home)
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-
-        // Mandatory App Check configuration with launch intent before any UI or Firebase operations
+        // Mandatory App Check configuration with launch intent before super.onCreate or any lazy ViewModel/Firebase access
         configureAppCheck(this, intent)
+        super.onCreate(savedInstanceState)
 
         handleIncomingIntent(intent)
 
@@ -188,6 +187,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: android.content.Intent) {
         super.onNewIntent(intent)
+        configureAppCheck(this, intent)
         handleIncomingIntent(intent)
     }
 
