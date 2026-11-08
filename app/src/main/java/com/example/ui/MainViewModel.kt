@@ -101,23 +101,83 @@ data class AttachmentPayload(
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val database = AppDatabase.getDatabase(application, viewModelScope)
-    val chatRepository = ChatRepository(database.chatDao(), database.messageDao())
-    val repository = chatRepository
-    val messageRepository = MessageRepository(database.messageDao(), database.chatDao())
-    val wakeWordRepository = WakeWordRepository(database.wakeWordDao(), database.chatDao())
-    val firebaseSyncRepository: FirebaseSyncRepository? = try {
-        FirebaseSyncRepository(application)
-    } catch (_: Throwable) {
-        null
+    @Volatile
+    var isDatabaseInitialized: Boolean = false
+        private set
+
+    @Volatile
+    var isGeminiServiceInitialized: Boolean = false
+        private set
+
+    @Volatile
+    var isFirebaseSyncInitialized: Boolean = false
+        private set
+
+    private val database: AppDatabase by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        isDatabaseInitialized = true
+        AppDatabase.getDatabase(application, viewModelScope)
     }
-    val wakeWordManager = WakeWordManager(application, database.wakeWordDao())
-    val streamingVoicePlayer = com.example.voice.StreamingVoicePlayer(scope = viewModelScope)
-    val chromeBridge = ChromeAppBridge(application)
-    val bufferManager = ChatMemoryBufferManager(application, database.chatDao())
-    val promptRepository = com.example.data.repository.PromptRepository(application)
-    val chunkedImporter = com.example.importer.ChunkedChatImporter()
-    private val geminiService = GeminiService()
+    val chatRepository: ChatRepository by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        ChatRepository(database.chatDao(), database.messageDao())
+    }
+    val repository: ChatRepository
+        get() = chatRepository
+    val messageRepository: MessageRepository by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        MessageRepository(database.messageDao(), database.chatDao())
+    }
+    val wakeWordRepository: WakeWordRepository by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        WakeWordRepository(database.wakeWordDao(), database.chatDao())
+    }
+    val firebaseSyncRepository: FirebaseSyncRepository? by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        isFirebaseSyncInitialized = true
+        try {
+            FirebaseSyncRepository(application)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+    val wakeWordManager: WakeWordManager by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        WakeWordManager(application)
+    }
+    val streamingVoicePlayer: com.example.voice.StreamingVoicePlayer by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        com.example.voice.StreamingVoicePlayer(scope = viewModelScope)
+    }
+    val textToSpeechManager: com.example.voice.TextToSpeechManager by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        com.example.voice.TextToSpeechManager(
+            context = application,
+            scope = viewModelScope,
+            onPlaybackStarted = {
+                stopSpeechRecognizerInternal()
+            },
+            onPlaybackSettledAndReadyToListen = {
+                if (_isHandsFreeActive.value && !_isSleepMode.value) {
+                    speechRecognitionCoordinator.setProcessingState(false)
+                    val started = speechRecognitionCoordinator.startListening(userInitiated = false)
+                    if (!started) {
+                        wakeWordManager.restartWakeListeningAfterTurn()
+                    }
+                }
+            }
+        )
+    }
+    val isTtsSpeaking: StateFlow<Boolean>
+        get() = textToSpeechManager.isSpeaking
+    val chromeBridge: ChromeAppBridge by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        ChromeAppBridge(application)
+    }
+    val bufferManager: ChatMemoryBufferManager by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        ChatMemoryBufferManager(application, database.chatDao(), database.messageDao())
+    }
+    val promptRepository: com.example.data.repository.PromptRepository by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        com.example.data.repository.PromptRepository(application)
+    }
+    val chunkedImporter: com.example.importer.ChunkedChatImporter by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        com.example.importer.ChunkedChatImporter()
+    }
+    private val geminiService: GeminiService by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        isGeminiServiceInitialized = true
+        GeminiService()
+    }
 
     private val _currentUserUid = MutableStateFlow<String?>(null)
     val currentUserUid: StateFlow<String?> = _currentUserUid.asStateFlow()
@@ -324,7 +384,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
     private val _voiceEngineMode = MutableStateFlow(initialVoiceMode)
     val voiceEngineMode: StateFlow<com.example.voice.VoiceEngineMode> = _voiceEngineMode.asStateFlow()
-    val isOrionVoicePlaying: StateFlow<Boolean> = streamingVoicePlayer.isPlaying
+    val isOrionVoicePlaying: StateFlow<Boolean>
+        get() = streamingVoicePlayer.isPlaying
 
     private val initialSelectedVoice = appPrefs.getString("selected_voice", "Fenrir") ?: "Fenrir"
     private val _selectedVoice = MutableStateFlow(initialSelectedVoice)
@@ -391,13 +452,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val hasExclusiveAudioFocus: StateFlow<Boolean> = wakeWordManager.hasAudioFocus
     val isUserVoiceTurn: StateFlow<Boolean> = wakeWordManager.isUserVoiceTurn
 
+    private val _isInChatDictationActive = MutableStateFlow(false)
+    val isInChatDictationActive: StateFlow<Boolean> = _isInChatDictationActive.asStateFlow()
+
     val isChatTurnRecording: StateFlow<Boolean> = combine(
         wakeWordManager.isListening,
         wakeWordManager.engineState,
         wakeWordManager.handsFreeState,
-        wakeWordManager.isUserVoiceTurn
-    ) { listening, engineState, hfState, userVoiceTurn ->
-        (listening && (engineState == WakeWordManagerState.ACTIVE_STREAMING || hfState == HandsFreeVoiceState.TRANSCRIBING)) ||
+        wakeWordManager.isUserVoiceTurn,
+        _isInChatDictationActive
+    ) { listening, engineState, hfState, userVoiceTurn, inChatDictating ->
+        inChatDictating ||
+            (listening && (engineState == WakeWordManagerState.ACTIVE_STREAMING || hfState == HandsFreeVoiceState.TRANSCRIBING)) ||
             (listening && userVoiceTurn)
     }.stateIn(
         scope = viewModelScope,
@@ -420,22 +486,58 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val requiresAudioPermission: StateFlow<Boolean> = _requiresAudioPermission.asStateFlow()
 
     private var pendingWakeStartAfterPermission: Boolean = false
-    private var speechRecognizer: android.speech.SpeechRecognizer? = null
-    private var speechRecognizerRestartJob: Job? = null
-    private var consecutiveSpeechRecognizerErrors: Int = 0
     private var lastPartialWakeMatchMs: Long = 0L
-
-    private val _isSpeechRecognizerListening = MutableStateFlow(false)
-    val isSpeechRecognizerListening: StateFlow<Boolean> = _isSpeechRecognizerListening.asStateFlow()
-
-    private val _speechRecognizerErrorCount = MutableStateFlow(0)
-    val speechRecognizerErrorCount: StateFlow<Int> = _speechRecognizerErrorCount.asStateFlow()
 
     private val _wakeRetriggerEventId = MutableStateFlow(0L)
     val wakeRetriggerEventId: StateFlow<Long> = _wakeRetriggerEventId.asStateFlow()
 
     private val _lastDispatchedVoicePrompt = MutableStateFlow<String?>(null)
     val lastDispatchedVoicePrompt: StateFlow<String?> = _lastDispatchedVoicePrompt.asStateFlow()
+
+    // Pending wake-word trailing inquiry to auto-dispatch once when navigating into ChatDetailScreen
+    private val _pendingWakeQuery = MutableStateFlow<String?>(null)
+    val pendingWakeQuery: StateFlow<String?> = _pendingWakeQuery.asStateFlow()
+
+    private val _hasWindowFocus = MutableStateFlow(true)
+    val hasWindowFocus: StateFlow<Boolean> = _hasWindowFocus.asStateFlow()
+
+    /**
+     * Sanitizes a voice or wake query payload: discards `null`, empty, blank, legacy placeholder,
+     * pure wake-word trigger, or any query shorter than 2 characters (`length < 2`).
+     */
+    fun sanitizeValidWakeQuery(query: String?): String? {
+        val cleaned = query?.trim()
+            ?.takeIf {
+                it.length >= 2 &&
+                    it.isNotBlank() &&
+                    !ChatMessage.isLegacyAudioPlaceholder(it) &&
+                    !com.example.voice.AudioCommandSanitizer.isPureWakeWordTrigger(it)
+            }
+        return cleaned
+    }
+
+    fun setPendingWakeQuery(query: String?) {
+        val cleaned = sanitizeValidWakeQuery(query)
+        _pendingWakeQuery.value = cleaned
+        _currentDraftText.value = ""
+    }
+
+    fun consumePendingWakeQuery(): String? {
+        val current = _pendingWakeQuery.value
+        _pendingWakeQuery.value = null
+        _currentDraftText.value = ""
+        return sanitizeValidWakeQuery(current)
+    }
+
+    /**
+     * Immediately clears [_pendingWakeQuery] and any unsolicited wake conversation summary
+     * when entering ChatScreen so it cannot auto-submit or generate unsolicited summary overlays.
+     */
+    fun onEnterChatScreen(chatId: Long? = _currentChatId.value) {
+        _pendingWakeQuery.value = null
+        _currentDraftText.value = ""
+        _wakeConversationSummary.value = null
+    }
 
     internal fun setPermissionGrantedOverrideForTest(granted: Boolean?) {
         permissionGrantedOverrideForTest = granted
@@ -514,101 +616,678 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * RecognitionListener implementation for continuous wake-word listening inside MainViewModel.
+     * Dedicated coordinator managing SpeechRecognizer lifecycle, >=1500ms debounced restarts,
+     * idle timeout cutoff on ERROR_NO_MATCH (7) / ERROR_SPEECH_TIMEOUT (6),
+     * isIntentionallyPaused / sleep / processing guards, and temporary AudioManager.STREAM_SYSTEM muting.
      */
-    val wakeRecognitionListener = object : android.speech.RecognitionListener {
-        override fun onReadyForSpeech(params: android.os.Bundle?) {
-            consecutiveSpeechRecognizerErrors = 0
-            _isSpeechRecognizerListening.value = true
+    val speechRecognitionCoordinator: com.example.voice.SpeechRecognitionCoordinator = com.example.voice.SpeechRecognitionCoordinator(
+        context = application,
+        scope = viewModelScope,
+        hasRecordAudioPermission = { checkRecordAudioPermission() },
+        hasActiveWindowFocus = { _hasWindowFocus.value },
+        isContinuousModeEnabled = { _isHandsFreeActive.value },
+        isExternalGuardBlocked = {
+            _isGenerating.value || isOrionVoicePlaying.value
+        },
+        onPrepareHardwareBeforeStart = {
+            wakeWordManager.isExternalSpeechRecognizerActive = true
+            releaseAllNativeAudioRecordTracksForSpeechRecognizer()
+        },
+        onReadyStateChanged = { listening, status ->
             wakeWordManager.updateExternalListeningState(
-                listening = true,
-                status = "Listening for wake word (SpeechRecognizer)..."
+                listening = listening,
+                status = status
+            )
+        },
+        onStatusMessage = { msg ->
+            wakeWordManager.setStatusMessage(msg)
+        },
+        onRmsChangedCallback = { normalizedRms ->
+            wakeWordManager.updateExternalRmsDb(normalizedRms)
+        },
+        onAudioBufferReceived = { buffer ->
+            wakeWordManager.appendPreRollPcm(buffer, buffer.size)
+        },
+        onPartialTranscripts = { matches ->
+            processSpeechRecognizerResults(matches, isFinal = false)
+        },
+        onFinalTranscripts = { matches ->
+            _currentDraftText.value = ""
+            val handled = processSpeechRecognizerResults(matches, isFinal = true)
+            _currentDraftText.value = ""
+            handled
+        },
+        onInsufficientPermissions = {
+            _hasRecordAudioPermission.value = false
+            _requiresAudioPermission.value = true
+            _isInChatDictationActive.value = false
+            speechRecognitionCoordinator.setInChatDictationMode(false)
+        },
+        onSilenceTimeoutDuringVoiceTurn = {
+            if (_isInChatDictationActive.value) {
+                _isInChatDictationActive.value = false
+                speechRecognitionCoordinator.setInChatDictationMode(false)
+            }
+            if (isUserVoiceTurn.value) {
+                wakeWordManager.setUserVoiceTurn(false)
+                if (_isHandsFreeActive.value) {
+                    wakeWordManager.transitionToPassiveListening()
+                }
+            }
+        },
+        onIdleThresholdReached = {
+            wakeWordManager.isExternalSpeechRecognizerActive = false
+            wakeWordManager.updateExternalListeningState(
+                listening = false,
+                status = "Standby (paused after silence timeout)"
+            )
+            if (_isHandsFreeActive.value && !_isSleepMode.value) {
+                wakeWordManager.startContinuousListening(forceActiveTurn = false)
+            }
+        },
+        onFallbackToPcmRequested = {
+            wakeWordManager.isExternalSpeechRecognizerActive = false
+            wakeWordManager.startContinuousListening(forceActiveTurn = isUserVoiceTurn.value)
+        },
+        onBargeInSpeechDetected = {
+            if (textToSpeechManager.isSpeaking.value) {
+                textToSpeechManager.bargeInAndStop()
+            }
+            if (streamingVoicePlayer.isPlaying.value) {
+                streamingVoicePlayer.stop()
+            }
+        },
+        activeWakeWordsProvider = {
+            (
+                allChats.value.mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
+                    wakeWordManager.getActiveChats().mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
+                    allWakeWords.value.filter { it.isEnabled }.map { it.phrase }
+                ).distinct()
+        },
+        onOneBreathWakeQueryFinalized = { matchedWake, strippedPrompt ->
+            handleOneBreathWakeQueryDispatch(matchedWake, strippedPrompt)
+        },
+        onDiagnosticTrace = { stage, details ->
+            wakeWordManager.appendDiagnosticTraceLog(stage, details)
+        }
+    )
+
+    private var lastDirectVoiceDispatchPrompt: String = ""
+    private var lastDirectVoiceDispatchAtMs: Long = 0L
+    private var lastSentWakeMessagePrompt: String = ""
+    private var lastSentWakeMessageChatId: Long = 0L
+    private var lastSentWakeMessageAtMs: Long = 0L
+
+    private fun handleOneBreathWakeQueryDispatch(matchedWake: String, strippedPrompt: String): Boolean {
+        val cleanPrompt = sanitizeValidWakeQuery(strippedPrompt)
+        if (cleanPrompt == null || _isGenerating.value) {
+            _pendingWakeQuery.value = null
+            _currentDraftText.value = ""
+            return false
+        }
+        val now = System.currentTimeMillis()
+        if (now - lastPartialWakeMatchMs < 800L && _lastDispatchedVoicePrompt.value == cleanPrompt) {
+            return false
+        }
+        lastPartialWakeMatchMs = now
+        com.example.voice.AudioCommandSanitizer.playWakeWordHaptic(getApplication(), matchedWake)
+        stopSpeechRecognizerInternal()
+        _lastDispatchedVoicePrompt.value = cleanPrompt
+        _pendingWakeQuery.value = cleanPrompt
+        // Do NOT assign recognized speech to _currentDraftText—keep draft state and bottom input field blank.
+        _currentDraftText.value = ""
+
+        val routingDecision = com.example.voice.WakeWordRoutingEngine.resolveTargetChatForWakeWord(
+            spokenWakePhrase = matchedWake,
+            chats = allChats.value.ifEmpty { wakeWordManager.getActiveChats() },
+            configuredWakeWords = allWakeWords.value,
+            favoriteChatIds = favoriteChatIds.value,
+            contextualRoutingEnabled = contextualRoutingEnabled.value,
+            promptFavoritesOnGeneralWake = promptFavoritesOnWake.value,
+            chatCategoryMap = chatCategoryMap.value,
+            chatTagsMap = chatTagsMap.value,
+            spokenContextOrTranscript = cleanPrompt
+        )
+        _matchedWakeCategory.value = routingDecision?.matchedCategory
+        val resolvedTargetId = routingDecision?.targetChat?.id ?: _currentChatId.value
+        if (resolvedTargetId != null && resolvedTargetId > 0L && _currentChatId.value != resolvedTargetId) {
+            selectChat(resolvedTargetId)
+        }
+
+        // Validate pendingWakeQuery before dispatching to the chat session; discard if < 2 chars or blank
+        val queryToDispatch = sanitizeValidWakeQuery(_pendingWakeQuery.value ?: cleanPrompt)
+        _pendingWakeQuery.value = null
+        if (queryToDispatch == null) {
+            return false
+        }
+
+        // Execute in-chat voice action command if matched, otherwise directly invoke sendMessage(text = queryToDispatch, triggeredByWakeWord = true)
+        lastDirectVoiceDispatchPrompt = queryToDispatch
+        lastDirectVoiceDispatchAtMs = System.currentTimeMillis()
+        if (!executeInChatVoiceActionCommand(queryToDispatch, resolvedTargetId)) {
+            sendMessage(text = queryToDispatch, triggeredByWakeWord = true)
+        }
+
+        wakeWordManager.onKeywordHit(
+            keyword = matchedWake,
+            initialQuery = queryToDispatch,
+            targetChatIdOverride = routingDecision?.targetChat?.id
+        )
+        _currentDraftText.value = ""
+        return true
+    }
+
+    private val _pendingVoiceNavigationRoute = MutableStateFlow<String?>(null)
+    val pendingVoiceNavigationRoute: StateFlow<String?> = _pendingVoiceNavigationRoute.asStateFlow()
+
+    private val _isNavigatingViaVoiceCommand = MutableStateFlow(false)
+    val isNavigatingViaVoiceCommand: StateFlow<Boolean> = _isNavigatingViaVoiceCommand.asStateFlow()
+
+    @Volatile
+    var awaitingVoiceNavigationCommitRoute: String? = null
+        private set
+
+    private var voiceNavigationSettleJob: kotlinx.coroutines.Job? = null
+    private var lastVoiceNavigationAtMs: Long = 0L
+
+    /**
+     * Immediately clears/consumes the pending voice navigation route so it cannot re-trigger
+     * in an infinite loop when the app resumes or recomposes.
+     */
+    fun consumePendingVoiceNavigationRoute() {
+        val consumed = _pendingVoiceNavigationRoute.value
+        _pendingVoiceNavigationRoute.value = null
+        if (consumed != null) {
+            wakeWordManager.appendDiagnosticTraceLog(
+                stage = "VOICE_NAV_ROUTE_CONSUMED",
+                details = "route=$consumed consumed by root NavController observer"
             )
         }
+    }
 
-        override fun onBeginningOfSpeech() {
-            _isSpeechRecognizerListening.value = true
-            wakeWordManager.setStatusMessage("Detecting speech...")
+    /**
+     * Suspends active microphone capture and releases all AudioRecord / audio focus handles across
+     * SpeechRecognitionCoordinator, WakeWordManager, AudioRecorder, and WakeWordVoiceService BEFORE
+     * emitting an in-memory route ("history", "chat/$chatId", etc.) to the root NavController.
+     * Waits for [onVoiceNavigationDestinationCommitted] (plus settle window) or the fallback settle
+     * timer (650ms) before automatically resuming passive wake listening.
+     */
+    fun dispatchVoiceNavigationCommand(route: String, rawTranscript: String) {
+        val cleanRoute = route.trim()
+        if (cleanRoute.isBlank()) return
+        val now = System.currentTimeMillis()
+        if (now - lastVoiceNavigationAtMs < 600L && _pendingVoiceNavigationRoute.value == cleanRoute) {
+            wakeWordManager.appendDiagnosticTraceLog(
+                stage = "VOICE_NAV_DISPATCH_DEBOUNCED",
+                details = "route=$cleanRoute ignored duplicate within 600ms"
+            )
+            return
         }
+        lastVoiceNavigationAtMs = now
+        val cleanedTranscript = rawTranscript.trim().ifBlank { "Open History" }
 
-        override fun onRmsChanged(rmsdB: Float) {
-            val normalizedRms = rmsdB.coerceIn(0f, 10f)
-            wakeWordManager.updateExternalRmsDb(normalizedRms)
-        }
+        wakeWordManager.appendDiagnosticTraceLog(
+            stage = "VOICE_NAV_DISPATCH_START",
+            details = "route=$cleanRoute transcript=\"${cleanedTranscript.take(50)}\" locking audio mutex before navigation"
+        )
 
-        override fun onBufferReceived(buffer: ByteArray?) {
-            if (buffer != null && buffer.isNotEmpty()) {
-                wakeWordManager.appendPreRollPcm(buffer, buffer.size)
-            }
-        }
+        // 1. Immediately pause/suspend active microphone listening loops and release AudioRecord handles
+        //    BEFORE emitting the navigation state to prevent Samsung One UI audio policy conflicts.
+        awaitingVoiceNavigationCommitRoute = cleanRoute
+        _isNavigatingViaVoiceCommand.value = true
+        _isInChatDictationActive.value = false
+        speechRecognitionCoordinator.setInChatDictationMode(false)
+        speechRecognitionCoordinator.pauseForCommandDispatch(reason = "route:$cleanRoute")
+        wakeWordManager.isExternalSpeechRecognizerActive = false
+        wakeWordManager.setUserVoiceTurn(false)
+        audioRecorder.stopAndReleaseHardware()
+        wakeWordManager.stopAndReleaseAudioRecordSynchronously()
+        wakeWordManager.abandonExclusiveAudioFocus()
+        com.example.voice.WakeWordVoiceService.pauseMicrophoneForCommandDispatch(getApplication())
 
-        override fun onEndOfSpeech() {
-            _isSpeechRecognizerListening.value = false
-        }
+        // 2. Clear any stale draft or pending wake query so it cannot auto-send
+        _currentDraftText.value = ""
+        _pendingWakeQuery.value = null
 
-        override fun onError(error: Int) {
-            _isSpeechRecognizerListening.value = false
-            when (error) {
-                android.speech.SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
-                    _hasRecordAudioPermission.value = false
-                    _requiresAudioPermission.value = true
-                    wakeWordManager.updateExternalListeningState(
-                        listening = false,
-                        status = "Microphone permission required for wake-word listening"
-                    )
-                }
-                android.speech.SpeechRecognizer.ERROR_SPEECH_TIMEOUT,
-                android.speech.SpeechRecognizer.ERROR_NO_MATCH -> {
-                    consecutiveSpeechRecognizerErrors = 0
-                    if (isUserVoiceTurn.value) {
-                        wakeWordManager.setUserVoiceTurn(false)
-                        if (_isHandsFreeActive.value) {
-                            wakeWordManager.transitionToPassiveListening()
-                        }
-                    }
-                    if (_isHandsFreeActive.value && !isTextInputFocused.value) {
-                        scheduleSpeechRecognizerRestart(delayMs = 180L)
-                    }
-                }
-                else -> {
-                    consecutiveSpeechRecognizerErrors++
-                    _speechRecognizerErrorCount.update { it + 1 }
-                    if (_isHandsFreeActive.value && !isTextInputFocused.value) {
-                        if (consecutiveSpeechRecognizerErrors <= 4) {
-                            val backoffMs = (250L * consecutiveSpeechRecognizerErrors).coerceAtMost(1200L)
-                            scheduleSpeechRecognizerRestart(delayMs = backoffMs, allowDuringUserVoiceTurn = true)
-                        } else {
-                            // Hybrid Fallback: switch to hardware AudioRecord PCM wake listener
-                            stopSpeechRecognizerInternal()
-                            wakeWordManager.startContinuousListening(forceActiveTurn = isUserVoiceTurn.value)
-                        }
-                    }
-                }
-            }
-        }
+        // 3. Record command in Voice Command History
+        webLinkHistoryManager.recordVoiceCommand(
+            commandType = VoiceCommandType.WAKE_WORD,
+            triggerPhrase = "Voice History",
+            recognizedTranscript = cleanedTranscript,
+            chatTitle = currentChat.value?.title ?: "History Navigation"
+        )
+        wakeWordManager.setStatusMessage("Opening History...")
 
-        override fun onResults(results: android.os.Bundle?) {
-            _isSpeechRecognizerListening.value = false
-            val matches = results?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
-            val recognizedText = matches?.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
-            if (recognizedText.isNotBlank()) {
-                com.example.voice.WakeWordVoiceService.startServiceSafely(
-                    context = getApplication(),
-                    candidateTranscript = recognizedText
+        // 4. Emit in-memory navigation route consumed by root NavController in MainActivity
+        _pendingVoiceNavigationRoute.value = cleanRoute
+
+        // 5. Fallback settle timer (650ms) in case NavController is already on destination or running in headless test
+        voiceNavigationSettleJob?.cancel()
+        voiceNavigationSettleJob = viewModelScope.launch(Dispatchers.Main.immediate) {
+            kotlinx.coroutines.delay(650L)
+            if (_isNavigatingViaVoiceCommand.value) {
+                completeVoiceNavigationMutexResume(
+                    committedRoute = cleanRoute,
+                    triggerSource = "fallback_settle_timer_650ms"
                 )
             }
-            val matchedWakeOrCommand = processSpeechRecognizerResults(matches, isFinal = true)
-            if (!matchedWakeOrCommand && _isHandsFreeActive.value && !isTextInputFocused.value) {
-                scheduleSpeechRecognizerRestart(delayMs = if (_isSleepMode.value) 350L else 150L, allowDuringUserVoiceTurn = true)
+        }
+    }
+
+    /**
+     * Invoked by [com.example.MainActivity] after `NavController` commits the target route
+     * (e.g., `"history"`) and the UI frame has settled. Schedules a post-commit settle delay
+     * (`450ms`) before unlocking the microphone mutex and resuming passive wake listening.
+     */
+    fun onVoiceNavigationDestinationCommitted(committedRoute: String, settleDelayMs: Long = 450L) {
+        val cleanCommitted = committedRoute.trim()
+        if (cleanCommitted.isBlank()) return
+        wakeWordManager.appendDiagnosticTraceLog(
+            stage = "VOICE_NAV_DESTINATION_COMMITTED",
+            details = "route=$cleanCommitted settleDelayMs=$settleDelayMs navMoving=${_isNavigatingViaVoiceCommand.value}"
+        )
+        voiceNavigationSettleJob?.cancel()
+        voiceNavigationSettleJob = viewModelScope.launch(Dispatchers.Main.immediate) {
+            kotlinx.coroutines.delay(settleDelayMs.coerceAtLeast(100L))
+            completeVoiceNavigationMutexResume(
+                committedRoute = cleanCommitted,
+                triggerSource = "nav_controller_commit_plus_${settleDelayMs}ms"
+            )
+        }
+    }
+
+    private fun completeVoiceNavigationMutexResume(committedRoute: String, triggerSource: String) {
+        awaitingVoiceNavigationCommitRoute = null
+        _isNavigatingViaVoiceCommand.value = false
+        com.example.voice.WakeWordVoiceService.resumeMicrophoneAfterCommandNavigation(getApplication())
+        val shouldResumeListening = _isHandsFreeActive.value && !_isSleepMode.value
+        wakeWordManager.appendDiagnosticTraceLog(
+            stage = "VOICE_NAV_MUTEX_RESUMED",
+            details = "route=$committedRoute source=$triggerSource handsFree=${_isHandsFreeActive.value} sleep=${_isSleepMode.value} autoResume=$shouldResumeListening"
+        )
+        if (shouldResumeListening) {
+            speechRecognitionCoordinator.resumeAfterCommandNavigation(
+                delayMs = com.example.voice.SpeechRecognitionCoordinator.MIN_RESTART_DEBOUNCE_MS,
+                reason = "$triggerSource:$committedRoute"
+            )
+        }
+    }
+
+    /**
+     * Parses and executes in-chat voice action commands after a wake word is spoken or during in-chat voice control
+     * (e.g., opening voice history, clearing chat history, reading the last reply aloud, pinning/unpinning the chat, or switching themes).
+     * Returns true if a dedicated voice action command was handled, or false if the transcript should be sent as a prompt.
+     */
+    fun executeInChatVoiceActionCommand(rawTranscript: String, targetChatId: Long? = _currentChatId.value): Boolean {
+        val normalized = rawTranscript.trim().lowercase(java.util.Locale.US)
+            .trimEnd('.', '!', '?')
+            .trim()
+        if (normalized.isBlank()) return false
+
+        val activeWakeWords = (
+            allChats.value.mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
+                wakeWordManager.getActiveChats().mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
+                allWakeWords.value.filter { it.isEnabled }.map { it.phrase }
+            ).distinct()
+        if (com.example.voice.AudioCommandSanitizer.isVoiceHistoryNavigationCommand(rawTranscript, activeWakeWords)) {
+            dispatchVoiceNavigationCommand(route = "history", rawTranscript = rawTranscript)
+            return true
+        }
+
+        val chatId = targetChatId ?: _currentChatId.value ?: allChats.value.firstOrNull()?.id ?: return false
+
+        return when {
+            normalized == "clear chat" ||
+                normalized == "clear history" ||
+                normalized == "clear chat history" ||
+                normalized == "delete chat history" -> {
+                clearChatHistory(chatId)
+                wakeWordManager.setStatusMessage("Cleared chat history via voice command")
+                true
+            }
+            normalized == "read last reply" ||
+                normalized == "read reply" ||
+                normalized == "read response" ||
+                normalized == "read last message" ||
+                normalized == "speak last reply" -> {
+                val lastAiReply = rawCurrentMessages.value.lastOrNull { it.sender != "user" && it.content.isNotBlank() }?.content
+                if (!lastAiReply.isNullOrBlank()) {
+                    speakMessage(lastAiReply)
+                    wakeWordManager.setStatusMessage("Reading last reply aloud")
+                }
+                true
+            }
+            normalized == "pin chat" ||
+                normalized == "pin this chat" ||
+                normalized == "pin conversation" -> {
+                if (!pinnedChatIds.value.contains(chatId)) {
+                    togglePinnedChat(chatId)
+                }
+                wakeWordManager.setStatusMessage("Pinned chat to top of list")
+                true
+            }
+            normalized == "unpin chat" ||
+                normalized == "unpin this chat" ||
+                normalized == "unpin conversation" -> {
+                if (pinnedChatIds.value.contains(chatId)) {
+                    togglePinnedChat(chatId)
+                }
+                wakeWordManager.setStatusMessage("Unpinned chat")
+                true
+            }
+            normalized == "dark theme" || normalized == "switch to dark theme" -> {
+                updateChatTheme(chatId, AppTheme.DARK)
+                wakeWordManager.setStatusMessage("Switched chat to Dark theme")
+                true
+            }
+            normalized == "light theme" || normalized == "switch to light theme" -> {
+                updateChatTheme(chatId, AppTheme.LIGHT)
+                wakeWordManager.setStatusMessage("Switched chat to Light theme")
+                true
+            }
+            normalized.contains("ocean theme") || normalized.contains("cyan theme") -> {
+                updateChatAppearance(chatId, "OCEAN_CYAN", "DEFAULT", "#38BDF8")
+                wakeWordManager.setStatusMessage("Applied Ocean Cyan palette")
+                true
+            }
+            normalized.contains("emerald theme") || normalized.contains("forest theme") -> {
+                updateChatAppearance(chatId, "EMERALD_FOREST", "AURORA_MESH", "#10B981")
+                wakeWordManager.setStatusMessage("Applied Emerald Forest palette")
+                true
+            }
+            normalized.contains("sunset theme") || normalized.contains("amber theme") -> {
+                updateChatAppearance(chatId, "SUNSET_AMBER", "WARM_DUSK", "#F59E0B")
+                wakeWordManager.setStatusMessage("Applied Sunset Amber palette")
+                true
+            }
+            normalized.contains("violet theme") || normalized.contains("purple theme") || normalized.contains("nebula theme") -> {
+                updateChatAppearance(chatId, "ROYAL_VIOLET", "NEBULA_GLOW", "#A855F7")
+                wakeWordManager.setStatusMessage("Applied Royal Violet & Nebula Glow theme")
+                true
+            }
+            normalized.contains("rose theme") || normalized.contains("pink theme") -> {
+                updateChatAppearance(chatId, "ROSE_QUARTZ", "WARM_DUSK", "#F43F5E")
+                wakeWordManager.setStatusMessage("Applied Rose Quartz palette")
+                true
+            }
+            normalized == "open diagnostics" ||
+                normalized == "show diagnostics" ||
+                normalized == "open diagnostic log" ||
+                normalized == "diagnostic log" -> {
+                dispatchVoiceNavigationCommand(route = "diagnostics", rawTranscript = rawTranscript)
+                true
+            }
+            else -> false
+        }
+    }
+
+    val isSpeechRecognizerListening: StateFlow<Boolean>
+        get() = speechRecognitionCoordinator.isListening
+
+    val speechRecognizerRmsDb: StateFlow<Float>
+        get() = speechRecognitionCoordinator.liveRmsDb
+
+    val speechRecognizerErrorCount: StateFlow<Int>
+        get() = speechRecognitionCoordinator.errorCount
+
+    val speechTraceHistory: StateFlow<List<String>>
+        get() = speechRecognitionCoordinator.traceHistory
+
+    val coordinatorMutexSnapshot: StateFlow<com.example.voice.SpeechRecognitionCoordinator.CoordinatorMutexSnapshot>
+        get() = speechRecognitionCoordinator.mutexSnapshotFlow
+
+    val wakeRecognitionListener: android.speech.RecognitionListener
+        get() = speechRecognitionCoordinator.recognitionListener
+
+    fun clearDiagnosticTraceLogs() {
+        speechRecognitionCoordinator.clearTraceHistory()
+        wakeWordManager.clearWakeWordLogs()
+    }
+
+    fun toggleDiagnosticSpeechRecognizer(): Boolean {
+        val currentlyActive = speechRecognitionCoordinator.isListening.value || wakeWordManager.isListening.value
+        return if (currentlyActive) {
+            speechRecognitionCoordinator.recordTrace(
+                stage = "DIAGNOSTIC_USER_STOP_REQUESTED",
+                details = "User stopped SpeechRecognizer from Diagnostic Console"
+            )
+            stopContinuousWakeWordListening()
+            false
+        } else {
+            speechRecognitionCoordinator.setSleeping(false)
+            speechRecognitionCoordinator.setProcessingState(false)
+            speechRecognitionCoordinator.setIntentionallyPaused(false)
+            speechRecognitionCoordinator.recordTrace(
+                stage = "DIAGNOSTIC_USER_START_REQUESTED",
+                details = "User started SpeechRecognizer from Diagnostic Console"
+            )
+            val started = speechRecognitionCoordinator.startListening(userInitiated = true)
+            if (!started) {
+                wakeWordManager.startContinuousListening(forceActiveTurn = false)
+            }
+            started || wakeWordManager.isListening.value
+        }
+    }
+
+    fun simulateDiagnosticWakeWordEvent(
+        wakePhrase: String = allChats.value.firstOrNull { it.isDefaultWakeChat }?.wakeWord
+            ?: allWakeWords.value.firstOrNull { it.isEnabled }?.phrase
+            ?: "Hey Gemini",
+        followUpPrompt: String = "diagnostic status check"
+    ) {
+        val cleanPhrase = wakePhrase.trim().ifBlank { "Hey Gemini" }
+        val cleanFollowUp = followUpPrompt.trim().ifBlank { "diagnostic status check" }
+        val simulatedTranscript = "$cleanPhrase $cleanFollowUp"
+
+        speechRecognitionCoordinator.recordTrace(
+            stage = "DIAGNOSTIC_WAKE_SIMULATION_START",
+            details = "Simulating wake event phrase=\"$cleanPhrase\" transcript=\"$simulatedTranscript\""
+        )
+        speechRecognitionCoordinator.recognitionListener.onReadyForSpeech(android.os.Bundle())
+        speechRecognitionCoordinator.recognitionListener.onBeginningOfSpeech()
+        speechRecognitionCoordinator.recognitionListener.onRmsChanged(6.4f)
+
+        val partialBundle = android.os.Bundle().apply {
+            putStringArrayList(
+                android.speech.SpeechRecognizer.RESULTS_RECOGNITION,
+                arrayListOf(cleanPhrase)
+            )
+        }
+        speechRecognitionCoordinator.recognitionListener.onPartialResults(partialBundle)
+
+        val targetChat = allChats.value.firstOrNull {
+            it.wakeWord.equals(cleanPhrase, ignoreCase = true)
+        } ?: allChats.value.firstOrNull { it.isDefaultWakeChat } ?: allChats.value.firstOrNull()
+
+        wakeWordManager.updateLastHeardText(simulatedTranscript)
+        wakeWordManager.onKeywordHit(
+            keyword = cleanPhrase,
+            initialQuery = cleanFollowUp,
+            targetChatIdOverride = targetChat?.id
+        )
+        speechRecognitionCoordinator.recordTrace(
+            stage = "DIAGNOSTIC_WAKE_EVENT_VERIFIED",
+            details = "Wake word \"$cleanPhrase\" routed to chat=\"${targetChat?.title ?: "Default Chat"}\" (id=${targetChat?.id ?: 0L})"
+        )
+    }
+
+    fun resetDiagnosticAudioMutexLocks() {
+        awaitingVoiceNavigationCommitRoute = null
+        _isNavigatingViaVoiceCommand.value = false
+        _isInChatDictationActive.value = false
+        speechRecognitionCoordinator.setInChatDictationMode(false)
+        speechRecognitionCoordinator.setProcessingState(false)
+        speechRecognitionCoordinator.setSleeping(false)
+        speechRecognitionCoordinator.setIntentionallyPaused(false)
+        wakeWordManager.setUserVoiceTurn(false)
+        wakeWordManager.exitSleepMode("Mutex reset from Diagnostic Console")
+        speechRecognitionCoordinator.recordTrace(
+            stage = "DIAGNOSTIC_MUTEX_LOCKS_RESET",
+            details = "Cleared paused, processing, asleep, dictation, and navigation mutex locks"
+        )
+    }
+
+    val sessionStartedAtMs: Long = System.currentTimeMillis()
+
+    fun buildDiagnosticReportText(): String {
+        val snap = speechRecognitionCoordinator.getMutexSnapshot()
+        val traces = speechRecognitionCoordinator.traceHistory.value
+        val logs = wakeWordManager.wakeWordLogs.value
+        val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US)
+        return buildString {
+            appendLine("=== GEMINI WAKE SPEECHRECOGNIZER & MUTEX DIAGNOSTIC REPORT ===")
+            appendLine("Generated: ${sdf.format(java.util.Date(System.currentTimeMillis()))}")
+            appendLine("Recognizer Listening: ${snap.isListening} | WakeManager Listening: ${wakeWordManager.isListening.value}")
+            appendLine("Window Focus: ${snap.isWindowFocused} | Intentionally Paused: ${snap.isIntentionallyPaused}")
+            appendLine("Processing Mutex: ${snap.isProcessing} | Sleep Mode: ${snap.isAsleep || _isSleepMode.value}")
+            appendLine("In-Chat Dictation: ${snap.isInChatDictationMode} | Voice Nav Mutex Locked: ${_isNavigatingViaVoiceCommand.value}")
+            appendLine("Exclusive Audio Focus: ${wakeWordManager.hasAudioFocus.value} | Hands-Free Mode: ${_isHandsFreeActive.value}")
+            appendLine("Idle Timeouts: ${snap.consecutiveIdleTimeouts} | Transient Errors: ${snap.consecutiveTransientErrors} | Total Errors: ${snap.totalErrors}")
+            appendLine("Status Message: ${wakeWordManager.statusMessage.value}")
+            appendLine("Last Heard Transcript: \"${wakeWordManager.lastHeardText.value}\"")
+            appendLine()
+            appendLine("--- THREAD & MUTEX TRACE HISTORY (${traces.size} entries) ---")
+            if (traces.isEmpty()) {
+                appendLine("(No SpeechRecognizer trace entries recorded yet)")
+            } else {
+                traces.forEachIndexed { idx, line ->
+                    appendLine("${idx + 1}. $line")
+                }
+            }
+            appendLine()
+            appendLine("--- WAKE-WORD & EVENT LOGS (${logs.size} entries) ---")
+            if (logs.isEmpty()) {
+                appendLine("(No wake-word event logs recorded yet)")
+            } else {
+                logs.forEachIndexed { idx, entry ->
+                    appendLine("${idx + 1}. [${sdf.format(java.util.Date(entry.timestamp))}] ${entry.wakeWord} | rms=${String.format(java.util.Locale.US, "%.1f", entry.rmsDb)}dB | ${entry.chatTitle}")
+                }
             }
         }
+    }
 
-        override fun onPartialResults(partialResults: android.os.Bundle?) {
-            val matches = partialResults?.getStringArrayList(android.speech.SpeechRecognizer.RESULTS_RECOGNITION)
-            processSpeechRecognizerResults(matches, isFinal = false)
+    /**
+     * Collects per-use session diagnostic information for debugging purposes when "Create a general log file"
+     * is tapped in Settings, highlighting Network state, Permission states, Recent Error logs, and Session telemetry.
+     */
+    fun buildGeneralSessionLogFile(): String {
+        val appContext = getApplication<Application>()
+        val nowMs = System.currentTimeMillis()
+        val uptimeSec = ((nowMs - sessionStartedAtMs) / 1000L).coerceAtLeast(0L)
+        val snap = speechRecognitionCoordinator.getMutexSnapshot()
+        val traces = speechRecognitionCoordinator.traceHistory.value
+        val wakeLogs = wakeWordManager.wakeWordLogs.value
+        val voiceCmds = voiceCommandHistory.value
+        val relay = relayServerState.value
+        val buf = bufferMetrics.value
+        val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US)
+
+        val audioGranted = checkRecordAudioPermission()
+        val cameraGranted = androidx.core.content.ContextCompat.checkSelfPermission(
+            appContext,
+            android.Manifest.permission.CAMERA
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        val notificationsGranted = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                appContext,
+                android.Manifest.permission.POST_NOTIFICATIONS
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        } else {
+            true
         }
 
-        override fun onEvent(eventType: Int, params: android.os.Bundle?) {}
+        val errorTraces = traces.filter { line ->
+            line.contains("ERROR", ignoreCase = true) ||
+                line.contains("EXCEPTION", ignoreCase = true) ||
+                line.contains("UNAVAILABLE", ignoreCase = true) ||
+                line.contains("ABORTED", ignoreCase = true) ||
+                line.contains("OFF-MAIN-THREAD", ignoreCase = true) ||
+                line.contains("RATE_LIMITED", ignoreCase = true) ||
+                line.contains("WARN", ignoreCase = true)
+        }
+        val hapticEvents = com.example.voice.AudioCommandSanitizer.getRecentHapticEvents()
+
+        return buildString {
+            appendLine("=== GEMINI WAKE GENERAL SESSION DIAGNOSTIC LOG FILE ===")
+            appendLine("Session Started: ${sdf.format(java.util.Date(sessionStartedAtMs))}")
+            appendLine("Log Generated:   ${sdf.format(java.util.Date(nowMs))}")
+            appendLine("Session Uptime:  ${uptimeSec / 60}m ${uptimeSec % 60}s (${nowMs - sessionStartedAtMs} ms)")
+            appendLine("Active Chat:     ${currentChat.value?.title ?: "None"} (id=${_currentChatId.value ?: -1L})")
+            appendLine("Loaded Chats:    ${allChats.value.size} | Configured Wake Words: ${allWakeWords.value.size}")
+            appendLine("Voice Engine:    ${_voiceEngineMode.value.displayName} | Sensitivity: ${(_wakeWordSensitivity.value * 100).toInt()}%")
+            appendLine("Memory Buffer:   Hot RAM=${buf.hotMemoryCount}/${buf.hotBufferSizeLimit} | Total Disk=${buf.totalDiskCount}")
+            appendLine()
+            appendLine("--- 1. NETWORK & CONNECTIVITY STATE ---")
+            appendLine("Network Connection State: ${networkState.value.name}")
+            appendLine("Cloud Firestore Sync:     ${_cloudSyncStatus.value}")
+            appendLine("Signed-In Account:        ${_currentUserEmail.value ?: "Local / Unauthenticated"}")
+            appendLine("Local Sync Relay:         ${relay.bindHost}:${relay.port} | Running=${relay.isRunning} | Clients=${relay.connectedClientsCount} | Deduplicated=${relay.deduplicatedTurnCount}")
+            appendLine()
+            appendLine("--- 2. PERMISSION & AUDIO FOCUS STATES ---")
+            appendLine("RECORD_AUDIO Permission:       ${if (audioGranted) "GRANTED" else "DENIED"}")
+            appendLine("CAMERA Permission:             ${if (cameraGranted) "GRANTED" else "DENIED"}")
+            appendLine("POST_NOTIFICATIONS Permission: ${if (notificationsGranted) "GRANTED" else "DENIED"}")
+            appendLine("Permission Rationale Enabled:  ${_permissionRationaleEnabled.value} | Permission Resets: ${_permissionsResetCount.value}")
+            appendLine("Exclusive Audio Focus Held:    ${wakeWordManager.hasAudioFocus.value} | Window Focus: ${_hasWindowFocus.value}")
+            appendLine("Hands-Free Radar Active:       ${_isHandsFreeActive.value} | Sleep Mode: ${_isSleepMode.value} (${_sleepModeReason.value.ifBlank { "Awake" }})")
+            appendLine("Recognizer Listening:          ${snap.isListening} | WakeManager Listening: ${wakeWordManager.isListening.value}")
+            appendLine()
+            appendLine("--- 3. RECENT ERROR LOGS & WARNINGS ---")
+            appendLine("Active UI Error Message:       ${_errorMessage.value ?: "None"}")
+            appendLine("Recognizer Error Counters:     totalErrors=${snap.totalErrors}, transientErrors=${snap.consecutiveTransientErrors}, idleTimeouts=${snap.consecutiveIdleTimeouts}")
+            if (errorTraces.isEmpty() && _errorMessage.value.isNullOrBlank()) {
+                appendLine("(No error or warning trace entries recorded during this session)")
+            } else {
+                errorTraces.take(25).forEachIndexed { idx, errLine ->
+                    appendLine("Error #${idx + 1}: $errLine")
+                }
+            }
+            appendLine()
+            appendLine("--- 4. HAPTIC FEEDBACK & VOICE ACTIVATION TELEMETRY ---")
+            appendLine("Total Haptics Triggered: ${com.example.voice.AudioCommandSanitizer.hapticTriggerCount} | Last Pattern: ${com.example.voice.AudioCommandSanitizer.lastHapticPattern?.name ?: "NONE"}")
+            if (hapticEvents.isEmpty()) {
+                appendLine("(No haptic events triggered yet in this session)")
+            } else {
+                hapticEvents.take(10).forEachIndexed { idx, evt ->
+                    appendLine("Haptic #${idx + 1}: $evt")
+                }
+            }
+            appendLine("Session Voice Commands Recorded: ${voiceCmds.size}")
+            voiceCmds.take(10).forEachIndexed { idx, cmd ->
+                appendLine("Command #${idx + 1}: [${cmd.commandType.name}] trigger=\"${cmd.triggerPhrase}\" transcript=\"${cmd.recognizedTranscript}\"")
+            }
+            appendLine()
+            appendLine("--- 5. RECENT SESSION TRACE & WAKE EVENT TAIL (${traces.size} traces, ${wakeLogs.size} logs) ---")
+            if (traces.isEmpty() && wakeLogs.isEmpty()) {
+                appendLine("(No trace entries recorded yet in this session)")
+            } else {
+                traces.take(20).forEachIndexed { idx, line ->
+                    appendLine("Trace #${idx + 1}: $line")
+                }
+                wakeLogs.filter { !it.wakeWord.startsWith("[SR-Trace]") }.take(10).forEachIndexed { idx, entry ->
+                    appendLine("Wake #${idx + 1}: [${sdf.format(java.util.Date(entry.timestamp))}] ${entry.wakeWord} | rms=${String.format(java.util.Locale.US, "%.1f", entry.rmsDb)}dB | ${entry.chatTitle}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Builds the per-use general session log file and immediately copies it to the system clipboard on demand.
+     */
+    fun createAndCopyGeneralLogFileToClipboard(context: android.content.Context = getApplication()): String {
+        val logContent = buildGeneralSessionLogFile()
+        try {
+            val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+            val clip = android.content.ClipData.newPlainText("Gemini Wake General Session Log", logContent)
+            clipboard?.setPrimaryClip(clip)
+        } catch (e: Exception) {
+            android.util.Log.w("MainViewModel", "Unable to copy general log file to clipboard: ${e.message}")
+        }
+        speechRecognitionCoordinator.recordTrace(
+            stage = "GENERAL_LOG_FILE_CREATED",
+            details = "Copied session general diagnostic log (${logContent.length} chars) to clipboard"
+        )
+        return logContent
     }
 
     /**
@@ -617,7 +1296,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * Returns true if a wake-word or terminal command was triggered.
      */
     fun processSpeechRecognizerResults(candidates: List<String>?, isFinal: Boolean): Boolean {
-        val rawList = candidates?.filter { it.isNotBlank() }.orEmpty()
+        val rawList = candidates
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() && !ChatMessage.isLegacyAudioPlaceholder(it) }
+            .orEmpty()
         if (rawList.isEmpty()) return false
 
         val primaryTranscript = rawList.first().trim()
@@ -625,6 +1307,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // 0a. Check Wake-Up Voice Command ("Gemini, wake up") to exit Sleep Mode
         if (com.example.voice.AudioCommandSanitizer.containsWakeUpCommand(primaryTranscript)) {
             if (isFinal) {
+                com.example.voice.AudioCommandSanitizer.playVoiceCommandHaptic(
+                    getApplication(),
+                    "Wake Up (\"$primaryTranscript\")"
+                )
                 exitSleepModeAndResumeListening(reason = "Voice command: \"$primaryTranscript\"")
                 webLinkHistoryManager.recordVoiceCommand(
                     commandType = VoiceCommandType.WAKE_UP,
@@ -639,6 +1325,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // 0b. Check Sleep Voice Command ("Gemini, sleep") to temporarily disable the wake word listener
         if (com.example.voice.AudioCommandSanitizer.containsSleepCommand(primaryTranscript)) {
             if (isFinal) {
+                com.example.voice.AudioCommandSanitizer.playVoiceCommandHaptic(
+                    getApplication(),
+                    "Sleep (\"$primaryTranscript\")"
+                )
                 enterSleepMode(reason = "Voice command: \"$primaryTranscript\"")
                 webLinkHistoryManager.recordVoiceCommand(
                     commandType = VoiceCommandType.SLEEP,
@@ -655,6 +1345,35 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return false
         }
 
+        // 0c. Check Voice History Navigation Command ("open history", "show history", "voice history")
+        //     Suspends active microphone/AudioRecord FIRST and navigates purely in-app via StateFlow.
+        val activeWakeWordsForHistory = (
+            allChats.value.mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
+                wakeWordManager.getActiveChats().mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
+                allWakeWords.value.filter { it.isEnabled }.map { it.phrase }
+            ).distinct()
+        val matchedHistoryCandidate = rawList.firstOrNull { candidate ->
+            com.example.voice.AudioCommandSanitizer.isVoiceHistoryNavigationCommand(
+                candidate,
+                activeWakeWordsForHistory
+            )
+        }
+        if (matchedHistoryCandidate != null) {
+            wakeWordManager.updateLastHeardText(matchedHistoryCandidate)
+            if (isFinal) {
+                com.example.voice.AudioCommandSanitizer.playVoiceCommandHaptic(
+                    getApplication(),
+                    "Voice History Navigation (\"$matchedHistoryCandidate\")"
+                )
+                dispatchVoiceNavigationCommand(
+                    route = "history",
+                    rawTranscript = matchedHistoryCandidate
+                )
+                return true
+            }
+            return false
+        }
+
         // 1. Check Heartbeat Trigger
         if (com.example.voice.AudioCommandSanitizer.containsHeartbeatTrigger(primaryTranscript, _heartbeatTrigger.value)) {
             if (isFinal) {
@@ -667,6 +1386,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // 2. Check Send Trigger
         if (com.example.voice.AudioCommandSanitizer.containsSendTrigger(primaryTranscript, _sendTrigger.value)) {
             if (isFinal) {
+                com.example.voice.AudioCommandSanitizer.playVoiceCommandHaptic(
+                    getApplication(),
+                    "Send (${_sendTrigger.value})"
+                )
                 wakeWordManager.onHandsFreeSend?.invoke(primaryTranscript)
             }
             return isFinal
@@ -674,21 +1397,84 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         // 3. Check Dictate Trigger
         if (com.example.voice.AudioCommandSanitizer.containsDictateTrigger(primaryTranscript, _dictateTrigger.value)) {
-            val extracted = com.example.voice.AudioCommandSanitizer.extractContentAfterDictate(
-                primaryTranscript,
-                _dictateTrigger.value
+            val extracted = sanitizeValidWakeQuery(
+                com.example.voice.AudioCommandSanitizer.extractContentAfterDictate(
+                    primaryTranscript,
+                    _dictateTrigger.value
+                )
             )
-            if (extracted.isNotBlank()) {
-                _currentDraftText.value = extracted
+            if (extracted != null) {
+                _currentDraftText.value = ""
                 wakeWordManager.updateLastHeardText(extracted)
                 if (isFinal) {
+                    com.example.voice.AudioCommandSanitizer.playVoiceCommandHaptic(
+                        getApplication(),
+                        "Dictate (${_dictateTrigger.value})"
+                    )
+                    _currentDraftText.value = ""
                     webLinkHistoryManager.recordVoiceCommand(
                         commandType = VoiceCommandType.DICTATE,
                         triggerPhrase = _dictateTrigger.value,
                         recognizedTranscript = extracted,
                         chatTitle = currentChat.value?.title
                     )
-                    sendMessage(extracted, triggeredByWakeWord = true)
+                    if (!executeInChatVoiceActionCommand(extracted, _currentChatId.value)) {
+                        sendMessage(text = extracted, triggeredByWakeWord = true)
+                    }
+                    return true
+                }
+            }
+            return false
+        }
+
+        // 3b. Explicit In-Chat Dictation Mode:
+        // Leave _currentDraftText completely clear and on final transcripts directly invoke sendMessage(text = cleanPrompt, triggeredByWakeWord = true).
+        if (_isInChatDictationActive.value) {
+            val activeWakeWords = (
+                allChats.value.mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
+                    wakeWordManager.getActiveChats().mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
+                    allWakeWords.value.filter { it.isEnabled }.map { it.phrase }
+                ).distinct()
+            val (_, scrubbed) = com.example.voice.SpeechRecognitionCoordinator.extractWakeTriggeredTranscript(
+                rawTranscript = primaryTranscript,
+                customWakeWords = activeWakeWords
+            )
+            val cleanPrompt = sanitizeValidWakeQuery(scrubbed)
+            if (cleanPrompt != null &&
+                !com.example.voice.AudioCommandSanitizer.isSystemOrCommandStatusString(
+                    text = cleanPrompt,
+                    dictateTrigger = _dictateTrigger.value,
+                    sendTrigger = _sendTrigger.value,
+                    heartbeatTrigger = _heartbeatTrigger.value
+                )
+            ) {
+                _currentDraftText.value = ""
+                wakeWordManager.updateLastHeardText(cleanPrompt)
+                if (isFinal) {
+                    com.example.voice.AudioCommandSanitizer.playVoiceCommandHaptic(
+                        getApplication(),
+                        "In-Chat Mic Dictation"
+                    )
+                    _isInChatDictationActive.value = false
+                    speechRecognitionCoordinator.setInChatDictationMode(false)
+                    wakeWordManager.setUserVoiceTurn(false)
+                    _currentDraftText.value = ""
+                    _lastDispatchedVoicePrompt.value = cleanPrompt
+                    webLinkHistoryManager.recordVoiceCommand(
+                        commandType = VoiceCommandType.DICTATE,
+                        triggerPhrase = "In-Chat Mic Dictation",
+                        recognizedTranscript = cleanPrompt,
+                        chatTitle = currentChat.value?.title
+                    )
+                    if (!executeInChatVoiceActionCommand(cleanPrompt, _currentChatId.value)) {
+                        sendMessage(text = cleanPrompt, triggeredByWakeWord = true)
+                    }
+                    if (_isHandsFreeActive.value && !_isSleepMode.value) {
+                        scheduleSpeechRecognizerRestart(
+                            delayMs = com.example.voice.SpeechRecognitionCoordinator.DEFAULT_RESTART_DEBOUNCE_MS,
+                            allowDuringUserVoiceTurn = true
+                        )
+                    }
                     return true
                 }
             }
@@ -700,82 +1486,116 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val wakeMatch = wakeWordManager.matchWakePhraseInTranscript(candidate)
             if (wakeMatch != null) {
                 val now = System.currentTimeMillis()
+                val customWordsForMatch = listOfNotNull(
+                    wakeMatch.matchedWakeWord.takeIf { it.isNotBlank() },
+                    wakeMatch.matchedChat?.wakeWord?.takeIf { it.isNotBlank() }
+                ).distinct()
+                val strippedFollowUp = wakeMatch.followUpQuery?.let { rawFollowUp ->
+                    com.example.voice.SpeechRecognitionCoordinator.extractWakeTriggeredTranscript(
+                        rawTranscript = rawFollowUp,
+                        customWakeWords = customWordsForMatch
+                    ).second.trim()
+                }?.let { sanitizeValidWakeQuery(it) }
+
                 // If user is still speaking a follow-up query during partial results, wait for final result
                 // so the entire follow-up question is captured in one breath.
-                if (!isFinal && !wakeMatch.followUpQuery.isNullOrBlank()) {
-                    wakeWordManager.updateLastHeardText(wakeMatch.followUpQuery)
+                if (!isFinal && !strippedFollowUp.isNullOrBlank()) {
+                    wakeWordManager.updateLastHeardText(strippedFollowUp)
                     return false
                 }
                 if (!isFinal && now - lastPartialWakeMatchMs < 1500L) {
                     return false
                 }
                 lastPartialWakeMatchMs = now
+                com.example.voice.AudioCommandSanitizer.playWakeWordHaptic(
+                    getApplication(),
+                    wakeMatch.matchedWakeWord
+                )
                 stopSpeechRecognizerInternal()
-                if (!wakeMatch.followUpQuery.isNullOrBlank()) {
-                    _lastDispatchedVoicePrompt.value = wakeMatch.followUpQuery
+                _currentDraftText.value = ""
+                if (strippedFollowUp != null) {
+                    _lastDispatchedVoicePrompt.value = strippedFollowUp
+                    _pendingWakeQuery.value = strippedFollowUp
+                    val validatedPending = sanitizeValidWakeQuery(_pendingWakeQuery.value)
+                    _pendingWakeQuery.value = null
+                    if (validatedPending != null) {
+                        lastDirectVoiceDispatchPrompt = validatedPending
+                        lastDirectVoiceDispatchAtMs = System.currentTimeMillis()
+                        if (!executeInChatVoiceActionCommand(validatedPending, wakeMatch.matchedChat?.id ?: _currentChatId.value)) {
+                            sendMessage(text = validatedPending, triggeredByWakeWord = true)
+                        }
+                    }
+                } else {
+                    _pendingWakeQuery.value = null
                 }
                 wakeWordManager.onKeywordHit(
                     keyword = wakeMatch.matchedWakeWord,
-                    initialQuery = wakeMatch.followUpQuery,
+                    initialQuery = strippedFollowUp,
                     targetChatIdOverride = wakeMatch.matchedChat?.id
                 )
+                _currentDraftText.value = ""
                 return true
             }
         }
 
-        // Update live partial/final transcript and auto-dispatch on final SpeechRecognizer results
-        val activeWakeWords = (
-            allChats.value.mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
-                wakeWordManager.getActiveChats().mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
-                allWakeWords.value.filter { it.isEnabled }.map { it.phrase }
-            ).distinct()
-        val scrubbed = com.example.voice.AudioCommandSanitizer.stripWakeWordTrigger(
-            rawText = primaryTranscript,
-            customWakeWords = activeWakeWords
-        )
-        if (scrubbed.isNotBlank() &&
-            !com.example.voice.AudioCommandSanitizer.isSystemOrCommandStatusString(
-                text = scrubbed,
-                dictateTrigger = _dictateTrigger.value,
-                sendTrigger = _sendTrigger.value,
-                heartbeatTrigger = _heartbeatTrigger.value
+        // 5. Follow-up Voice Turn (only when an explicit wake-word turn is already active):
+        // Do NOT pipe ambient transcripts into _currentDraftText; keep _currentDraftText blank and directly invoke sendMessage.
+        if (isUserVoiceTurn.value) {
+            val activeWakeWords = (
+                allChats.value.mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
+                    wakeWordManager.getActiveChats().mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
+                    allWakeWords.value.filter { it.isEnabled }.map { it.phrase }
+                ).distinct()
+            val (_, scrubbed) = com.example.voice.SpeechRecognitionCoordinator.extractWakeTriggeredTranscript(
+                rawTranscript = primaryTranscript,
+                customWakeWords = activeWakeWords
             )
-        ) {
-            wakeWordManager.updateLastHeardText(scrubbed)
-            _currentDraftText.value = scrubbed
-            if (isFinal) {
-                _lastDispatchedVoicePrompt.value = scrubbed
-                webLinkHistoryManager.recordVoiceCommand(
-                    commandType = VoiceCommandType.VOICE_TURN,
-                    triggerPhrase = currentChat.value?.wakeWord?.ifBlank { "Voice Input" } ?: "Voice Input",
-                    recognizedTranscript = scrubbed,
-                    chatTitle = currentChat.value?.title
+            val cleanPrompt = sanitizeValidWakeQuery(scrubbed)
+            if (cleanPrompt != null &&
+                !com.example.voice.AudioCommandSanitizer.isSystemOrCommandStatusString(
+                    text = cleanPrompt,
+                    dictateTrigger = _dictateTrigger.value,
+                    sendTrigger = _sendTrigger.value,
+                    heartbeatTrigger = _heartbeatTrigger.value
                 )
-                sendMessage(scrubbed, triggeredByWakeWord = true)
-                if (_isHandsFreeActive.value && !isTextInputFocused.value) {
-                    scheduleSpeechRecognizerRestart(delayMs = 180L, allowDuringUserVoiceTurn = true)
+            ) {
+                wakeWordManager.updateLastHeardText(cleanPrompt)
+                if (isFinal) {
+                    wakeWordManager.setUserVoiceTurn(false)
+                    _currentDraftText.value = ""
+                    _lastDispatchedVoicePrompt.value = cleanPrompt
+                    webLinkHistoryManager.recordVoiceCommand(
+                        commandType = VoiceCommandType.VOICE_TURN,
+                        triggerPhrase = currentChat.value?.wakeWord?.ifBlank { "Voice Input" } ?: "Voice Input",
+                        recognizedTranscript = cleanPrompt,
+                        chatTitle = currentChat.value?.title
+                    )
+                    if (!executeInChatVoiceActionCommand(cleanPrompt, _currentChatId.value)) {
+                        sendMessage(text = cleanPrompt, triggeredByWakeWord = true)
+                    }
+                    if (_isHandsFreeActive.value && !_isSleepMode.value) {
+                        scheduleSpeechRecognizerRestart(
+                            delayMs = com.example.voice.SpeechRecognitionCoordinator.DEFAULT_RESTART_DEBOUNCE_MS,
+                            allowDuringUserVoiceTurn = true
+                        )
+                    }
+                    return true
                 }
-                return true
             }
         }
         return false
     }
 
     private fun scheduleSpeechRecognizerRestart(
-        delayMs: Long = 180L,
+        delayMs: Long = com.example.voice.SpeechRecognitionCoordinator.DEFAULT_RESTART_DEBOUNCE_MS,
         allowDuringUserVoiceTurn: Boolean = false
     ) {
-        speechRecognizerRestartJob?.cancel()
-        speechRecognizerRestartJob = viewModelScope.launch(Dispatchers.Main.immediate) {
-            delay(delayMs.coerceAtLeast(50L))
-            if ((_isHandsFreeActive.value || allowDuringUserVoiceTurn) &&
-                !isTextInputFocused.value &&
-                (allowDuringUserVoiceTurn || !isUserVoiceTurn.value) &&
-                checkRecordAudioPermission()
-            ) {
-                startSpeechRecognizerInternal()
-            }
+        if (_isSleepMode.value || (!allowDuringUserVoiceTurn && isUserVoiceTurn.value && !_isInChatDictationActive.value)) {
+            return
         }
+        speechRecognitionCoordinator.scheduleDebouncedRestart(
+            delayMs = delayMs.coerceAtLeast(com.example.voice.SpeechRecognitionCoordinator.MIN_RESTART_DEBOUNCE_MS)
+        )
     }
 
     /**
@@ -788,75 +1608,49 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         wakeWordManager.stopAndReleaseAudioRecordSynchronously()
     }
 
-    private fun startSpeechRecognizerInternal(): Boolean {
-        val context = getApplication<Application>()
-        if (!android.speech.SpeechRecognizer.isRecognitionAvailable(context) || !checkRecordAudioPermission()) {
-            return false
-        }
-        return try {
-            wakeWordManager.isExternalSpeechRecognizerActive = true
-            releaseAllNativeAudioRecordTracksForSpeechRecognizer()
-            if (speechRecognizer == null) {
-                speechRecognizer = android.speech.SpeechRecognizer.createSpeechRecognizer(context).apply {
-                    setRecognitionListener(wakeRecognitionListener)
-                }
-            }
-            val intent = createWakeRecognizerIntent()
-            speechRecognizer?.startListening(intent)
-            _isSpeechRecognizerListening.value = true
-            wakeWordManager.updateExternalListeningState(
-                listening = true,
-                status = "Listening for wake word (SpeechRecognizer)..."
-            )
-            true
-        } catch (e: Exception) {
-            android.util.Log.w("MainViewModel", "SpeechRecognizer failed to start, using PCM fallback: ${e.message}")
-            wakeWordManager.isExternalSpeechRecognizerActive = false
-            _isSpeechRecognizerListening.value = false
-            false
-        }
+    private fun startSpeechRecognizerInternal(userInitiated: Boolean = false): Boolean {
+        return speechRecognitionCoordinator.startListening(userInitiated = userInitiated)
     }
 
-    private fun stopSpeechRecognizerInternal() {
-        speechRecognizerRestartJob?.cancel()
-        speechRecognizerRestartJob = null
+    private fun stopSpeechRecognizerInternal(markIntentionallyPaused: Boolean = false) {
         wakeWordManager.isExternalSpeechRecognizerActive = false
-        _isSpeechRecognizerListening.value = false
-        try {
-            speechRecognizer?.stopListening()
-            speechRecognizer?.cancel()
-        } catch (_: Exception) {}
+        speechRecognitionCoordinator.stopListening(markIntentionallyPaused = markIntentionallyPaused)
     }
 
     private fun destroySpeechRecognizerInternal() {
-        stopSpeechRecognizerInternal()
-        try {
-            speechRecognizer?.destroy()
-        } catch (_: Exception) {}
-        speechRecognizer = null
+        wakeWordManager.isExternalSpeechRecognizerActive = false
+        speechRecognitionCoordinator.destroy()
     }
 
     /**
      * Starts continuous wake-word listening via the ViewModel's Hybrid SpeechRecognizer + PCM engine,
      * verifying Manifest.permission.RECORD_AUDIO first.
      */
-    fun startContinuousWakeWordListening() {
+    fun startContinuousWakeWordListening(userInitiated: Boolean = false) {
         if (!ensureMicrophonePermission(startWakeListeningWhenGranted = true)) {
             return
         }
-        if (isTextInputFocused.value || isUserVoiceTurn.value) {
+        if ((isUserVoiceTurn.value && !_isInChatDictationActive.value) || _isSleepMode.value) {
             return
         }
+        speechRecognitionCoordinator.setIntentionallyPaused(false)
         viewModelScope.launch(Dispatchers.Main.immediate) {
             val context = getApplication<Application>()
             if (android.speech.SpeechRecognizer.isRecognitionAvailable(context) &&
                 !wakeWordManager.isListening.value
             ) {
-                val started = startSpeechRecognizerInternal()
-                if (!started) {
-                    wakeWordManager.startContinuousListening(forceActiveTurn = false)
+                if (!speechRecognitionCoordinator.isListening.value &&
+                    !speechRecognitionCoordinator.hasPendingRestart
+                ) {
+                    val started = startSpeechRecognizerInternal(userInitiated = userInitiated)
+                    if (!started &&
+                        !speechRecognitionCoordinator.hasPendingRestart &&
+                        !speechRecognitionCoordinator.shouldAbortListening()
+                    ) {
+                        wakeWordManager.startContinuousListening(forceActiveTurn = false)
+                    }
                 }
-            } else {
+            } else if (!speechRecognitionCoordinator.isListening.value) {
                 wakeWordManager.startContinuousListening(forceActiveTurn = false)
             }
         }
@@ -865,20 +1659,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /**
      * Stops continuous wake-word listening across both SpeechRecognizer and WakeWordManager.
      */
-    fun stopContinuousWakeWordListening() {
-        stopSpeechRecognizerInternal()
+    fun stopContinuousWakeWordListening(markIntentionallyPaused: Boolean = true) {
+        _isInChatDictationActive.value = false
+        speechRecognitionCoordinator.setInChatDictationMode(false)
+        stopSpeechRecognizerInternal(markIntentionallyPaused = markIntentionallyPaused)
         wakeWordManager.stopContinuousListening()
     }
 
     /**
-     * Toggles continuous wake-word listening on or off, requesting RECORD_AUDIO permission if needed.
+     * Toggles continuous wake-word listening and hands-free mode together via [toggleHandsFreeVoice].
      */
     fun toggleContinuousWakeWordListening() {
-        if (wakeWordManager.isListening.value || _isSpeechRecognizerListening.value) {
-            stopContinuousWakeWordListening()
-        } else {
-            startContinuousWakeWordListening()
-        }
+        toggleHandsFreeVoice()
     }
 
     private val _currentDraftText = MutableStateFlow("")
@@ -927,6 +1719,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun enterSleepMode(reason: String = "Say \"Gemini, wake up\" or tap Wake Up to resume") {
         _isSleepMode.value = true
         _sleepModeReason.value = reason
+        com.example.voice.AudioCommandSanitizer.playRadarToggleHaptic(
+            context = getApplication(),
+            isActivating = false,
+            reason = "Entered Sleep Mode ($reason)"
+        )
+        audioRecorder.setIntentionallyPaused(true)
+        speechRecognitionCoordinator.setSleeping(true)
+        wakeWordManager.isExternalSpeechRecognizerActive = false
         wakeWordManager.enterSleepMode(reason)
         com.example.voice.WakeWordVoiceService.setSleepMode(true)
         com.example.voice.WakeWordVoiceService.startServiceSafely(
@@ -935,9 +1735,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
         wakeWordManager.stopContinuousListening()
         wakeWordManager.setStatusMessage("Sleep Mode active — tap Wake Up or say \"Gemini, wake up\"")
-        if (_isHandsFreeActive.value && !isTextInputFocused.value) {
-            scheduleSpeechRecognizerRestart(delayMs = 300L, allowDuringUserVoiceTurn = true)
-        }
     }
 
     /**
@@ -946,6 +1743,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun exitSleepModeAndResumeListening(reason: String = "Listening resumed") {
         _isSleepMode.value = false
         _sleepModeReason.value = ""
+        com.example.voice.AudioCommandSanitizer.playRadarToggleHaptic(
+            context = getApplication(),
+            isActivating = true,
+            reason = "Exited Sleep Mode ($reason)"
+        )
+        audioRecorder.setIntentionallyPaused(false)
+        speechRecognitionCoordinator.setSleeping(false)
         wakeWordManager.exitSleepMode(reason)
         com.example.voice.WakeWordVoiceService.setSleepMode(false)
         com.example.voice.WakeWordVoiceService.startServiceSafely(
@@ -981,6 +1785,45 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     val relayServerState: StateFlow<com.example.bridge.RelayServerState> = localSyncServer.serverState
+
+    // AppSettingsManager state (Favorites, Pinned Chats, Contextual Routing, Categories/Tags, System Hygiene, 30-Day Backup Reminder)
+    val favoriteChatIds: StateFlow<Set<Long>> = com.example.util.AppSettingsManager.favoriteChatIds
+    val pinnedChatIds: StateFlow<Set<Long>> = com.example.util.AppSettingsManager.pinnedChatIds
+    val pinnedTimestampsMap: StateFlow<Map<Long, Long>> = com.example.util.AppSettingsManager.pinnedTimestampsMap
+    val contextualRoutingEnabled: StateFlow<Boolean> = com.example.util.AppSettingsManager.contextualRoutingEnabled
+    val promptFavoritesOnWake: StateFlow<Boolean> = com.example.util.AppSettingsManager.promptFavoritesOnWake
+    val lastHygieneResetMessage: StateFlow<String?> = com.example.util.AppSettingsManager.lastHygieneResetMessage
+    val chatCategoryMap: StateFlow<Map<Long, String>> = com.example.util.AppSettingsManager.chatCategoryMap
+    val messageCategoryMap: StateFlow<Map<Long, String>> = com.example.util.AppSettingsManager.messageCategoryMap
+    val chatTagsMap: StateFlow<Map<Long, Set<String>>> = com.example.util.AppSettingsManager.chatTagsMap
+    val availableCategories: StateFlow<List<String>> = com.example.util.AppSettingsManager.availableCategories
+
+    private val _pendingNewChatCategory = MutableStateFlow<String?>(null)
+    val pendingNewChatCategory: StateFlow<String?> = _pendingNewChatCategory.asStateFlow()
+
+    private val _pendingNewChatTags = MutableStateFlow<Set<String>>(emptySet())
+    val pendingNewChatTags: StateFlow<Set<String>> = _pendingNewChatTags.asStateFlow()
+
+    fun setPendingNewChatCategory(category: String?, tags: Set<String> = emptySet()) {
+        val cleaned = category?.trim()?.takeIf { it.isNotBlank() }
+        _pendingNewChatCategory.value = cleaned
+        _pendingNewChatTags.value = tags
+        if (!cleaned.isNullOrBlank()) {
+            com.example.util.AppSettingsManager.addCustomCategory(getApplication(), cleaned)
+        }
+    }
+
+    private val _matchedWakeCategory = MutableStateFlow<String?>(null)
+    val matchedWakeCategory: StateFlow<String?> = _matchedWakeCategory.asStateFlow()
+
+    private val _wakeConversationSummary = MutableStateFlow<com.example.voice.WakeConversationSummary?>(null)
+    val wakeConversationSummary: StateFlow<com.example.voice.WakeConversationSummary?> = _wakeConversationSummary.asStateFlow()
+
+    private val _showWakeFavoritesPickerDialog = MutableStateFlow(false)
+    val showWakeFavoritesPickerDialog: StateFlow<Boolean> = _showWakeFavoritesPickerDialog.asStateFlow()
+
+    private val _lastDetectedWakePhrase = MutableStateFlow("Hey Gemini")
+    val lastDetectedWakePhrase: StateFlow<String> = _lastDetectedWakePhrase.asStateFlow()
 
     val audioRecorder = AudioRecorder(application.applicationContext)
     val snippetPlayer = SnippetAudioPlayer()
@@ -1079,11 +1922,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Purges or repairs any corrupted JSON entries in web/voice history and chat disk caches.
+     * Purges or repairs any corrupted JSON entries in web/voice history, chat disk caches,
+     * and legacy audio placeholder rows in Room.
      */
     fun clearCorruptedHistory(): Int {
         val repairedWebAndVoice = webLinkHistoryManager.repairOrClearCorruptedHistory()
         val repairedDiskCaches = bufferManager.repairOrClearCorruptedDiskCaches()
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.pruneLegacyAudioPlaceholders()
+        }
         return repairedWebAndVoice + repairedDiskCaches
     }
 
@@ -1257,10 +2104,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val lastAudioPacketTimestampMs: StateFlow<Long> = _lastAudioPacketTimestampMs.asStateFlow()
 
     init {
+        com.example.util.AppSettingsManager.ensureInitialized(application)
+        com.example.heartbeat.BackupReminderWorker.schedulePeriodicBackupReminder(application)
         snippetPlayer.setVolume(_masterVolume.value)
         streamingVoicePlayer.setVolume(_masterVolume.value)
         wakeWordManager.wakeWordSensitivity = _wakeWordSensitivity.value
         screenshotWatcher.startWatching()
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.pruneLegacyAudioPlaceholders()
+        }
         // Sync active chats with wake word manager, seed Room wake-word records, and populate base tracked seconds
         viewModelScope.launch {
             wakeWordRepository.ensureSeededFromChatsAndDefaults(
@@ -1372,23 +2224,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         // Synchronously reset stale draft, hung recognizers, and active voice state whenever a wake word hits
-        // (even if the user is ALREADY in ChatDetailScreen or holding an unsent draft)
+        // (even if the user is ALREADY in ChatDetailScreen or holding an unsent draft).
+        // Do NOT assign recognized speech to _currentDraftText—keep the draft state and bottom input field blank.
         wakeWordManager.onWakeForceReset = { chatId, chatTitle, keyword, sanitizedQuery ->
+            _isInChatDictationActive.value = false
+            speechRecognitionCoordinator.setInChatDictationMode(false)
             stopSpeechRecognizerInternal()
             streamingVoicePlayer.stop()
-            _currentDraftText.value = sanitizedQuery ?: ""
+            _currentDraftText.value = ""
             _wakeRetriggerEventId.update { it + 1L }
+            val validWakeQuery = sanitizeValidWakeQuery(sanitizedQuery)
             _triggerBanner.value = TriggerBanner(
                 chatTitle = chatTitle,
                 matchedWord = keyword,
-                query = sanitizedQuery
+                query = validWakeQuery
             )
             if (chatId > 0L && _currentChatId.value != chatId) {
                 selectChat(chatId)
             }
-            if (!sanitizedQuery.isNullOrBlank()) {
-                _lastDispatchedVoicePrompt.value = sanitizedQuery
-            } else if (!isTextInputFocused.value) {
+            if (validWakeQuery != null) {
+                _lastDispatchedVoicePrompt.value = validWakeQuery
+                _pendingWakeQuery.value = validWakeQuery
+            } else {
+                _pendingWakeQuery.value = null
                 val context = getApplication<Application>()
                 if (android.speech.SpeechRecognizer.isRecognitionAvailable(context) && checkRecordAudioPermission()) {
                     wakeWordManager.isExternalSpeechRecognizerActive = true
@@ -1410,23 +2268,69 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                 }
-                val resolvedChatId = resolveOrEnsureTargetChatId(event.chatId)
+                val routingDecision = com.example.voice.WakeWordRoutingEngine.resolveTargetChatForWakeWord(
+                    spokenWakePhrase = event.matchedWord,
+                    chats = allChats.value,
+                    configuredWakeWords = allWakeWords.value,
+                    favoriteChatIds = favoriteChatIds.value,
+                    contextualRoutingEnabled = contextualRoutingEnabled.value,
+                    promptFavoritesOnGeneralWake = promptFavoritesOnWake.value,
+                    chatCategoryMap = chatCategoryMap.value,
+                    chatTagsMap = chatTagsMap.value,
+                    spokenContextOrTranscript = event.initialQuery.orEmpty()
+                )
+                _matchedWakeCategory.value = routingDecision?.matchedCategory
+                val resolvedChatId = resolveOrEnsureTargetChatId(
+                    routingDecision?.targetChat?.id ?: event.chatId
+                )
+                val resolvedChatSession = repository.getChatByIdSync(resolvedChatId)
+                    ?: routingDecision?.targetChat
+                val resolvedChatTitle = resolvedChatSession?.title ?: event.chatTitle
+                val routingReasonText = routingDecision?.routingReason
+                    ?: "Opened via wake word \"${event.matchedWord}\""
+                val routingSourceType = routingDecision?.routingSource
+                    ?: com.example.voice.WakeRoutingSource.SPECIFIC_WAKE_WORD
+                _lastDetectedWakePhrase.value = event.matchedWord
+
+                if (routingDecision?.shouldPromptFavoritesSheet == true &&
+                    event.initialQuery.isNullOrBlank() &&
+                    isAppInForeground
+                ) {
+                    _showWakeFavoritesPickerDialog.value = true
+                }
+
+                // Build instant local conversation recap when opened via wake word
+                val recentMsgs = withContext(Dispatchers.IO) {
+                    messageRepository.getMessagesForChatSync(resolvedChatId)
+                }
+                if (resolvedChatSession != null) {
+                    _wakeConversationSummary.value = com.example.voice.WakeWordRoutingEngine.buildInstantWakeConversationSummary(
+                        chat = resolvedChatSession,
+                        messages = recentMsgs,
+                        matchedWakeWord = event.matchedWord,
+                        routingSource = routingSourceType,
+                        routingReason = routingReasonText
+                    )
+                }
+
                 val inBackground = !isAppInForeground
                 _wakeReadyVisualCue.value = WakeReadyCueState(
                     wakePhrase = event.matchedWord,
                     chatId = resolvedChatId,
-                    chatTitle = event.chatTitle,
+                    chatTitle = resolvedChatTitle,
                     followUpQuery = event.initialQuery,
                     detectedInBackground = inBackground
                 )
-                if (inBackground || _backgroundCueOnlyMode.value) {
+                // Only post an external PendingIntent notification when the app is genuinely in the background
+                // so foreground voice navigation never triggers external activity intents.
+                if (inBackground) {
                     val matchedWake = allWakeWords.value.firstOrNull {
                         it.phrase.equals(event.matchedWord, ignoreCase = true)
                     } ?: WakeWord(
                         phrase = event.matchedWord,
                         triggerType = TriggerType.CHAT,
                         chatId = resolvedChatId,
-                        chatTitle = event.chatTitle,
+                        chatTitle = resolvedChatTitle,
                         sensitivity = _wakeWordSensitivity.value
                     )
                     com.example.voice.WakeWordVoiceService.postWakeWordReadyCueNotification(
@@ -1439,46 +2343,58 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     )
                 }
-                _triggerBanner.value = TriggerBanner(
-                    chatTitle = event.chatTitle,
-                    matchedWord = event.matchedWord,
-                    query = event.initialQuery
+                val customWords = listOfNotNull(event.matchedWord.takeIf { it.isNotBlank() })
+                val strippedCandidate = com.example.voice.AudioCommandSanitizer.stripWakeWordTrigger(
+                    rawText = event.initialQuery ?: "",
+                    customWakeWords = customWords
                 )
-                val transcriptText = event.initialQuery?.takeIf { it.isNotBlank() }
-                    ?: "Wake phrase \"${event.matchedWord}\" recognized"
+                val sanitizedQuery = sanitizeValidWakeQuery(strippedCandidate)
+                _triggerBanner.value = TriggerBanner(
+                    chatTitle = resolvedChatTitle,
+                    matchedWord = event.matchedWord,
+                    query = sanitizedQuery
+                )
+                val transcriptText = sanitizedQuery
+                    ?: "Wake phrase \"${event.matchedWord}\" recognized ($routingReasonText)"
                 webLinkHistoryManager.recordVoiceCommand(
                     commandType = VoiceCommandType.WAKE_WORD,
                     triggerPhrase = event.matchedWord,
                     recognizedTranscript = transcriptText,
-                    chatTitle = event.chatTitle
+                    chatTitle = resolvedChatTitle
                 )
                 // Pre-warm memory buffer immediately and select the corresponding chat
                 selectChat(resolvedChatId)
 
-                // If user continued speaking a full text query after the wake word, submit it directly!
-                val customWords = listOfNotNull(event.matchedWord.takeIf { it.isNotBlank() })
-                val sanitizedQuery = com.example.voice.AudioCommandSanitizer.stripWakeWordTrigger(
-                    rawText = event.initialQuery ?: "",
-                    customWakeWords = customWords
-                )
-                if (sanitizedQuery.isNotBlank()) {
-                    val handoffAudio = synchronized(voicePcmOutputStream) {
-                        val bytes = voicePcmOutputStream.toByteArray()
-                        voicePcmOutputStream.reset()
-                        bytes
-                    }.takeIf { WakeWordManager.shouldTransmitAudioPacket(it.size, it) }
-                    sendMessage(
-                        chatId = resolvedChatId,
-                        text = sanitizedQuery,
-                        audioBytes = handoffAudio,
-                        triggeredByWakeWord = true
-                    )
-                } else {
-                    val targetChat = repository.getChatByIdSync(resolvedChatId)
-                    val customGreeting = targetChat?.greetingMessage?.trim().orEmpty()
+                // Check pendingWakeQuery / sanitizedQuery before dispatching to the chat session:
+                // If empty, blank, or < 2 characters, discard completely instead of sending to Gemini.
+                val alreadyDispatchedDirectly = sanitizedQuery != null &&
+                    sanitizedQuery.equals(lastDirectVoiceDispatchPrompt, ignoreCase = true) &&
+                    (System.currentTimeMillis() - lastDirectVoiceDispatchAtMs) < 2500L
+                if (sanitizedQuery != null && !_isGenerating.value && !alreadyDispatchedDirectly) {
+                    _pendingWakeQuery.value = sanitizedQuery
+                    val verifiedPending = sanitizeValidWakeQuery(_pendingWakeQuery.value)
+                    _pendingWakeQuery.value = null
+                    if (verifiedPending != null) {
+                        val handoffAudio = synchronized(voicePcmOutputStream) {
+                            val bytes = voicePcmOutputStream.toByteArray()
+                            voicePcmOutputStream.reset()
+                            bytes
+                        }.takeIf { WakeWordManager.shouldTransmitAudioPacket(it.size, it) }
+                        sendMessage(
+                            chatId = resolvedChatId,
+                            text = verifiedPending,
+                            audioBytes = handoffAudio,
+                            triggeredByWakeWord = true
+                        )
+                    }
+                } else if (sanitizedQuery == null) {
+                    _pendingWakeQuery.value = null
+                    val customGreeting = resolvedChatSession?.greetingMessage?.trim().orEmpty()
                     if (customGreeting.isNotBlank() && _isAutoSpeakEnabled.value) {
                         speakMessage(customGreeting)
                     }
+                } else {
+                    _pendingWakeQuery.value = null
                 }
             }
         }
@@ -1505,6 +2421,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 wakeWordManager.enterSleepMode(_sleepModeReason.value)
             }
         }
+
+        com.example.voice.WakeWordVoiceService.onVoiceHistoryNavigationRequestedCallback = { transcript ->
+            dispatchVoiceNavigationCommand(route = "history", rawTranscript = transcript)
+        }
+
+        com.example.voice.WakeWordVoiceService.onBatterySaverResumeRequestedCallback = {
+            if (_isHandsFreeActive.value && !_isSleepMode.value) {
+                audioRecorder.setIntentionallyPaused(false)
+                speechRecognitionCoordinator.setIntentionallyPaused(false)
+                wakeWordManager.setStatusMessage("Resumed from Battery Saver pause")
+                startContinuousWakeWordListening()
+            }
+        }
+
+        com.example.voice.BatterySaverMonitorWorker.registerVoiceComponents(
+            coordinator = speechRecognitionCoordinator,
+            audioRecorder = audioRecorder,
+            activeUseChecker = {
+                isUserVoiceTurn.value ||
+                    _isGenerating.value ||
+                    isOrionVoicePlaying.value ||
+                    isChatTurnRecording.value ||
+                    _activeRecordingSlot.value != null
+            },
+            onStateChanged = { pausedByBatterySaver ->
+                if (pausedByBatterySaver) {
+                    wakeWordManager.isExternalSpeechRecognizerActive = false
+                    wakeWordManager.stopContinuousListening()
+                    wakeWordManager.setStatusMessage("Battery Saver active — microphone paused to extend battery life")
+                } else if (_isHandsFreeActive.value && !_isSleepMode.value) {
+                    wakeWordManager.setStatusMessage("Battery Saver off — resuming wake-word listening")
+                    startContinuousWakeWordListening()
+                }
+            }
+        )
+        com.example.voice.BatterySaverMonitorWorker.schedulePeriodicWork(application)
 
         // Wire AudioRecord PCM stream (16000Hz, MONO, PCM_16BIT, VOICE_RECOGNITION with MIC fallback)
         // and Auto-Silence Cutoff into Gemini Native Audio pipeline
@@ -1557,7 +2509,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         wakeWordManager.setHandsFreeMode(_isHandsFreeActive.value)
 
         wakeWordManager.onHandsFreePartialText = { partialText ->
-            if (!com.example.voice.AudioCommandSanitizer.isSystemOrCommandStatusString(
+            if (_isInChatDictationActive.value &&
+                _currentChatId.value != null &&
+                !com.example.voice.AudioCommandSanitizer.isSystemOrCommandStatusString(
                     text = partialText,
                     dictateTrigger = _dictateTrigger.value,
                     sendTrigger = _sendTrigger.value,
@@ -1615,8 +2569,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             com.example.heartbeat.HeartbeatAlarmReceiver.scheduleHeartbeatPing(getApplication(), 0L)
         }
 
-        // Barge-In Interruption: user speaking wake or dictate words immediately halts Orion audio
+        // Barge-In Interruption: user speaking wake or dictate words immediately halts TTS and Orion audio
         wakeWordManager.onBargeInDetected = {
+            if (textToSpeechManager.isSpeaking.value) {
+                textToSpeechManager.bargeInAndStop()
+            }
             if (streamingVoicePlayer.isPlaying.value) {
                 streamingVoicePlayer.stop()
             }
@@ -1663,6 +2620,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val prevChatId = _currentChatId.value
         val isSwitching = prevChatId != chatId
 
+        // Immediately clear _pendingWakeQuery and unsolicited summary overlays when entering/selecting a chat
+        _pendingWakeQuery.value = null
+        _wakeConversationSummary.value = null
+
         if (isSwitching) {
             // Cancel active generation & streaming text immediately so old session state doesn't bleed
             activeGenerationJob?.cancel()
@@ -1674,6 +2635,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
             // Detach and purge in-memory buffers for previous chat
             bufferManager.detachChat()
+            _isInChatDictationActive.value = false
+            speechRecognitionCoordinator.setInChatDictationMode(false)
             _currentDraftText.value = ""
 
             // Lifecycle Hook: Force reset and clear ChromeBridgeSocketManager on session switch or close
@@ -1734,6 +2697,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setBufferSizeLimit(limit: Int) {
         bufferManager.setBufferSizeLimit(limit)
+    }
+
+    /**
+     * Clears the active in-memory hot window (`ChatMemoryBufferManager.clear()`) without deleting Room database records.
+     */
+    fun clearActiveInMemoryBuffer() {
+        bufferManager.clear()
+    }
+
+    /**
+     * Alias for clearing the active in-memory RAM window (`ChatMemoryBufferManager.clear()`).
+     */
+    fun clearActiveRamWindow() {
+        bufferManager.clear()
+    }
+
+    /**
+     * Purges staged ephemeral disk cache files and resets system hygiene (`forceResetAndClear()`).
+     */
+    fun forceResetAndClear(): com.example.util.HygieneResetResult {
+        bufferManager.forceResetAndClear()
+        return forceResetAndClearSystemHygiene()
     }
 
     fun purgeDiskCache() {
@@ -1807,12 +2792,68 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _stagedAttachment = MutableStateFlow<AttachmentPayload?>(null)
     val stagedAttachment: StateFlow<AttachmentPayload?> = _stagedAttachment.asStateFlow()
 
+    // Dedicated attachedImageUri StateFlow for picked or clipboard-pasted images in the chat composer
+    private val _attachedImageUri = MutableStateFlow<Uri?>(null)
+    val attachedImageUri: StateFlow<Uri?> = _attachedImageUri.asStateFlow()
+
+    fun stageAttachedImageUri(uri: Uri?, context: android.content.Context = getApplication()) {
+        if (uri == null) {
+            clearAttachedImage()
+            return
+        }
+        _attachedImageUri.value = uri
+        stageFile(uri, context)
+    }
+
+    fun clearAttachedImage() {
+        _attachedImageUri.value = null
+        if (_stagedAttachment.value?.mimeType?.startsWith("image/") == true) {
+            _stagedAttachment.value = null
+        }
+    }
+
+    // Inspects Android's ClipboardManager.primaryClip for an image MIME type (image/png, image/jpeg).
+    // If found, grabs the URI, stages it in attachedImageUri, and populates stagedAttachment.
+    fun checkAndStageClipboardImage(context: android.content.Context = getApplication()): Boolean {
+        return try {
+            val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                ?: return false
+            val clip = clipboard.primaryClip ?: return false
+            if (clip.itemCount <= 0) return false
+            val desc = clip.description
+            val hasImageMime = (0 until desc.mimeTypeCount).any { idx ->
+                val mime = desc.getMimeType(idx).lowercase(java.util.Locale.US)
+                mime == "image/png" || mime == "image/jpeg" || mime == "image/jpg" || mime.startsWith("image/")
+            }
+            for (i in 0 until clip.itemCount) {
+                val itemUri = clip.getItemAt(i)?.uri ?: continue
+                val resolvedMime = context.contentResolver.getType(itemUri)?.lowercase(java.util.Locale.US).orEmpty()
+                if (hasImageMime || resolvedMime == "image/png" || resolvedMime == "image/jpeg" || resolvedMime.startsWith("image/")) {
+                    if (_attachedImageUri.value != itemUri) {
+                        stageAttachedImageUri(itemUri, context)
+                    }
+                    return true
+                }
+            }
+            false
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     fun stageFile(uri: Uri, context: android.content.Context) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val contentResolver = context.contentResolver
                 var fileName = "attachment"
-                var mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
+                val rawMimeType = contentResolver.getType(uri)
+                val mimeType = when {
+                    !rawMimeType.isNullOrBlank() -> rawMimeType
+                    uri.toString().endsWith(".png", ignoreCase = true) -> "image/png"
+                    uri.toString().endsWith(".jpg", ignoreCase = true) ||
+                        uri.toString().endsWith(".jpeg", ignoreCase = true) -> "image/jpeg"
+                    else -> "image/jpeg"
+                }
                 contentResolver.query(uri, null, null, null, null)?.use { cursor ->
                     if (cursor.moveToFirst()) {
                         val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
@@ -1824,6 +2865,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: byteArrayOf()
                 val sizeBytes = bytes.size.toLong()
+                if (mimeType.startsWith("image/")) {
+                    _attachedImageUri.value = uri
+                    if (fileName == "attachment") {
+                        fileName = "attached_image.jpg"
+                    }
+                }
                 _stagedAttachment.value = AttachmentPayload(uri, fileName, mimeType, bytes, sizeBytes)
             } catch (e: Exception) {
                 android.util.Log.e("MainViewModel", "Failed to stage file: ${e.message}", e)
@@ -1833,10 +2880,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun stageAttachment(payload: AttachmentPayload) {
         _stagedAttachment.value = payload
+        if (payload.mimeType.startsWith("image/")) {
+            _attachedImageUri.value = payload.uri
+        }
     }
 
     fun clearStagedAttachment() {
         _stagedAttachment.value = null
+        _attachedImageUri.value = null
     }
 
     fun clearTriggerBanner() {
@@ -1866,9 +2917,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun onTextInputFocusChanged(focused: Boolean) {
-        if (focused) {
-            stopSpeechRecognizerInternal()
-        }
         wakeWordManager.onTextInputFocusChanged(focused)
         if (!focused && _isHandsFreeActive.value && !isUserVoiceTurn.value && checkRecordAudioPermission()) {
             scheduleSpeechRecognizerRestart(delayMs = 200L)
@@ -1915,29 +2963,97 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Starts an active voice recording turn via hardware AudioRecord
-     * (VOICE_RECOGNITION with automatic fallback to MIC).
+     * Toggles in-chat voice dictation strictly via the internal [speechRecognitionCoordinator]
+     * (`stopListening()` when listening, `startListening()` when idle) with zero external intents,
+     * keeping the app 100% pinned to the foreground.
      */
-    fun startVoiceRecording() {
-        if (!ensureMicrophonePermission(startWakeListeningWhenGranted = false)) {
-            return
+    fun toggleInChatDictation(manualDraftText: String = ""): Boolean {
+        return if (_isInChatDictationActive.value || speechRecognitionCoordinator.isInChatDictationMode) {
+            val capturedSpeech = manualDraftText.trim()
+                .ifBlank { _currentDraftText.value.trim() }
+                .ifBlank { wakeWordManager.lastHeardText.value.trim() }
+            _isInChatDictationActive.value = false
+            speechRecognitionCoordinator.setInChatDictationMode(false)
+            wakeWordManager.setUserVoiceTurn(false)
+            speechRecognitionCoordinator.stopListening(markIntentionallyPaused = !_isHandsFreeActive.value)
+            _currentDraftText.value = ""
+            wakeWordManager.clearLastHeardText()
+            if (capturedSpeech.isNotBlank()) {
+                val activeWakeWords = (
+                    allChats.value.mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
+                        wakeWordManager.getActiveChats().mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
+                        allWakeWords.value.filter { it.isEnabled }.map { it.phrase }
+                    ).distinct()
+                val (_, scrubbed) = com.example.voice.SpeechRecognitionCoordinator.extractWakeTriggeredTranscript(
+                    rawTranscript = capturedSpeech,
+                    customWakeWords = activeWakeWords
+                )
+                val cleanPrompt = sanitizeValidWakeQuery(scrubbed.trim().ifBlank { capturedSpeech })
+                if (cleanPrompt != null) {
+                    _lastDispatchedVoicePrompt.value = cleanPrompt
+                    if (!executeInChatVoiceActionCommand(cleanPrompt, _currentChatId.value)) {
+                        sendMessage(text = cleanPrompt, triggeredByWakeWord = true)
+                    }
+                }
+            }
+            if (_isHandsFreeActive.value && !_isSleepMode.value) {
+                speechRecognitionCoordinator.scheduleDebouncedRestart(
+                    delayMs = com.example.voice.SpeechRecognitionCoordinator.DEFAULT_RESTART_DEBOUNCE_MS
+                )
+            }
+            false
+        } else {
+            if (!_hasWindowFocus.value || !speechRecognitionCoordinator.isWindowFocused || !checkRecordAudioPermission()) {
+                return false
+            }
+            if (textToSpeechManager.isSpeaking.value) {
+                textToSpeechManager.bargeInAndStop()
+            }
+            if (streamingVoicePlayer.isPlaying.value) {
+                streamingVoicePlayer.stop()
+            }
+            // Completely stop any existing background service listener and native AudioRecord handles
+            // before requesting interactive speech recognition to prevent Samsung audio focus contention.
+            com.example.voice.WakeWordVoiceService.pauseMicrophoneForCommandDispatch(getApplication())
+            try {
+                getApplication<Application>().stopService(
+                    android.content.Intent(getApplication(), com.example.voice.WakeWordVoiceService::class.java)
+                )
+            } catch (_: Exception) {}
+            wakeWordManager.stopContinuousListening()
+            releaseAllNativeAudioRecordTracksForSpeechRecognizer()
+            wakeWordManager.abandonExclusiveAudioFocus()
+            if (speechRecognitionCoordinator.isListening.value) {
+                speechRecognitionCoordinator.stopListening(markIntentionallyPaused = false)
+            }
+            _pendingWakeQuery.value = null
+            _currentDraftText.value = ""
+            wakeWordManager.clearLastHeardText()
+            _isInChatDictationActive.value = true
+            wakeWordManager.setUserVoiceTurn(true)
+            speechRecognitionCoordinator.setInChatDictationMode(true)
+            speechRecognitionCoordinator.startListening(userInitiated = true)
+            true
         }
-        destroySpeechRecognizerInternal()
-        streamingVoicePlayer.stop()
-        _currentDraftText.value = ""
-        wakeWordManager.clearLastHeardText()
-        synchronized(voicePcmOutputStream) {
-            voicePcmOutputStream.reset()
-        }
-        wakeWordManager.setUserVoiceTurn(true)
-        wakeWordManager.startContinuousListening(forceActiveTurn = true)
     }
 
     /**
-     * Cancels the active voice recording turn, releases the chat-turn AudioRecord,
+     * Starts or toggles an in-chat dictation turn via the in-process [speechRecognitionCoordinator].
+     */
+    fun startVoiceRecording() {
+        if (!_isInChatDictationActive.value) {
+            toggleInChatDictation()
+        }
+    }
+
+    /**
+     * Cancels the active voice recording / in-chat dictation turn, releases the chat-turn AudioRecord,
      * discards buffered PCM audio, and restarts passive wake listening if hands-free is active.
      */
     fun cancelVoiceRecording() {
+        _isInChatDictationActive.value = false
+        speechRecognitionCoordinator.setInChatDictationMode(false)
+        speechRecognitionCoordinator.stopListening(markIntentionallyPaused = !_isHandsFreeActive.value)
         wakeWordManager.setUserVoiceTurn(false)
         wakeWordManager.completeChatTurnAndReleaseMic()
         _currentDraftText.value = ""
@@ -1945,7 +3061,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         synchronized(voicePcmOutputStream) {
             voicePcmOutputStream.reset()
         }
-        if (_isHandsFreeActive.value) {
+        if (_isHandsFreeActive.value && !_isSleepMode.value) {
+            scheduleSpeechRecognizerRestart(
+                delayMs = com.example.voice.SpeechRecognitionCoordinator.DEFAULT_RESTART_DEBOUNCE_MS,
+                allowDuringUserVoiceTurn = true
+            )
             wakeWordManager.restartWakeListeningAfterTurn()
         }
     }
@@ -1956,6 +3076,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * Aborts the turn with a brief notice if the captured buffer is empty or silent and no text was entered.
      */
     fun finishVoiceRecordingAndSend(manualPromptText: String = "") {
+        _isInChatDictationActive.value = false
+        speechRecognitionCoordinator.setInChatDictationMode(false)
         stopSpeechRecognizerInternal()
         wakeWordManager.setUserVoiceTurn(false)
         wakeWordManager.completeChatTurnAndReleaseMic()
@@ -2151,7 +3273,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * Convenience overload that dispatches recognized speech or text directly to the active/default chat session.
      */
     fun sendMessage(
-        spokenText: String,
+        text: String,
         triggeredByWakeWord: Boolean = true
     ) {
         val targetChatId = _currentChatId.value
@@ -2162,7 +3284,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             ?: 0L
         sendMessage(
             chatId = targetChatId,
-            text = spokenText,
+            text = text,
             audioBytes = null,
             triggeredByWakeWord = triggeredByWakeWord
         )
@@ -2176,29 +3298,78 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         // Explicitly stop SpeechRecognizer and grab any buffered partial/final transcription if text is blank
         stopSpeechRecognizerInternal()
-        val activeWakeWords = (allChats.value + wakeWordManager.getActiveChats())
-            .mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } }
-            .distinct()
+        val activeWakeWords = (
+            allChats.value.mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
+                wakeWordManager.getActiveChats().mapNotNull { it.wakeWord.takeIf { w -> w.isNotBlank() } } +
+                allWakeWords.value.filter { it.isEnabled }.map { it.phrase }
+            ).distinct()
         val effectiveRawText = text.trim()
             .ifBlank { _currentDraftText.value.trim() }
             .ifBlank { wakeWordManager.lastHeardText.value.trim() }
-        val trimmed = if (triggeredByWakeWord || text.isBlank()) {
-            com.example.voice.AudioCommandSanitizer.stripWakeWordTrigger(
-                rawText = effectiveRawText,
+        val (detectedWakePrefix, strippedWakeText) =
+            com.example.voice.SpeechRecognitionCoordinator.extractWakeTriggeredTranscript(
+                rawTranscript = effectiveRawText,
                 customWakeWords = activeWakeWords
             )
+        val effectiveTriggeredByWakeWord = triggeredByWakeWord || detectedWakePrefix
+        val trimmed = if (effectiveTriggeredByWakeWord || text.isBlank()) {
+            strippedWakeText
         } else {
             effectiveRawText
         }
-        val attachment = _stagedAttachment.value
+        val currentAttachedUri = _attachedImageUri.value
+        val attachment = _stagedAttachment.value ?: if (currentAttachedUri != null) {
+            try {
+                val cr = getApplication<Application>().contentResolver
+                val mime = cr.getType(currentAttachedUri) ?: "image/jpeg"
+                val bytes = cr.openInputStream(currentAttachedUri)?.use { it.readBytes() } ?: byteArrayOf()
+                AttachmentPayload(
+                    uri = currentAttachedUri,
+                    fileName = "attached_image.jpg",
+                    mimeType = mime,
+                    bytes = bytes,
+                    sizeBytes = bytes.size.toLong()
+                )
+            } catch (_: Exception) {
+                null
+            }
+        } else null
         val validAudioBytes = audioBytes?.takeIf {
             WakeWordManager.shouldTransmitAudioPacket(it.size, it)
         }
         val hasAudio = validAudioBytes != null
-        if (trimmed.isBlank() && attachment == null && !hasAudio) return
+        if (trimmed.isBlank() && attachment == null && currentAttachedUri == null && !hasAudio) {
+            _pendingWakeQuery.value = null
+            _currentDraftText.value = ""
+            return
+        }
+        // Discard any voice-triggered payload shorter than 2 characters when no attachment or audio is present
+        if (effectiveTriggeredByWakeWord && trimmed.length < 2 && attachment == null && currentAttachedUri == null && !hasAudio) {
+            _pendingWakeQuery.value = null
+            _currentDraftText.value = ""
+            return
+        }
+        val immediateChatId = chatId.takeIf { it > 0L } ?: _currentChatId.value ?: 0L
+        val checkNowMs = System.currentTimeMillis()
+        if (effectiveTriggeredByWakeWord &&
+            trimmed.isNotBlank() &&
+            trimmed.equals(lastSentWakeMessagePrompt, ignoreCase = true) &&
+            immediateChatId == lastSentWakeMessageChatId &&
+            (checkNowMs - lastSentWakeMessageAtMs) < 2000L
+        ) {
+            _pendingWakeQuery.value = null
+            _currentDraftText.value = ""
+            return
+        }
         if (_isGenerating.value) return
         if (trimmed.isNotBlank()) {
             _lastDispatchedVoicePrompt.value = trimmed
+            if (effectiveTriggeredByWakeWord) {
+                lastSentWakeMessagePrompt = trimmed
+                lastSentWakeMessageChatId = immediateChatId
+                lastSentWakeMessageAtMs = checkNowMs
+                _pendingWakeQuery.value = null
+            }
         }
         _currentDraftText.value = ""
         wakeWordManager.clearLastHeardText()
@@ -2217,6 +3388,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         clearStagedAttachment()
+        _attachedImageUri.value = null
+
+        // Immediately append optimistic user message into hotMessages so the user bubble renders on-screen instantly
+        if (immediateChatId > 0L && trimmed.isNotEmpty() && !ChatMessage.isLegacyAudioPlaceholder(trimmed)) {
+            val optimisticMsg = ChatMessage(
+                chatId = immediateChatId,
+                sender = "user",
+                content = trimmed,
+                timestamp = outgoingTimestamp,
+                triggeredByWakeWord = effectiveTriggeredByWakeWord,
+                attachmentUri = attachment?.uri?.toString(),
+                attachmentName = attachment?.fileName,
+                attachmentMimeType = attachment?.mimeType,
+                attachmentSizeBytes = attachment?.sizeBytes
+            ).sanitizeForPersistence()
+            if (optimisticMsg.hasPersistableContent) {
+                bufferManager.appendMessage(optimisticMsg)
+            }
+        }
 
         viewModelScope.launch {
             _errorMessage.value = null
@@ -2235,10 +3425,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     } catch (_: Exception) {
                         ""
                     }
-                    com.example.voice.AudioCommandSanitizer.stripWakeWordTrigger(
-                        rawText = transcribedRaw,
+                    com.example.voice.SpeechRecognitionCoordinator.extractWakeTriggeredTranscript(
+                        rawTranscript = transcribedRaw,
                         customWakeWords = activeWakeWords
-                    ).ifBlank { trimmed.takeUnless { ChatMessage.isLegacyAudioPlaceholder(it) }.orEmpty() }
+                    ).second.takeUnless { ChatMessage.isLegacyAudioPlaceholder(it) }
+                        ?.ifBlank { trimmed.takeUnless { t -> ChatMessage.isLegacyAudioPlaceholder(t) }.orEmpty() }
+                        .orEmpty()
                 }
                 else -> ""
             }
@@ -2247,33 +3439,48 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _lastDispatchedVoicePrompt.value = resolvedUserText
             }
 
-            // Prompt text sent alongside structured inlineData parts
-            val apiPrompt = when {
-                resolvedUserText.isNotEmpty() -> resolvedUserText
-                attachment != null -> "Please analyze this attached file."
-                else -> ""
-            }
-
             val userMsg = ChatMessage(
                 chatId = resolvedChatId,
                 sender = "user",
                 content = resolvedUserText,
                 timestamp = now,
-                triggeredByWakeWord = triggeredByWakeWord,
+                triggeredByWakeWord = effectiveTriggeredByWakeWord,
                 attachmentUri = attachment?.uri?.toString(),
                 attachmentName = attachment?.fileName,
                 attachmentMimeType = attachment?.mimeType,
                 attachmentSizeBytes = attachment?.sizeBytes
-            )
+            ).sanitizeForPersistence()
 
-            // 1. Insert user message into Room safely and append to buffer
-            val userMsgId = repository.insertMessage(userMsg)
+            if (!userMsg.hasPersistableContent) {
+                // Never insert empty or legacy audio-placeholder-only messages into Room or memory buffer
+                return@launch
+            }
+
+            // Immediately append optimistic userMsg into ChatMemoryBufferManager.hotMessages before Room insertion
+            bufferManager.appendMessage(userMsg)
+
+            // Prompt text sent alongside structured inlineData parts
+            val apiPrompt = when {
+                userMsg.sanitizedTextContent.isNotEmpty() -> userMsg.sanitizedTextContent
+                attachment != null -> "Please analyze this attached file."
+                else -> ""
+            }
+
+            // 1. Insert user message into Room safely via MessageDao (@Insert(onConflict = IGNORE))
+            //    which also atomically increments ChatSession.totalVoiceCommands when triggeredByWakeWord = true.
+            val userMsgId = messageRepository.insertMessage(userMsg)
             if (userMsgId <= 0) {
-                // Parent chat session was deleted or does not exist; abort safely
+                // Duplicate [chatId, timestamp, sender] turn ignored or parent chat missing; abort duplicate AI generation
                 return@launch
             }
             val savedUserMsg = userMsg.copy(id = userMsgId)
+            com.example.util.AppSettingsManager.applyCategoryToMessage(
+                context = getApplication(),
+                messageId = userMsgId,
+                chatId = resolvedChatId
+            )
             bufferManager.appendMessage(savedUserMsg)
+            localSyncServer.publishOutgoingTurnToSse(savedUserMsg)
             syncMessageToCloudIfSignedIn(savedUserMsg)
             syncChatToCloudIfSignedIn(resolvedChatId)
 
@@ -2293,6 +3500,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val fullResponse = StringBuilder()
                 try {
                     streamingVoicePlayer.stop()
+                    textToSpeechManager.stop()
                     val requestAudio = _voiceEngineMode.value == com.example.voice.VoiceEngineMode.GEMINI_ORION && _isAutoSpeakEnabled.value
 
                     geminiService.streamChatResponse(
@@ -2325,8 +3533,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         val aiMsgId = repository.insertMessage(aiMsg)
                         if (aiMsgId > 0) {
                             val savedAiMsg = aiMsg.copy(id = aiMsgId)
+                            com.example.util.AppSettingsManager.applyCategoryToMessage(
+                                context = getApplication(),
+                                messageId = aiMsgId,
+                                chatId = resolvedChatId
+                            )
                             bufferManager.appendMessage(savedAiMsg)
+                            localSyncServer.publishOutgoingTurnToSse(savedAiMsg)
                             syncMessageToCloudIfSignedIn(savedAiMsg)
+                        }
+                        if (_isAutoSpeakEnabled.value &&
+                            _voiceEngineMode.value != com.example.voice.VoiceEngineMode.MUTED &&
+                            !streamingVoicePlayer.isPlaying.value
+                        ) {
+                            textToSpeechManager.speak(finalAnswer)
                         }
                         ReplyNotificationHelper.notifyModelReplyIfBackgroundedOrScreenOff(
                             context = getApplication(),
@@ -2345,7 +3565,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     // Post-turn mic behavior:
                     // - Hands-Free ON: Re-initialize and restart wake-word listening once audio playback has finished
                     // - Hands-Free OFF (Walkie-Talkie mode): Stay stopped until manually triggered
-                    if (_isHandsFreeActive.value && !streamingVoicePlayer.isPlaying.value) {
+                    if (_isHandsFreeActive.value &&
+                        !_isSleepMode.value &&
+                        !streamingVoicePlayer.isPlaying.value &&
+                        !textToSpeechManager.isSpeaking.value
+                    ) {
+                        speechRecognitionCoordinator.setProcessingState(false)
+                        speechRecognitionCoordinator.setIntentionallyPaused(false)
+                        scheduleSpeechRecognizerRestart(
+                            delayMs = com.example.voice.SpeechRecognitionCoordinator.DEFAULT_RESTART_DEBOUNCE_MS,
+                            allowDuringUserVoiceTurn = true
+                        )
                         wakeWordManager.restartWakeListeningAfterTurn()
                     }
                 }
@@ -2610,15 +3840,58 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun toggleHandsFreeMode(enabled: Boolean? = null) {
+    var handsFreeToggleClockMs: () -> Long = { System.currentTimeMillis() }
+    private var lastHandsFreeToggleAtMs: Long = 0L
+
+    internal fun resetHandsFreeToggleDebounceForTest() {
+        lastHandsFreeToggleAtMs = 0L
+    }
+
+    /**
+     * Unified microphone & hands-free voice toggle shared by the Front Dashboard mic button,
+     * the Settings screen test/listener toggle button, and hands-free controls.
+     * Synchronizes persistent [isHandsFreeActive] state and active speech recognition together.
+     *
+     * Strictly uses [_isHandsFreeActive] as the single source of truth so transient
+     * `isListening == false` states never force or invert `handsFreeMode` to OFF, and enforces
+     * a minimum 400ms debounce between user toggles.
+     */
+    fun toggleHandsFreeVoice(enabled: Boolean? = null) {
+        if (enabled != null && enabled == _isHandsFreeActive.value && !_isSleepMode.value) {
+            return
+        }
+        val now = handsFreeToggleClockMs()
+        if (lastHandsFreeToggleAtMs > 0L && (now - lastHandsFreeToggleAtMs) < 400L) {
+            return
+        }
+        lastHandsFreeToggleAtMs = now
+
         val next = enabled ?: !_isHandsFreeActive.value
+
+        com.example.voice.AudioCommandSanitizer.playRadarToggleHaptic(
+            context = getApplication(),
+            isActivating = next,
+            reason = if (next) "Hands-Free Radar Toggled ON" else "Hands-Free Radar Toggled OFF"
+        )
+
+        if (next && _isSleepMode.value) {
+            _isSleepMode.value = false
+            _sleepModeReason.value = ""
+            audioRecorder.setIntentionallyPaused(false)
+            speechRecognitionCoordinator.setSleeping(false)
+            wakeWordManager.exitSleepMode("Hands-free voice enabled")
+            com.example.voice.WakeWordVoiceService.setSleepMode(false)
+        }
+
         if (next && !checkRecordAudioPermission()) {
             pendingWakeStartAfterPermission = true
             _requiresAudioPermission.value = true
             wakeWordManager.setStatusMessage("Microphone permission required for hands-free wake-word listening")
         }
+
         _isHandsFreeActive.value = next
         appPrefs.edit().putBoolean("hands_free_active", next).apply()
+
         if (next && _currentChatId.value == null) {
             viewModelScope.launch {
                 val resolvedId = resolveOrEnsureTargetChatId(null)
@@ -2627,10 +3900,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
-        if (!next) {
-            stopSpeechRecognizerInternal()
-        }
+
         wakeWordManager.setHandsFreeMode(next)
+
+        if (next) {
+            audioRecorder.setIntentionallyPaused(false)
+            speechRecognitionCoordinator.setIntentionallyPaused(false)
+            if (!_isSleepMode.value) {
+                com.example.voice.WakeWordVoiceService.startServiceSafely(
+                    context = getApplication(),
+                    action = com.example.voice.WakeWordVoiceService.ACTION_START_VOICE_SERVICE
+                )
+            }
+            if (checkRecordAudioPermission()) {
+                startContinuousWakeWordListening(userInitiated = true)
+            }
+        } else {
+            _isInChatDictationActive.value = false
+            speechRecognitionCoordinator.setInChatDictationMode(false)
+            stopContinuousWakeWordListening(markIntentionallyPaused = true)
+            wakeWordManager.setStatusMessage("Hands-free voice standby")
+        }
+    }
+
+    fun toggleHandsFreeMode(enabled: Boolean? = null) {
+        toggleHandsFreeVoice(enabled)
     }
 
     fun updateCurrentDraftText(text: String) {
@@ -2644,14 +3938,50 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         com.example.voice.AudioCommandSanitizer.playHeartbeatConfirmation(getApplication())
     }
 
+    fun onWindowFocusChanged(hasFocus: Boolean) {
+        _hasWindowFocus.value = hasFocus
+        val isHandsFreeModeEnabled = _isHandsFreeActive.value && !_isSleepMode.value
+        val isProcessingCommand = speechRecognitionCoordinator.isProcessing ||
+            _isGenerating.value ||
+            isOrionVoicePlaying.value ||
+            textToSpeechManager.isSpeaking.value ||
+            _isNavigatingViaVoiceCommand.value
+        if (hasFocus && isHandsFreeModeEnabled && !isProcessingCommand) {
+            audioRecorder.setIntentionallyPaused(false)
+            speechRecognitionCoordinator.setIntentionallyPaused(false)
+        }
+        speechRecognitionCoordinator.setWindowFocused(hasFocus)
+        wakeWordManager.setWindowFocused(hasFocus)
+        if (!hasFocus) {
+            _isInChatDictationActive.value = false
+            speechRecognitionCoordinator.stopListening(markIntentionallyPaused = false)
+            releaseAllNativeAudioRecordTracksForSpeechRecognizer()
+        } else if (isAppInForeground &&
+            isHandsFreeModeEnabled &&
+            !isProcessingCommand &&
+            checkRecordAudioPermission()
+        ) {
+            if (!wakeWordManager.isListening.value &&
+                !speechRecognitionCoordinator.isListening.value &&
+                !speechRecognitionCoordinator.hasPendingRestart
+            ) {
+                speechRecognitionCoordinator.startListening(userInitiated = false)
+            }
+        }
+    }
+
     fun onAppBackgrounded() {
         isAppInForeground = false
-        if ((_isHandsFreeActive.value || wakeWordManager.isListening.value) && !_isSleepMode.value) {
+        _hasWindowFocus.value = false
+        speechRecognitionCoordinator.setWindowFocused(false)
+        wakeWordManager.setWindowFocused(false)
+        if ((_isHandsFreeActive.value || wakeWordManager.isListening.value || speechRecognitionCoordinator.isListening.value) && !_isSleepMode.value) {
             com.example.voice.WakeWordVoiceService.startServiceSafely(
                 context = getApplication(),
                 action = com.example.voice.WakeWordVoiceService.ACTION_START_VOICE_SERVICE
             )
         }
+        com.example.voice.BatterySaverMonitorWorker.enqueueImmediateCheck(getApplication())
         if (_heartbeatPingOnlyMode.value) {
             ChromeBridgeSocketManager.enterHeartbeatMode(getApplication())
         }
@@ -2659,7 +3989,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onAppForegrounded() {
         isAppInForeground = true
+        _hasWindowFocus.value = true
+        speechRecognitionCoordinator.setWindowFocused(true)
+        wakeWordManager.setWindowFocused(true)
         networkStatusTracker.refresh()
+        if (_isHandsFreeActive.value && !_isSleepMode.value && checkRecordAudioPermission()) {
+            com.example.voice.WakeWordVoiceService.startServiceSafely(
+                context = getApplication(),
+                action = com.example.voice.WakeWordVoiceService.ACTION_START_VOICE_SERVICE
+            )
+            if (!wakeWordManager.isListening.value && !speechRecognitionCoordinator.isListening.value) {
+                startContinuousWakeWordListening()
+            }
+        }
+        com.example.voice.BatterySaverMonitorWorker.enqueueImmediateCheck(getApplication())
         if (_heartbeatPingOnlyMode.value) {
             ChromeBridgeSocketManager.exitHeartbeatMode(getApplication())
         }
@@ -2717,6 +4060,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             val id = repository.saveChat(chat)
             if (id > 0L) {
+                val pendingCat = _pendingNewChatCategory.value
+                val pendingTags = _pendingNewChatTags.value
+                if (!pendingCat.isNullOrBlank()) {
+                    val existingMsgIds = withContext(Dispatchers.IO) {
+                        messageRepository.getMessagesForChatSync(id).map { it.id }
+                    }
+                    com.example.util.AppSettingsManager.applyCategoryToChatAndMessages(
+                        context = getApplication(),
+                        chatId = id,
+                        category = pendingCat,
+                        messageIds = existingMsgIds
+                    )
+                    _pendingNewChatCategory.value = null
+                }
+                if (pendingTags.isNotEmpty()) {
+                    com.example.util.AppSettingsManager.setChatTags(getApplication(), id, pendingTags)
+                    _pendingNewChatTags.value = emptySet()
+                }
                 wakeWordRepository.syncChatWakeWordFromSession(
                     chatId = id,
                     chatTitle = chat.title,
@@ -2732,6 +4093,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun updateChatTheme(chatId: Long, theme: AppTheme) {
         viewModelScope.launch {
             repository.updateChatTheme(chatId, theme)
+        }
+    }
+
+    fun updateChatAppearance(
+        chatId: Long,
+        colorPaletteId: String,
+        backgroundStyle: String,
+        themeColorHex: String
+    ) {
+        viewModelScope.launch {
+            repository.updateChatAppearance(
+                chatId = chatId,
+                colorPaletteId = colorPaletteId,
+                backgroundStyle = backgroundStyle,
+                themeColorHex = themeColorHex
+            )
+            syncChatToCloudIfSignedIn(chatId)
         }
     }
 
@@ -2859,6 +4237,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             // Lifecycle Hook: Force reset and clear ChromeBridgeSocketManager when chat is deleted
             ChromeBridgeSocketManager.forceResetAndClear(getApplication(), preserveDiskCache = _preserveCacheAcrossSessions.value)
             bufferManager.clearDiskCache(chatId)
+            com.example.util.AppSettingsManager.unpinChat(getApplication(), chatId)
             deleteWakeWordSamples(chatId)
             wakeWordRepository.deleteWakeWordsForChat(chatId)
             repository.deleteChat(chatId)
@@ -3197,11 +4576,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         ) {
             return
         }
-        // StreamingVoicePlayer strictly plays incoming model responses from Gemini only.
+        if (_voiceEngineMode.value == com.example.voice.VoiceEngineMode.MUTED) return
+        textToSpeechManager.speak(text)
     }
 
     fun stopSpeaking() {
         streamingVoicePlayer.stop()
+        textToSpeechManager.bargeInAndStop()
     }
 
     fun setVoiceEngineMode(mode: com.example.voice.VoiceEngineMode) {
@@ -3209,6 +4590,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         appPrefs.edit().putString("voice_engine_mode", mode.name).apply()
         if (mode == com.example.voice.VoiceEngineMode.MUTED) {
             streamingVoicePlayer.stop()
+            textToSpeechManager.stop()
         }
     }
 
@@ -3402,6 +4784,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             wakeWordManager.destroy()
             streamingVoicePlayer.stop()
             streamingVoicePlayer.release()
+            textToSpeechManager.shutdown()
             localSyncServer.stop()
             screenshotWatcher.stopWatching()
             networkStatusTracker.stopTracking()
@@ -3430,6 +4813,189 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return sb.toString()
     }
 
+    /**
+     * Exports the chat interaction logs stored in the Room database as a JSON string.
+     * If [chatId] is provided, exports only that chat session's logs; otherwise exports all active chats.
+     */
+    suspend fun exportChatInteractionLogsAsJsonString(chatId: Long? = null): String {
+        return repository.exportChatInteractionLogsToJsonString(chatId)
+    }
+
+    /**
+     * Exports the chat interaction logs stored in Room to a `.json` file inside `cacheDir/exports`.
+     */
+    suspend fun exportChatInteractionLogsToJsonFile(
+        context: android.content.Context = getApplication(),
+        chatId: Long? = null
+    ): java.io.File {
+        return repository.exportChatInteractionLogsToJsonFile(context, chatId)
+    }
+
+    /**
+     * Exports the chat interaction logs stored in Room to a simple `.json` file and shares it
+     * via a standard Android `Intent.ACTION_SEND` chooser (`FileProvider`).
+     */
+    fun shareChatInteractionLogsAsJson(
+        context: android.content.Context,
+        chatId: Long? = null,
+        onError: (String) -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            try {
+                repository.exportAndShareChatInteractionLogs(context, chatId)
+            } catch (e: Exception) {
+                android.util.Log.e("MainViewModel", "Failed to export and share chat interaction logs JSON", e)
+                onError(e.message ?: "Unable to share chat interaction logs")
+            }
+        }
+    }
+
+    fun toggleFavoriteChat(chatId: Long): Boolean {
+        val updated = com.example.util.AppSettingsManager.toggleFavoriteChat(getApplication(), chatId)
+        return updated.contains(chatId)
+    }
+
+    fun togglePinnedChat(chatId: Long): Boolean {
+        val currentSession = allChats.value.firstOrNull { it.id == chatId }
+        val currentlyPinned = currentSession?.isPinned == true || pinnedChatIds.value.contains(chatId)
+        val nextPinned = !currentlyPinned
+        val updated = com.example.util.AppSettingsManager.togglePinnedChat(getApplication(), chatId)
+        val resolvedPinned = if (updated.contains(chatId) != nextPinned) {
+            com.example.util.AppSettingsManager.togglePinnedChat(getApplication(), chatId).contains(chatId)
+        } else {
+            nextPinned
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.updateChatPinned(chatId, resolvedPinned)
+            syncChatToCloudIfSignedIn(chatId)
+        }
+        return resolvedPinned
+    }
+
+    fun setContextualRoutingEnabled(enabled: Boolean) {
+        com.example.util.AppSettingsManager.setContextualRoutingEnabled(getApplication(), enabled)
+    }
+
+    fun setPromptFavoritesOnWake(enabled: Boolean) {
+        com.example.util.AppSettingsManager.setPromptFavoritesOnWake(getApplication(), enabled)
+    }
+
+    fun openWakeFavoritesPicker() {
+        _showWakeFavoritesPickerDialog.value = true
+    }
+
+    fun dismissWakeFavoritesPicker() {
+        _showWakeFavoritesPickerDialog.value = false
+    }
+
+    fun dismissWakeConversationSummary() {
+        _wakeConversationSummary.value = null
+    }
+
+    fun generateWakeAiSummary() {
+        val currentSummary = _wakeConversationSummary.value ?: return
+        if (currentSummary.isGeneratingAiSummary) return
+        _wakeConversationSummary.value = currentSummary.copy(isGeneratingAiSummary = true)
+        viewModelScope.launch {
+            try {
+                val recentMessages = withContext(Dispatchers.IO) {
+                    messageRepository.getMessagesForChatSync(currentSummary.chatId)
+                        .filter { !it.isDeleted && it.content.isNotBlank() }
+                        .takeLast(8)
+                }
+                if (recentMessages.isEmpty()) {
+                    _wakeConversationSummary.value = currentSummary.copy(
+                        aiExpandedSummary = "No recent messages in this conversation to summarize yet.",
+                        isGeneratingAiSummary = false
+                    )
+                    return@launch
+                }
+                val transcriptBlock = recentMessages.joinToString("\n") { msg ->
+                    val speaker = if (msg.sender.equals("user", ignoreCase = true)) "User" else "Gemini"
+                    "$speaker: ${msg.content.take(260)}"
+                }
+                val prompt = "Provide a concise 2-sentence context recap of the following recent conversation so the user can immediately resume where they left off:\n\n$transcriptBlock"
+                val responseBuilder = StringBuilder()
+                geminiService.streamChatResponse(
+                    context = getApplication(),
+                    systemInstruction = "You are a concise conversation summarizer. Respond in at most 2 short sentences.",
+                    history = emptyList(),
+                    userPrompt = prompt,
+                    requestAudio = false
+                ).collect { chunk ->
+                    responseBuilder.append(chunk)
+                }
+                val fallbackRecap = currentSummary.instantRecapBullets.joinToString(" ")
+                val generated = responseBuilder.toString().trim().ifBlank {
+                    fallbackRecap
+                }
+                _wakeConversationSummary.value = _wakeConversationSummary.value?.copy(
+                    aiExpandedSummary = generated,
+                    isGeneratingAiSummary = false
+                )
+            } catch (e: Exception) {
+                val fallbackRecap = currentSummary.instantRecapBullets.joinToString(" ")
+                _wakeConversationSummary.value = _wakeConversationSummary.value?.copy(
+                    aiExpandedSummary = "Instant Recap: $fallbackRecap",
+                    isGeneratingAiSummary = false
+                )
+            }
+        }
+    }
+
+    fun toggleRelayServer(enabled: Boolean) {
+        if (enabled) {
+            localSyncServer.start(com.example.bridge.LocalSyncRelayServer.DEFAULT_PORT)
+        } else {
+            localSyncServer.stop()
+        }
+    }
+
+    fun rotateRelaySessionToken(): String {
+        return localSyncServer.regenerateSessionToken()
+    }
+
+    fun forceResetAndClearSystemHygiene(): com.example.util.HygieneResetResult {
+        return com.example.util.AppSettingsManager.forceResetAndClear(
+            context = getApplication(),
+            relayServer = localSyncServer,
+            bufferManager = bufferManager,
+            clearAudioBufferCallback = {
+                synchronized(voicePcmOutputStream) {
+                    voicePcmOutputStream.reset()
+                }
+            },
+            preserveDiskCache = false
+        )
+    }
+
+    fun setChatCategoryAndTags(chatId: Long, category: String, tags: Set<String>) {
+        if (chatId <= 0L) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val messageIds = messageRepository.getMessagesForChatSync(chatId).map { it.id }
+            com.example.util.AppSettingsManager.applyCategoryToChatAndMessages(
+                context = getApplication(),
+                chatId = chatId,
+                category = category,
+                messageIds = messageIds
+            )
+            com.example.util.AppSettingsManager.setChatTags(getApplication(), chatId, tags)
+        }
+    }
+
+    fun reassignChatAndMessagesCategory(chatId: Long, category: String) {
+        if (chatId <= 0L) return
+        viewModelScope.launch(Dispatchers.IO) {
+            val messageIds = messageRepository.getMessagesForChatSync(chatId).map { it.id }
+            com.example.util.AppSettingsManager.applyCategoryToChatAndMessages(
+                context = getApplication(),
+                chatId = chatId,
+                category = category,
+                messageIds = messageIds
+            )
+        }
+    }
+
     override fun onCleared() {
         super.onCleared()
         timerTickerJob?.cancel()
@@ -3439,6 +5005,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         audioRecorder.release()
         snippetPlayer.release()
         streamingVoicePlayer.release()
+        textToSpeechManager.shutdown()
         screenshotWatcher.stopWatching()
         networkStatusTracker.stopTracking()
         activeGenerationJob?.cancel()

@@ -26,6 +26,14 @@ data class VoiceCommandEntity(
     val chatTitle: String? = null,
     val timestamp: Long = System.currentTimeMillis()
 ) {
+    /**
+     * Returns true when [recognizedTranscript] holds actual transcribed speech rather than a blank
+     * string or a legacy audio placeholder.
+     */
+    val hasValidTranscript: Boolean
+        get() = recognizedTranscript.isNotBlank() &&
+            !ChatMessage.isLegacyAudioPlaceholder(recognizedTranscript)
+
     fun toHistoryEntry(): VoiceCommandHistoryEntry {
         val safeType = try {
             VoiceCommandType.valueOf(commandType.trim().uppercase())
@@ -33,13 +41,16 @@ data class VoiceCommandEntity(
             VoiceCommandType.WAKE_WORD
         }
         val safeTrigger = triggerPhrase.trim().ifBlank { safeType.displayLabel }
-        val safeTranscript = recognizedTranscript.trim().ifBlank { safeTrigger }
+        val cleanTranscript = recognizedTranscript.trim()
+            .takeUnless { ChatMessage.isLegacyAudioPlaceholder(it) }
+            .orEmpty()
+            .ifBlank { safeTrigger }
         val safeTimestamp = if (timestamp > 0L) timestamp else System.currentTimeMillis()
         return VoiceCommandHistoryEntry(
             id = id.ifBlank { UUID.randomUUID().toString() },
             commandType = safeType,
             triggerPhrase = safeTrigger,
-            recognizedTranscript = safeTranscript,
+            recognizedTranscript = cleanTranscript,
             chatTitle = chatTitle?.trim()?.takeIf { it.isNotBlank() },
             timestamp = safeTimestamp
         )
@@ -49,13 +60,16 @@ data class VoiceCommandEntity(
         fun fromHistoryEntry(entry: VoiceCommandHistoryEntry): VoiceCommandEntity {
             val safeId = entry.id.trim().ifBlank { UUID.randomUUID().toString() }
             val safeTrigger = entry.triggerPhrase.trim().ifBlank { entry.commandType.displayLabel }
-            val safeTranscript = entry.recognizedTranscript.trim().ifBlank { safeTrigger }
+            val cleanTranscript = entry.recognizedTranscript.trim()
+                .takeUnless { ChatMessage.isLegacyAudioPlaceholder(it) }
+                .orEmpty()
+                .ifBlank { safeTrigger }
             val safeTimestamp = if (entry.timestamp > 0L) entry.timestamp else System.currentTimeMillis()
             return VoiceCommandEntity(
                 id = safeId,
                 commandType = entry.commandType.name,
                 triggerPhrase = safeTrigger,
-                recognizedTranscript = safeTranscript,
+                recognizedTranscript = cleanTranscript,
                 chatTitle = entry.chatTitle?.trim()?.takeIf { it.isNotBlank() },
                 timestamp = safeTimestamp
             )

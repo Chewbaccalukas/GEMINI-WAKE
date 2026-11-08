@@ -28,9 +28,11 @@ import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -58,6 +60,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.model.ChatMessage
 import com.example.data.model.ChatSession
+import com.example.ui.components.WakeWordSessionBarChartCard
+import com.example.ui.components.WeeklyActivityHeatmapCard
+import com.example.ui.components.computeWeeklyActivityHeatmap
 import com.example.ui.components.getIconForName
 import com.example.util.VoiceCommandHistoryEntry
 import java.text.SimpleDateFormat
@@ -114,6 +119,11 @@ fun HistoryScreen(
     onDeleteMessage: (Long) -> Unit,
     onNavigateToChat: (Long) -> Unit,
     onClearCorruptedHistory: () -> Unit = {},
+    onShareLogsAsJson: () -> Unit = {},
+    onShareLogsAsCsv: () -> Unit = {},
+    onOpenBackupExportDialog: (() -> Unit)? = null,
+    sessionStatisticsState: com.example.ui.SessionStatisticsUiState? = null,
+    onSelectStatisticsDateRange: ((com.example.ui.components.StatisticsDateRange) -> Unit)? = null,
     voiceCommands: List<VoiceCommandHistoryEntry>? = emptyList(),
     onDeleteVoiceCommand: (String) -> Unit = {},
     hasHistoryError: Boolean = false
@@ -153,7 +163,9 @@ fun HistoryScreen(
                     .filter { cmd ->
                         val transcript = safeText(cmd.recognizedTranscript)
                         val trigger = safeText(cmd.triggerPhrase)
-                        if (transcript.isBlank() && trigger.isBlank()) {
+                        val hasValidTranscript = transcript.isNotBlank() && !ChatMessage.isLegacyAudioPlaceholder(transcript)
+                        val hasValidTrigger = trigger.isNotBlank() && !ChatMessage.isLegacyAudioPlaceholder(trigger)
+                        if (!hasValidTranscript && !hasValidTrigger) {
                             false
                         } else if (query.isBlank()) {
                             true
@@ -201,6 +213,28 @@ fun HistoryScreen(
                 },
                 actions = {
                     TextButton(
+                        onClick = {
+                            if (onOpenBackupExportDialog != null) {
+                                onOpenBackupExportDialog()
+                            } else {
+                                onShareLogsAsJson()
+                            }
+                        },
+                        modifier = Modifier.testTag("export_share_logs_json_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = "Export JSON or CSV Backup",
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "Export JSON/CSV",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold)
+                        )
+                    }
+                    TextButton(
                         onClick = onClearCorruptedHistory,
                         modifier = Modifier.testTag("clear_corrupted_history_button")
                     ) {
@@ -219,6 +253,19 @@ fun HistoryScreen(
                 },
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)
             )
+        },
+        floatingActionButton = {
+            FloatingActionButton(
+                onClick = onShareLogsAsCsv,
+                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                modifier = Modifier.testTag("history_fab_share_csv_statistics")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Share,
+                    contentDescription = "Share Session Statistics CSV via FileProvider"
+                )
+            }
         }
     ) { innerPadding ->
         Column(
@@ -280,31 +327,67 @@ fun HistoryScreen(
                 }
 
                 is SafeHistoryState.Ready -> {
-                    if (current.messages.isEmpty() && current.voiceCommands.isEmpty()) {
-                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Icon(
-                                    Icons.Default.History,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(64.dp),
-                                    tint = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
-                                )
-                                Spacer(modifier = Modifier.height(16.dp))
-                                Text(
-                                    text = if (searchQuery.isBlank()) "No history recorded yet" else "No matches found for \"$searchQuery\"",
-                                    style = MaterialTheme.typography.bodyLarge,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
+                    LazyColumn(
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .testTag("history_lazy_column")
+                    ) {
+                        item(key = "history_wake_session_bar_chart") {
+                            WakeWordSessionBarChartCard(
+                                chats = current.chatMap.values.toList(),
+                                messages = current.messages,
+                                voiceCommands = current.voiceCommands,
+                                statisticsState = sessionStatisticsState,
+                                onSelectDateRange = onSelectStatisticsDateRange,
+                                onOpenExportDialog = onOpenBackupExportDialog,
+                                onQuickShareCsv = onShareLogsAsCsv
+                            )
                         }
-                    } else {
-                        LazyColumn(
-                            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-                            verticalArrangement = Arrangement.spacedBy(12.dp),
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .testTag("history_lazy_column")
-                        ) {
+
+                        item(key = "history_weekly_activity_heatmap") {
+                            val heatmapCells = remember(sessionStatisticsState, current) {
+                                sessionStatisticsState?.weeklyHeatmapCells?.takeIf { it.isNotEmpty() }
+                                    ?: computeWeeklyActivityHeatmap(
+                                        chats = current.chatMap.values.toList(),
+                                        messages = current.messages,
+                                        voiceCommands = current.voiceCommands
+                                    )
+                            }
+                            val peakLabel = sessionStatisticsState?.peakHeatmapSlotLabel ?: "Peak Activity Slot"
+                            WeeklyActivityHeatmapCard(
+                                heatmapCells = heatmapCells,
+                                peakSlotSummary = peakLabel,
+                                onShareCsvClick = onShareLogsAsCsv
+                            )
+                        }
+
+                        if (current.messages.isEmpty() && current.voiceCommands.isEmpty()) {
+                            item(key = "history_empty_state") {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 48.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        Icon(
+                                            Icons.Default.History,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(64.dp),
+                                            tint = MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
+                                        )
+                                        Spacer(modifier = Modifier.height(16.dp))
+                                        Text(
+                                            text = if (searchQuery.isBlank()) "No history recorded yet" else "No matches found for \"$searchQuery\"",
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                            }
+                        } else {
                             if (current.voiceCommands.isNotEmpty()) {
                                 itemsIndexed(
                                     items = current.voiceCommands,
@@ -343,10 +426,18 @@ fun VoiceCommandHistoryCard(
     onDelete: () -> Unit
 ) {
     val safeTranscript = remember(entry) {
-        safeText(entry.recognizedTranscript, safeText(entry.triggerPhrase, "Voice command"))
+        val rawTranscript = safeText(entry.recognizedTranscript)
+        val cleanTranscript = if (!ChatMessage.isLegacyAudioPlaceholder(rawTranscript)) rawTranscript else ""
+        val rawTrigger = safeText(entry.triggerPhrase)
+        val cleanTrigger = if (!ChatMessage.isLegacyAudioPlaceholder(rawTrigger)) rawTrigger else ""
+        cleanTranscript.ifBlank { cleanTrigger }
+    }
+    if (safeTranscript.isBlank()) {
+        return
     }
     val safeTrigger = remember(entry) {
-        safeText(entry.triggerPhrase, "Voice Trigger")
+        val rawTrigger = safeText(entry.triggerPhrase)
+        if (!ChatMessage.isLegacyAudioPlaceholder(rawTrigger)) rawTrigger else "Voice Trigger"
     }
     val safeChatTitle = remember(entry) {
         safeText(entry.chatTitle, "Hands-Free Command")
@@ -434,13 +525,17 @@ fun HistoryMessageItem(
     }
 
     val safeContent = remember(message.content, message.attachmentName) {
-        val raw = safeText(message.content)
-        if (!ChatMessage.isLegacyAudioPlaceholder(raw)) {
+        val raw = message.sanitizedTextContent
+        if (raw.isNotBlank()) {
             raw
         } else {
             val att = safeText(message.attachmentName)
             if (att.isNotBlank() && !message.isAudioPlaceholderAttachment) "Attached: $att" else ""
         }
+    }
+
+    if (safeContent.isBlank()) {
+        return
     }
 
     val safeSender = remember(message.sender) {

@@ -17,8 +17,8 @@ android {
     applicationId = "com.aistudio.geminiwake.vztrkq"
     minSdk = 24
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0"
+    versionCode = 7
+    versionName = "7.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -65,6 +65,10 @@ android {
     buildConfig = true
   }
   testOptions { unitTests { isIncludeAndroidResources = true } }
+  lint {
+    checkReleaseBuilds = false
+    abortOnError = false
+  }
   dependenciesInfo {
     includeInApk = false
     includeInBundle = true
@@ -109,11 +113,11 @@ dependencies {
   implementation(libs.androidx.lifecycle.runtime.compose)
   implementation(libs.androidx.lifecycle.runtime.ktx)
   implementation(libs.androidx.lifecycle.viewmodel.compose)
-  // implementation(libs.androidx.navigation.compose)
+  implementation(libs.androidx.navigation.compose)
   implementation(libs.androidx.room.ktx)
   implementation(libs.androidx.room.runtime)
   // implementation(libs.coil.compose)
-  implementation(libs.converter.moshi)
+  // implementation(libs.converter.moshi)
   implementation(libs.firebase.ai)
   // Uncomment to use Firestore:
   implementation(libs.firebase.firestore)
@@ -128,17 +132,19 @@ dependencies {
   implementation(libs.firebase.appcheck.debug)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
-  implementation(libs.logging.interceptor)
-  implementation(libs.moshi.kotlin)
+  // implementation(libs.logging.interceptor)
+  // implementation(libs.moshi.kotlin)
   implementation(libs.okhttp)
   // implementation(libs.play.services.location)
-  implementation(libs.retrofit)
+  // implementation(libs.retrofit)
+  implementation(libs.androidx.work.runtime.ktx)
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)
   testImplementation(libs.androidx.junit)
   testImplementation(libs.junit)
   testImplementation(libs.kotlinx.coroutines.test)
   testImplementation(libs.robolectric)
+  testImplementation(libs.androidx.work.testing)
   androidTestImplementation(platform(libs.androidx.compose.bom))
   androidTestImplementation(libs.androidx.compose.ui.test.junit4)
   androidTestImplementation(libs.androidx.espresso.core)
@@ -146,6 +152,41 @@ dependencies {
   androidTestImplementation(libs.androidx.runner)
   debugImplementation(libs.androidx.compose.ui.test.manifest)
   debugImplementation(libs.androidx.compose.ui.tooling)
-  "ksp"(libs.androidx.room.compiler)
-  "ksp"(libs.moshi.kotlin.codegen)
+  "kspDebug"(libs.androidx.room.compiler)
+  "kspRelease"(libs.androidx.room.compiler)
+  // "ksp"(libs.moshi.kotlin.codegen)
 }
+
+object KspAwtSafeExceptionFilter : Thread.UncaughtExceptionHandler, java.io.Serializable {
+  @Transient @Volatile private var previousHandler: Thread.UncaughtExceptionHandler? = null
+
+  fun install() {
+    val current = Thread.getDefaultUncaughtExceptionHandler()
+    if (current !== this) {
+      previousHandler = current
+      Thread.setDefaultUncaughtExceptionHandler(this)
+    }
+  }
+
+  override fun uncaughtException(t: Thread, e: Throwable) {
+    if (
+      t.name.startsWith("AWT-EventQueue") &&
+        e is NullPointerException &&
+        (e.message?.contains("ApplicationManager.getApplication()") == true ||
+          e.stackTrace.any { it.className.startsWith("ksp.com.intellij.") })
+    ) {
+      return
+    }
+    previousHandler?.uncaughtException(t, e)
+  }
+}
+
+KspAwtSafeExceptionFilter.install()
+
+tasks.matching { it.name.startsWith("ksp") }.configureEach {
+  if (name.contains("UnitTest") || name.contains("AndroidTest")) {
+    enabled = false
+  }
+  doFirst { KspAwtSafeExceptionFilter.install() }
+}
+

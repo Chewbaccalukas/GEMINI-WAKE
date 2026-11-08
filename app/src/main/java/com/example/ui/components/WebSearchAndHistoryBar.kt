@@ -131,8 +131,16 @@ fun WebSearchAndHistoryBar(
         onSetHistoryExpandedExternal?.invoke(newValue)
     }
 
+    val validVoiceCommandEntries = remember(voiceCommandEntries) {
+        voiceCommandEntries.filter { entry ->
+            val transcript = entry.recognizedTranscript.trim()
+            val trigger = entry.triggerPhrase.trim()
+            (transcript.isNotBlank() && !com.example.data.model.ChatMessage.isLegacyAudioPlaceholder(transcript)) ||
+                (trigger.isNotBlank() && !com.example.data.model.ChatMessage.isLegacyAudioPlaceholder(trigger))
+        }
+    }
     var cumulativeDragY by remember { mutableFloatStateOf(0f) }
-    val totalHistoryCount = historyEntries.size + voiceCommandEntries.size
+    val totalHistoryCount = historyEntries.size + validVoiceCommandEntries.size
 
     Column(
         modifier = modifier
@@ -361,7 +369,7 @@ fun WebSearchAndHistoryBar(
                                 selected = selectedTabIndex == 1,
                                 icon = Icons.Default.RecordVoiceOver,
                                 label = "Voice Commands",
-                                count = voiceCommandEntries.size,
+                                count = validVoiceCommandEntries.size,
                                 onClick = { selectedTabIndex = 1 },
                                 modifier = Modifier
                                     .weight(1f)
@@ -528,7 +536,7 @@ fun WebSearchAndHistoryBar(
                                         color = MaterialTheme.colorScheme.primary
                                     )
                                 }
-                                if (voiceCommandEntries.isNotEmpty()) {
+                                if (validVoiceCommandEntries.isNotEmpty()) {
                                     TextButton(
                                         onClick = onClearAllVoiceCommands,
                                         contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
@@ -565,7 +573,7 @@ fun WebSearchAndHistoryBar(
 
                         HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
 
-                        if (voiceCommandEntries.isEmpty()) {
+                        if (validVoiceCommandEntries.isEmpty()) {
                             Box(
                                 modifier = Modifier
                                     .fillMaxWidth()
@@ -588,7 +596,7 @@ fun WebSearchAndHistoryBar(
                                 verticalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
                                 itemsIndexed(
-                                    items = voiceCommandEntries,
+                                    items = validVoiceCommandEntries,
                                     key = { index, item -> "${item.id}_$index" }
                                 ) { _, entry ->
                                     VoiceCommandHistoryRow(

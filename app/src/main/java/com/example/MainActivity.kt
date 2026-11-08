@@ -49,9 +49,11 @@ import com.example.ui.components.ImportGeminiChatDialog
 import com.example.ui.components.MemoryBufferBridgeDialog
 import com.example.ui.components.WakeWordSettingsDialog
 import com.example.ui.screens.ChatDetailScreen
+import com.example.ui.screens.DiagnosticLogScreen
 import com.example.ui.screens.GoogleAuthScreen
 import com.example.ui.screens.HistoryScreen
 import com.example.ui.screens.HomeScreen
+import com.example.ui.screens.SettingsScreen
 import com.example.ui.screens.WakeWordRecordingScreen
 import com.example.ui.auth.GoogleAuthManager
 import com.example.ui.theme.AppTheme
@@ -64,11 +66,18 @@ import com.example.ui.components.AudioPermissionRationaleDialog
 import com.example.util.WebLinkHistoryManager
 import com.example.util.configureAppCheck
 import com.example.voice.WakeWordVoiceService
+import androidx.navigation.NavType
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
 
 sealed class Screen {
     object Home : Screen()
     object History : Screen()
+    object Settings : Screen()
     object WakeWordStudio : Screen()
+    object DiagnosticLog : Screen()
     data class Chat(val chatId: Long) : Screen()
 }
 
@@ -84,8 +93,10 @@ class MainActivity : ComponentActivity() {
     private val wakeWordViewModel: WakeWordViewModel by viewModels {
         WakeWordViewModel.provideFactory(viewModel.wakeWordRepository)
     }
+    private val sessionStatisticsViewModel: com.example.ui.SessionStatisticsViewModel by viewModels()
     private val incomingSharedText = mutableStateOf<String?>(null)
     private val incomingExternalWebUrl = mutableStateOf<String?>(null)
+    private val incomingOpenBackupExport = mutableStateOf(false)
     private var currentScreen by mutableStateOf<Screen>(Screen.Home)
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -137,12 +148,15 @@ class MainActivity : ComponentActivity() {
                         MainApp(
                             viewModel = viewModel,
                             wakeWordViewModel = wakeWordViewModel,
+                            sessionStatisticsViewModel = sessionStatisticsViewModel,
                             currentScreen = currentScreen,
                             onNavigate = { currentScreen = it },
                             incomingSharedText = incomingSharedText.value,
                             incomingExternalWebUrl = incomingExternalWebUrl.value,
+                            incomingOpenBackupExport = incomingOpenBackupExport.value,
                             onClearIncomingSharedText = { incomingSharedText.value = null },
-                            onClearIncomingExternalWebUrl = { incomingExternalWebUrl.value = null }
+                            onClearIncomingExternalWebUrl = { incomingExternalWebUrl.value = null },
+                            onClearIncomingOpenBackupExport = { incomingOpenBackupExport.value = false }
                         )
                     }
                 }
@@ -160,12 +174,20 @@ class MainActivity : ComponentActivity() {
         viewModel.onAppBackgrounded()
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        viewModel.onWindowFocusChanged(hasFocus)
+    }
+
     override fun onNewIntent(intent: android.content.Intent) {
         super.onNewIntent(intent)
         handleIncomingIntent(intent)
     }
 
     private fun handleIncomingIntent(intent: android.content.Intent?) {
+        if (intent?.getBooleanExtra(com.example.heartbeat.BackupReminderWorker.EXTRA_OPEN_BACKUP_EXPORT, false) == true) {
+            incomingOpenBackupExport.value = true
+        }
         val targetChatId = intent?.getLongExtra(com.example.heartbeat.HeartbeatAlarmReceiver.EXTRA_TARGET_CHAT_ID, -1L) ?: -1L
         val wakeTargetChatId = intent?.getLongExtra(WakeWordVoiceService.EXTRA_WAKE_TARGET_CHAT_ID, -1L) ?: -1L
         val resolvedTargetChatId = when {
@@ -308,18 +330,22 @@ fun MainApp(
     wakeWordViewModel: WakeWordViewModel = remember(viewModel) {
         WakeWordViewModel(viewModel.wakeWordRepository)
     },
+    sessionStatisticsViewModel: com.example.ui.SessionStatisticsViewModel? = null,
     currentScreen: Screen,
     onNavigate: (Screen) -> Unit,
     incomingSharedText: String? = null,
     incomingExternalWebUrl: String? = null,
+    incomingOpenBackupExport: Boolean = false,
     onClearIncomingSharedText: () -> Unit = {},
-    onClearIncomingExternalWebUrl: () -> Unit = {}
+    onClearIncomingExternalWebUrl: () -> Unit = {},
+    onClearIncomingOpenBackupExport: () -> Unit = {}
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
 
     val chats by viewModel.allChats.collectAsStateWithLifecycle()
     val currentChatId by viewModel.currentChatId.collectAsStateWithLifecycle()
     val currentChat by viewModel.currentChat.collectAsStateWithLifecycle()
+    val sessionStatisticsState = sessionStatisticsViewModel?.uiState?.collectAsStateWithLifecycle()?.value
 
     // Persistence & Custom Prompts
     val defaultPersistenceEnabled by viewModel.defaultPersistenceEnabled.collectAsStateWithLifecycle()
@@ -336,6 +362,10 @@ fun MainApp(
     val handsFreeVoiceState by viewModel.handsFreeVoiceState.collectAsStateWithLifecycle()
     val currentDraftText by viewModel.currentDraftText.collectAsStateWithLifecycle()
     val wakeRetriggerEventId by viewModel.wakeRetriggerEventId.collectAsStateWithLifecycle()
+    val pendingWakeQuery by viewModel.pendingWakeQuery.collectAsStateWithLifecycle()
+    val pendingVoiceNavigationRoute by viewModel.pendingVoiceNavigationRoute.collectAsStateWithLifecycle()
+    val isNavigatingViaVoiceCommand by viewModel.isNavigatingViaVoiceCommand.collectAsStateWithLifecycle()
+    val hasWindowFocus by viewModel.hasWindowFocus.collectAsStateWithLifecycle()
 
     // Active stopwatch/timer tracking state for listed chats
     val activeTimerChatIds by viewModel.activeTimerChatIds.collectAsStateWithLifecycle()
@@ -366,10 +396,26 @@ fun MainApp(
     val currentUserEmail by viewModel.currentUserEmail.collectAsStateWithLifecycle()
     val currentUserDisplayName by viewModel.currentUserDisplayName.collectAsStateWithLifecycle()
     val cloudSyncStatus by viewModel.cloudSyncStatus.collectAsStateWithLifecycle()
+    val favoriteChatIds by viewModel.favoriteChatIds.collectAsStateWithLifecycle()
+    val pinnedChatIds by viewModel.pinnedChatIds.collectAsStateWithLifecycle()
+    val contextualRoutingEnabled by viewModel.contextualRoutingEnabled.collectAsStateWithLifecycle()
+    val promptFavoritesOnWake by viewModel.promptFavoritesOnWake.collectAsStateWithLifecycle()
+    val lastHygieneResetMessage by viewModel.lastHygieneResetMessage.collectAsStateWithLifecycle()
+    val wakeConversationSummary by viewModel.wakeConversationSummary.collectAsStateWithLifecycle()
+    val showWakeFavoritesPickerDialog by viewModel.showWakeFavoritesPickerDialog.collectAsStateWithLifecycle()
+    val lastDetectedWakePhrase by viewModel.lastDetectedWakePhrase.collectAsStateWithLifecycle()
     val authScope = rememberCoroutineScope()
 
     var showControlSheet by remember { mutableStateOf(false) }
     var showPowerConfirmDialog by remember { mutableStateOf(false) }
+    var showBackupExportDialog by remember { mutableStateOf(false) }
+
+    LaunchedEffect(incomingOpenBackupExport) {
+        if (incomingOpenBackupExport) {
+            showBackupExportDialog = true
+            onClearIncomingOpenBackupExport()
+        }
+    }
 
     val exportDocLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("text/plain")
@@ -387,12 +433,90 @@ fun MainApp(
         }
     }
 
+    val saveJsonBackupLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri: Uri? ->
+        if (uri != null) {
+            sessionStatisticsViewModel?.saveBackupToDocumentUri(
+                context = context,
+                targetUri = uri,
+                format = com.example.util.BackupExportFormat.JSON
+            ) { _, msg ->
+                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    val saveCsvBackupLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("text/csv")
+    ) { uri: Uri? ->
+        if (uri != null) {
+            sessionStatisticsViewModel?.saveBackupToDocumentUri(
+                context = context,
+                targetUri = uri,
+                format = com.example.util.BackupExportFormat.CSV
+            ) { _, msg ->
+                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    val launchSaveBackupToDevice: (com.example.util.BackupExportFormat) -> Unit = { format ->
+        val suggestedName = com.example.util.ChatLogJsonExporter.buildSuggestedBackupFileName(format)
+        when (format) {
+            com.example.util.BackupExportFormat.JSON -> saveJsonBackupLauncher.launch(suggestedName)
+            com.example.util.BackupExportFormat.CSV -> saveCsvBackupLauncher.launch(suggestedName)
+        }
+    }
+
+    val launchShareBackupFile: (com.example.util.BackupExportFormat) -> Unit = { format ->
+        if (sessionStatisticsViewModel != null) {
+            sessionStatisticsViewModel.shareBackup(
+                context = context,
+                format = format,
+                onError = { err ->
+                    Toast.makeText(context, "Export failed: $err", Toast.LENGTH_SHORT).show()
+                }
+            )
+        } else {
+            viewModel.shareChatInteractionLogsAsJson(
+                context = context,
+                chatId = null,
+                onError = { err ->
+                    Toast.makeText(context, "Export failed: $err", Toast.LENGTH_SHORT).show()
+                }
+            )
+        }
+    }
+
+    val handleCreateNewWakeTargetChat: (String, String) -> Unit = { newTitle, wakePhrase ->
+        val newChat = com.example.data.model.ChatSession(
+            title = newTitle.trim().ifBlank { "Voice Assistant Chat" },
+            wakeWord = wakePhrase.trim().ifBlank { "Hey Gemini" },
+            isDefaultWakeChat = true,
+            isPersistent = defaultPersistenceEnabled
+        )
+        viewModel.saveChat(newChat) { newId ->
+            viewModel.setDefaultWakeChat(newId)
+            Toast.makeText(
+                context,
+                "Created \"${newChat.title}\" as active wake target chat!",
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
+
     val isListening by viewModel.wakeWordManager.isListening.collectAsStateWithLifecycle()
+    val isSpeechRecognizerListening by viewModel.isSpeechRecognizerListening.collectAsStateWithLifecycle()
+    val speechRecognizerRmsDb by viewModel.speechRecognizerRmsDb.collectAsStateWithLifecycle()
     val isChatTurnRecording by viewModel.isChatTurnRecording.collectAsStateWithLifecycle()
+    val isInChatDictationActive by viewModel.isInChatDictationActive.collectAsStateWithLifecycle()
     val isUserVoiceTurn by viewModel.isUserVoiceTurn.collectAsStateWithLifecycle()
-    val audioRmsDb by viewModel.wakeWordManager.audioRmsDb.collectAsStateWithLifecycle()
+    val rawAudioRmsDb by viewModel.wakeWordManager.audioRmsDb.collectAsStateWithLifecycle()
+    val audioRmsDb = maxOf(rawAudioRmsDb, speechRecognizerRmsDb)
     val statusMessage by viewModel.wakeWordManager.statusMessage.collectAsStateWithLifecycle()
     val lastHeardText by viewModel.wakeWordManager.lastHeardText.collectAsStateWithLifecycle()
+    val attachedImageUri by viewModel.attachedImageUri.collectAsStateWithLifecycle()
     val stagedAttachment by viewModel.stagedAttachment.collectAsStateWithLifecycle()
     val stagedImageUri by viewModel.stagedImageUri.collectAsStateWithLifecycle()
     val stagedImageInfo by viewModel.stagedImageInfo.collectAsStateWithLifecycle()
@@ -401,9 +525,13 @@ fun MainApp(
     val voiceEngineMode by viewModel.voiceEngineMode.collectAsStateWithLifecycle()
     val selectedVoice by viewModel.selectedVoice.collectAsStateWithLifecycle()
     val wakeWordLogs by viewModel.wakeWordLogs.collectAsStateWithLifecycle()
+    val speechTraceHistory by viewModel.speechTraceHistory.collectAsStateWithLifecycle()
+    val coordinatorMutexSnapshot by viewModel.coordinatorMutexSnapshot.collectAsStateWithLifecycle()
+    val hasExclusiveAudioFocus by viewModel.hasExclusiveAudioFocus.collectAsStateWithLifecycle()
     val importProgressState by viewModel.importProgressState.collectAsStateWithLifecycle()
     val activeKeyType by viewModel.activeKeyType.collectAsStateWithLifecycle()
-    val isAudioSpeaking = isOrionVoicePlaying
+    val isTtsSpeaking by viewModel.isTtsSpeaking.collectAsStateWithLifecycle()
+    val isAudioSpeaking = isOrionVoicePlaying || isTtsSpeaking
     val masterVolume by viewModel.masterVolume.collectAsStateWithLifecycle()
     val autoStopLimitSec by viewModel.autoStopLimitSec.collectAsStateWithLifecycle()
     val networkState by viewModel.networkState.collectAsStateWithLifecycle()
@@ -415,8 +543,8 @@ fun MainApp(
     val requiresAudioPermission by viewModel.requiresAudioPermission.collectAsStateWithLifecycle()
 
     var showCreateEditDialog by remember { mutableStateOf(false) }
+    var showSelectCategoryDialog by remember { mutableStateOf(false) }
     var chatToEdit by remember { mutableStateOf<ChatSession?>(null) }
-    var showWakeSettingsDialog by remember { mutableStateOf(false) }
     var showBufferBridgeDialog by remember { mutableStateOf(false) }
     var showImportDialog by remember { mutableStateOf(false) }
     var importInitialText by remember { mutableStateOf("") }
@@ -519,16 +647,10 @@ fun MainApp(
     fun executePendingAction(action: PendingAudioAction) {
         when (action) {
             is PendingAudioAction.ToggleListening -> {
-                if (isListening) {
-                    viewModel.stopContinuousWakeWordListening()
-                } else {
-                    viewModel.startContinuousWakeWordListening()
-                    Toast.makeText(context, "Microphone enabled. Listening for wake word!", Toast.LENGTH_SHORT).show()
-                }
+                viewModel.toggleHandsFreeVoice()
             }
             is PendingAudioAction.StartVoiceRecording -> {
-                viewModel.startVoiceRecording()
-                Toast.makeText(context, "Recording voice message...", Toast.LENGTH_SHORT).show()
+                viewModel.toggleInChatDictation()
             }
             is PendingAudioAction.RecordWakeSnippet -> {
                 viewModel.startRecordingWakeSnippet(action.chatId, action.slotIndex)
@@ -653,27 +775,143 @@ fun MainApp(
         }
     }
 
-    // Auto-start listening on launch only when Hands-Free mode is active, not in sleep mode, and no user voice turn is active
-    LaunchedEffect(hasAudioPermission, isHandsFreeActive, isUserVoiceTurn, isSleepMode) {
-        if (hasAudioPermission &&
-            isHandsFreeActive &&
-            !isSleepMode &&
-            !isListening &&
-            !isUserVoiceTurn &&
-            !viewModel.wakeWordManager.isTransitioningAudioState
-        ) {
-            viewModel.startContinuousWakeWordListening()
+    val navController = rememberNavController()
+
+    fun isValidNavHostRoute(route: String?): Boolean {
+        val clean = route?.trim() ?: return false
+        if (clean.isEmpty()) return false
+        return when {
+            clean == "home" || clean == "history" || clean == "settings" || clean == "studio" || clean == "diagnostics" -> true
+            clean.startsWith("chat/") -> {
+                val id = clean.removePrefix("chat/").toLongOrNull()
+                id != null && id > 0L
+            }
+            else -> false
         }
     }
 
-    // Automatically open or refresh the corresponding chat screen when a wake word triggers a chat turn
-    LaunchedEffect(wakeRetriggerEventId, triggerBanner, currentChatId) {
+    fun navigateNavControllerSafely(targetRoute: String) {
+        if (!isValidNavHostRoute(targetRoute)) return
+        runCatching {
+            val currentRoute = navController.currentDestination?.route
+            if (currentRoute != null && currentRoute != targetRoute) {
+                navController.navigate(targetRoute) {
+                    launchSingleTop = true
+                    restoreState = true
+                }
+            }
+        }
+    }
+
+    val navigateInApp: (Screen) -> Unit = { targetScreen ->
+        onNavigate(targetScreen)
+        val targetRoute = when (targetScreen) {
+            is Screen.Home -> "home"
+            is Screen.History -> "history"
+            is Screen.Settings -> "settings"
+            is Screen.WakeWordStudio -> "studio"
+            is Screen.DiagnosticLog -> "diagnostics"
+            is Screen.Chat -> "chat/${targetScreen.chatId}"
+        }
+        navigateNavControllerSafely(targetRoute)
+    }
+
+    LaunchedEffect(currentScreen) {
+        val targetRoute = when (val s = currentScreen) {
+            is Screen.Home -> "home"
+            is Screen.History -> "history"
+            is Screen.Settings -> "settings"
+            is Screen.WakeWordStudio -> "studio"
+            is Screen.DiagnosticLog -> "diagnostics"
+            is Screen.Chat -> "chat/${s.chatId}"
+        }
+        navigateNavControllerSafely(targetRoute)
+    }
+
+    // Consume voice navigation commands (such as "open history", "show history", "voice history")
+    // purely in-memory via root NavController without ever calling startActivity() or external intents.
+    LaunchedEffect(pendingVoiceNavigationRoute) {
+        val route = pendingVoiceNavigationRoute
+        if (route != null) {
+            // Immediately clear/consume pending state so it cannot re-trigger on resume or recomposition
+            viewModel.consumePendingVoiceNavigationRoute()
+            val cleanRoute = route.trim()
+            if (isValidNavHostRoute(cleanRoute)) {
+                showControlSheet = false
+                when {
+                    cleanRoute == "history" -> {
+                        onNavigate(Screen.History)
+                        runCatching {
+                            if (navController.currentDestination != null) {
+                                navController.navigate("history") {
+                                    launchSingleTop = true
+                                    restoreState = true
+                                }
+                            }
+                        }
+                    }
+                    cleanRoute == "home" -> navigateInApp(Screen.Home)
+                    cleanRoute == "settings" -> navigateInApp(Screen.Settings)
+                    cleanRoute == "studio" -> navigateInApp(Screen.WakeWordStudio)
+                    cleanRoute == "diagnostics" -> navigateInApp(Screen.DiagnosticLog)
+                    cleanRoute.startsWith("chat/") -> {
+                        val chatId = cleanRoute.removePrefix("chat/").toLongOrNull()
+                        if (chatId != null && chatId > 0L) {
+                            viewModel.selectChat(chatId)
+                            navigateInApp(Screen.Chat(chatId))
+                        }
+                    }
+                }
+                androidx.compose.runtime.withFrameNanos { }
+                viewModel.onVoiceNavigationDestinationCommitted(cleanRoute)
+            }
+        }
+    }
+
+    // Root-level continuous voice radar lifecycle across ALL screens (Home, ChatDetail, Settings, History, Studio).
+    // Respects hasWindowFocus and isNavigatingViaVoiceCommand so the microphone never loops in the background or mid-transition.
+    // Note: Do NOT include transient isListening / isSpeechRecognizerListening in LaunchedEffect keys,
+    // as brief recognizer restarts between utterances must not trigger recomposition restart loops.
+    LaunchedEffect(
+        hasWindowFocus,
+        hasAudioPermission,
+        isHandsFreeActive,
+        isUserVoiceTurn,
+        isSleepMode,
+        isNavigatingViaVoiceCommand,
+        currentScreen
+    ) {
+        if (hasWindowFocus &&
+            hasAudioPermission &&
+            isHandsFreeActive &&
+            !isSleepMode &&
+            !isListening &&
+            !isSpeechRecognizerListening &&
+            !viewModel.speechRecognitionCoordinator.hasPendingRestart &&
+            !isUserVoiceTurn &&
+            !isNavigatingViaVoiceCommand &&
+            !viewModel.wakeWordManager.isTransitioningAudioState
+        ) {
+            WakeWordVoiceService.startServiceSafely(
+                context = context,
+                action = WakeWordVoiceService.ACTION_START_VOICE_SERVICE
+            )
+            viewModel.startContinuousWakeWordListening(userInitiated = false)
+        }
+    }
+
+    // Automatically open or refresh the corresponding chat screen via Compose NavController ("chat/$targetId")
+    // when a wake word triggers a chat turn—never calling startActivity() or external intents.
+    LaunchedEffect(wakeRetriggerEventId, triggerBanner, currentChatId, pendingWakeQuery) {
         val targetId = currentChatId
-        if (triggerBanner != null && targetId != null && targetId > 0L) {
-            showWakeSettingsDialog = false
+        if (!isNavigatingViaVoiceCommand &&
+            (triggerBanner != null || !pendingWakeQuery.isNullOrBlank()) &&
+            targetId != null &&
+            targetId > 0L
+        ) {
             showControlSheet = false
             if (currentScreen != Screen.Chat(targetId)) {
-                onNavigate(Screen.Chat(targetId))
+                navigateInApp(Screen.Chat(targetId))
             }
         }
     }
@@ -688,6 +926,22 @@ fun MainApp(
                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
         }
+    }
+
+    // Hidden/synced Compose NavHost backing in-app route navigation ("home", "chat/{chatId}", "settings", "history", "studio")
+    NavHost(
+        navController = navController,
+        startDestination = "home"
+    ) {
+        composable("home") {}
+        composable("history") {}
+        composable("settings") {}
+        composable("studio") {}
+        composable("diagnostics") {}
+        composable(
+            route = "chat/{chatId}",
+            arguments = listOf(navArgument("chatId") { type = NavType.LongType })
+        ) {}
     }
 
     if (currentScreen is Screen.Chat && currentChat != null) {
@@ -705,7 +959,7 @@ fun MainApp(
                 hasMoreOlderMessages = hasMoreOlderMessages,
                 isLoadingOlder = isLoadingOlder,
                 customPrompts = customPrompts,
-                onBack = { onNavigate(Screen.Home) },
+                onBack = { navigateInApp(Screen.Home) },
                 onSendMessage = { text ->
                     viewModel.sendMessage(currentChat!!.id, text)
                 },
@@ -740,7 +994,7 @@ fun MainApp(
                 sendTrigger = sendTrigger,
                 heartbeatTrigger = heartbeatTrigger,
                 draftSpokenText = currentDraftText,
-                onToggleHandsFree = { viewModel.toggleHandsFreeMode() },
+                onToggleHandsFree = { handleToggleListening() },
                 stagedImageUri = stagedImageUri,
                 stagedImageInfo = stagedImageInfo,
                 screenshotBanner = screenshotBanner,
@@ -772,9 +1026,14 @@ fun MainApp(
                 },
                 onPowerExit = { showPowerConfirmDialog = true },
                 isVoiceRecording = isChatTurnRecording,
+                isInChatDictationActive = isInChatDictationActive,
                 audioRmsDb = audioRmsDb,
+                viewModel = viewModel,
                 onStartVoiceRecording = {
-                    requestAudioPermissionAndExecute(PendingAudioAction.StartVoiceRecording)
+                    viewModel.toggleInChatDictation()
+                },
+                onToggleInChatDictation = {
+                    viewModel.toggleInChatDictation()
                 },
                 onSendVoiceRecording = { promptText ->
                     viewModel.finishVoiceRecordingAndSend(promptText)
@@ -814,107 +1073,187 @@ fun MainApp(
                 isSleepMode = isSleepMode,
                 sleepModeReason = sleepModeReason,
                 onEnterSleepMode = { viewModel.enterSleepMode("Manual sleep mode enabled") },
-                onExitSleepMode = { viewModel.exitSleepModeAndResumeListening() }
+                onExitSleepMode = { viewModel.exitSleepModeAndResumeListening() },
+                onShareLogsAsJson = {
+                    if (sessionStatisticsViewModel != null) {
+                        sessionStatisticsViewModel.shareBackup(
+                            context = context,
+                            format = com.example.util.BackupExportFormat.JSON,
+                            chatId = currentChat?.id,
+                            onError = { err ->
+                                Toast.makeText(context, "JSON export failed: $err", Toast.LENGTH_SHORT).show()
+                            }
+                        )
+                    } else {
+                        viewModel.shareChatInteractionLogsAsJson(
+                            context = context,
+                            chatId = currentChat?.id,
+                            onError = { err ->
+                                Toast.makeText(context, "JSON export failed: $err", Toast.LENGTH_SHORT).show()
+                            }
+                        )
+                    }
+                },
+                onShareLogsAsCsv = {
+                    sessionStatisticsViewModel?.shareBackup(
+                        context = context,
+                        format = com.example.util.BackupExportFormat.CSV,
+                        chatId = currentChat?.id,
+                        onError = { err ->
+                            Toast.makeText(context, "CSV export failed: $err", Toast.LENGTH_SHORT).show()
+                        }
+                    )
+                },
+                isWakeWordListening = isListening || isSpeechRecognizerListening,
+                lastHeardText = lastHeardText,
+                wakeConversationSummary = wakeConversationSummary?.takeIf { it.chatId == currentChat!!.id },
+                onGenerateWakeAiSummary = { viewModel.generateWakeAiSummary() },
+                onOpenWakeFavoritesPicker = { viewModel.openWakeFavoritesPicker() },
+                onDismissWakeSummary = { viewModel.dismissWakeConversationSummary() },
+                isFavoriteChat = favoriteChatIds.contains(currentChat!!.id),
+                onToggleFavoriteChat = {
+                    val isNowFav = viewModel.toggleFavoriteChat(currentChat!!.id)
+                    Toast.makeText(
+                        context,
+                        if (isNowFav) "Added \"${currentChat!!.title}\" to Favorite Wake Chats" else "Removed from Favorite Wake Chats",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                },
+                isPinnedChat = currentChat!!.isPinned || pinnedChatIds.contains(currentChat!!.id),
+                onTogglePinChat = {
+                    val isNowPinned = viewModel.togglePinnedChat(currentChat!!.id)
+                    Toast.makeText(
+                        context,
+                        if (isNowPinned) "Pinned \"${currentChat!!.title}\" to top of list" else "Unpinned \"${currentChat!!.title}\"",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                },
+                chatCategory = viewModel.chatCategoryMap.collectAsStateWithLifecycle().value[currentChat!!.id],
+                chatTags = viewModel.chatTagsMap.collectAsStateWithLifecycle().value[currentChat!!.id].orEmpty(),
+                allChats = chats,
+                chatCategoryMap = viewModel.chatCategoryMap.collectAsStateWithLifecycle().value,
+                messageCategoryMap = viewModel.messageCategoryMap.collectAsStateWithLifecycle().value,
+                onSelectChatFromCategoryBar = { targetId ->
+                    viewModel.selectChat(targetId)
+                    onNavigate(Screen.Chat(targetId))
+                },
+                onReassignChatCategory = { newCategory ->
+                    viewModel.reassignChatAndMessagesCategory(currentChat!!.id, newCategory)
+                    Toast.makeText(
+                        context,
+                        "Assigned \"${currentChat!!.title}\" & messages to $newCategory",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                },
+                attachedImageUri = attachedImageUri,
+                onStageAttachedImageUri = { uri ->
+                    viewModel.stageAttachedImageUri(uri, context)
+                },
+                onClearAttachedImage = {
+                    viewModel.clearAttachedImage()
+                },
+                onCheckAndStageClipboardImage = {
+                    viewModel.checkAndStageClipboardImage(context)
+                },
+                onUpdateChatAppearance = { paletteId, backgroundStyle, primaryHex ->
+                    viewModel.updateChatAppearance(
+                        chatId = currentChat!!.id,
+                        colorPaletteId = paletteId,
+                        backgroundStyle = backgroundStyle,
+                        themeColorHex = primaryHex
+                    )
+                },
+                pendingWakeQuery = pendingWakeQuery,
+                onConsumePendingWakeQuery = { viewModel.consumePendingWakeQuery() }
             )
         }
     } else if (currentScreen is Screen.WakeWordStudio) {
-        val activeRecordingSlot by viewModel.activeRecordingSlot.collectAsStateWithLifecycle()
-        val recordingDurationMs by viewModel.snippetRecordingDurationMs.collectAsStateWithLifecycle()
-        val currentlyPlayingPath by viewModel.currentlyPlayingSnippetPath.collectAsStateWithLifecycle()
-        val isSnippetPaused by viewModel.isSnippetPaused.collectAsStateWithLifecycle()
-        val configuredWakeWords by wakeWordViewModel.chatWakeWords.collectAsStateWithLifecycle()
-
-        WakeWordRecordingScreen(
+        MainWakeWordStudioSection(
+            viewModel = viewModel,
+            wakeWordViewModel = wakeWordViewModel,
             chats = chats,
-            configuredWakeWords = configuredWakeWords,
-            allSamples = allWakeWordSamples,
-            isListening = isListening,
-            isSleepMode = isSleepMode,
-            sleepModeReason = sleepModeReason,
-            backgroundCueOnlyMode = backgroundCueOnlyMode,
-            wakeReadyVisualCue = wakeReadyVisualCue,
-            audioRmsDb = audioRmsDb,
-            statusMessage = statusMessage,
-            wakeWordSensitivity = wakeWordSensitivity,
-            activeRecordingSlot = activeRecordingSlot,
-            recordingDurationMs = recordingDurationMs,
-            currentlyPlayingPath = currentlyPlayingPath,
-            isSnippetPaused = isSnippetPaused,
-            getSamplesFlow = { chatId -> viewModel.getSamplesForChatFlow(chatId) },
-            onBack = { onNavigate(Screen.Home) },
+            onNavigate = navigateInApp,
             onToggleListening = { handleToggleListening() },
-            onEnterSleepMode = { viewModel.enterSleepMode("Manual sleep mode enabled") },
-            onExitSleepMode = { viewModel.exitSleepModeAndResumeListening() },
-            onToggleBackgroundCueOnlyMode = { viewModel.setBackgroundCueOnlyMode(it) },
-            onDismissWakeReadyCue = { viewModel.dismissWakeReadyVisualCue() },
-            onSetWakeWordSensitivity = { viewModel.setWakeWordSensitivity(it) },
-            onSetWakeWordSensitivityLevel = { viewModel.setWakeWordSensitivityLevel(it) },
-            onStartSnippetRecording = { chatId, slotIndex ->
+            onRequestRecordSnippet = { chatId, slotIndex ->
                 requestAudioPermissionAndExecute(PendingAudioAction.RecordWakeSnippet(chatId, slotIndex))
-            },
-            onStopSnippetRecording = { chatId, slotIndex ->
-                viewModel.stopRecordingWakeSnippet(chatId, slotIndex)
-            },
-            onPlaySnippetPreview = { filePath -> viewModel.playSnippetPreview(filePath) },
-            onPauseSnippetPreview = { viewModel.pauseSnippetPreview() },
-            onResumeSnippetPreview = { viewModel.resumeSnippetPreview() },
-            onDeleteSampleById = { chatId, sampleId, filePath ->
-                viewModel.deleteWakeWordSampleById(chatId, sampleId, filePath)
-            },
-            onDeleteAllSamplesForChat = { chatId -> viewModel.deleteWakeWordSamples(chatId) },
-            onSaveCustomWakeWordWithSamples = { phrase, chatId, sensitivity ->
-                viewModel.saveCustomWakeWordWithSamples(phrase, chatId, sensitivity)
-            },
-            onSaveCustomWakeWordWithNewChat = { phrase, newChatTitle, sensitivity ->
-                viewModel.addCustomWakeWordWithNewChat(
-                    phrase = phrase,
-                    newChatTitle = newChatTitle,
-                    sensitivity = sensitivity
-                )
-            },
-            onSetIndividualWakeWordSensitivity = { id, sensitivity ->
-                viewModel.setIndividualWakeWordSensitivity(id, sensitivity)
-            },
-            onReassignWakeWordToChat = { wakeWordId, targetChatId ->
-                viewModel.reassignWakeWordToChat(wakeWordId, targetChatId)
-            },
-            onToggleWakeWordEnabled = { id, enabled -> wakeWordViewModel.toggleWakeWordEnabled(id, enabled) },
-            onDeleteWakeWord = { id -> wakeWordViewModel.removeWakeWordById(id) },
-            onTriggerWakeWordAndOpenChat = { wakeWord ->
-                val targetId = wakeWord.effectiveTargetChatId
-                    ?: chats.firstOrNull { it.wakeWord.equals(wakeWord.phrase, ignoreCase = true) }?.id
-                    ?: chats.firstOrNull()?.id
-                    ?: 0L
-                if (targetId > 0L) {
-                    viewModel.selectChat(targetId)
-                    viewModel.wakeWordManager.onKeywordHit(
-                        keyword = wakeWord.phrase,
-                        initialQuery = "",
-                        targetChatIdOverride = targetId
-                    )
-                    onNavigate(Screen.Chat(targetId))
-                }
-            },
-            onOpenChat = { chatId ->
-                viewModel.selectChat(chatId)
-                onNavigate(Screen.Chat(chatId))
             }
         )
     } else if (currentScreen is Screen.History) {
         HistoryScreen(
             messages = allMessages,
             chats = chats,
-            onBack = { onNavigate(Screen.Home) },
+            onBack = { navigateInApp(Screen.Home) },
             onDeleteMessage = { viewModel.deleteMessage(it) },
             onClearCorruptedHistory = {
                 val count = viewModel.clearCorruptedHistory()
                 Toast.makeText(context, "History verified & repaired ($count entries cleaned).", Toast.LENGTH_SHORT).show()
             },
+            onShareLogsAsJson = {
+                launchShareBackupFile(com.example.util.BackupExportFormat.JSON)
+            },
+            onShareLogsAsCsv = {
+                launchShareBackupFile(com.example.util.BackupExportFormat.CSV)
+            },
+            onOpenBackupExportDialog = { showBackupExportDialog = true },
+            sessionStatisticsState = sessionStatisticsState,
+            onSelectStatisticsDateRange = { range ->
+                sessionStatisticsViewModel?.selectDateRange(range)
+            },
             voiceCommands = voiceCommandHistory,
             onDeleteVoiceCommand = { id -> viewModel.deleteVoiceCommandEntry(id) },
             onNavigateToChat = { chatId ->
-                viewModel.selectChat(chatId)
-                onNavigate(Screen.Chat(chatId))
+                if (chatId > 0L) {
+                    viewModel.selectChat(chatId)
+                    navigateInApp(Screen.Chat(chatId))
+                }
+            }
+        )
+    } else if (currentScreen is Screen.DiagnosticLog) {
+        DiagnosticLogScreen(
+            speechTraceHistory = speechTraceHistory,
+            wakeWordLogs = wakeWordLogs,
+            mutexSnapshot = coordinatorMutexSnapshot,
+            isSpeechRecognizerListening = isSpeechRecognizerListening,
+            isWakeManagerListening = isListening,
+            hasWindowFocus = hasWindowFocus,
+            isSleepMode = isSleepMode,
+            isNavigatingViaVoiceCommand = isNavigatingViaVoiceCommand,
+            hasExclusiveAudioFocus = hasExclusiveAudioFocus,
+            isHandsFreeActive = isHandsFreeActive,
+            audioRmsDb = audioRmsDb,
+            statusMessage = statusMessage,
+            lastHeardText = lastHeardText,
+            activeWakePhrase = chats.firstOrNull { it.isDefaultWakeChat }?.wakeWord ?: "Hey Gemini",
+            onBack = { navigateInApp(Screen.Home) },
+            onToggleRecognizer = {
+                viewModel.toggleDiagnosticSpeechRecognizer()
+            },
+            onSimulateWakeEvent = { phrase ->
+                viewModel.simulateDiagnosticWakeWordEvent(wakePhrase = phrase)
+            },
+            onResetMutexLocks = {
+                viewModel.resetDiagnosticAudioMutexLocks()
+            },
+            onClearLogs = {
+                viewModel.clearDiagnosticTraceLogs()
+            },
+            onBuildDiagnosticReport = {
+                viewModel.buildDiagnosticReportText()
+            }
+        )
+    } else if (currentScreen is Screen.Settings) {
+        MainSettingsSection(
+            viewModel = viewModel,
+            wakeWordViewModel = wakeWordViewModel,
+            chats = chats,
+            sessionStatisticsState = sessionStatisticsState,
+            onNavigate = navigateInApp,
+            onToggleListening = { handleToggleListening() },
+            onCreateNewWakeTargetChat = handleCreateNewWakeTargetChat,
+            onSaveBackupToDevice = launchSaveBackupToDevice,
+            onShareBackupFile = launchShareBackupFile,
+            onRequestRecordSnippet = { chatId, slotIndex ->
+                requestAudioPermissionAndExecute(PendingAudioAction.RecordWakeSnippet(chatId, slotIndex))
             }
         )
     } else {
@@ -940,15 +1279,17 @@ fun MainApp(
             onToggleDefaultPersistence = { enabled -> viewModel.setDefaultPersistenceEnabled(enabled) },
             onTogglePreserveCacheAcrossSessions = { enabled -> viewModel.setPreserveCacheAcrossSessions(enabled) },
             onToggleHeartbeatPingOnlyMode = { enabled -> viewModel.setHeartbeatPingOnlyMode(enabled) },
-            onToggleHandsFree = { enabled -> viewModel.toggleHandsFreeMode(enabled) },
+            onToggleHandsFree = { enabled -> viewModel.toggleHandsFreeVoice(enabled) },
             onToggleListening = { handleToggleListening() },
             onSelectChat = { id ->
-                viewModel.selectChat(id)
-                onNavigate(Screen.Chat(id))
+                if (id > 0L) {
+                    viewModel.selectChat(id)
+                    navigateInApp(Screen.Chat(id))
+                }
             },
             onCreateChat = {
                 chatToEdit = null
-                showCreateEditDialog = true
+                showSelectCategoryDialog = true
             },
             onEditChat = { chat ->
                 chatToEdit = chat
@@ -956,8 +1297,10 @@ fun MainApp(
             },
             onDeleteChat = { id -> viewModel.deleteChat(id) },
             onSetDefaultWakeChat = { id -> viewModel.setDefaultWakeChat(id) },
-            onOpenWakeSettings = { showWakeSettingsDialog = true },
-            onNavigateToWakeWordStudio = { onNavigate(Screen.WakeWordStudio) },
+            onOpenWakeSettings = { navigateInApp(Screen.Settings) },
+            onNavigateToSettings = { navigateInApp(Screen.Settings) },
+            onNavigateToWakeWordStudio = { navigateInApp(Screen.WakeWordStudio) },
+            onNavigateToDiagnostics = { navigateInApp(Screen.DiagnosticLog) },
             isSleepMode = isSleepMode,
             sleepModeReason = sleepModeReason,
             wakeReadyVisualCue = wakeReadyVisualCue,
@@ -979,7 +1322,7 @@ fun MainApp(
             onCancelImport = { viewModel.cancelChatImport() },
             appTheme = appTheme,
             onSetAppTheme = { viewModel.setAppTheme(it) },
-            onNavigateToHistory = { onNavigate(Screen.History) },
+            onNavigateToHistory = { navigateInApp(Screen.History) },
             onOpenControlSheet = { showControlSheet = true },
             onPowerExit = { showPowerConfirmDialog = true },
             networkState = networkState,
@@ -1025,7 +1368,87 @@ fun MainApp(
                     viewModel.onAuthStateChanged(null)
                     Toast.makeText(context, "Signed out of Google Account.", Toast.LENGTH_SHORT).show()
                 }
-            }
+            },
+            sessionStatisticsState = sessionStatisticsState,
+            onSelectStatisticsDateRange = { range ->
+                sessionStatisticsViewModel?.selectDateRange(range)
+            },
+            onQuickShareCsv = {
+                launchShareBackupFile(com.example.util.BackupExportFormat.CSV)
+            },
+            favoriteChatIds = favoriteChatIds,
+            onToggleFavoriteChat = { chatId ->
+                val isNowFav = viewModel.toggleFavoriteChat(chatId)
+                Toast.makeText(
+                    context,
+                    if (isNowFav) "Added to Favorite Wake Chats" else "Removed from Favorite Wake Chats",
+                    Toast.LENGTH_SHORT
+                ).show()
+            },
+            pinnedChatIds = pinnedChatIds,
+            onTogglePinChat = { chatId ->
+                val isNowPinned = viewModel.togglePinnedChat(chatId)
+                Toast.makeText(
+                    context,
+                    if (isNowPinned) "Pinned chat to top of list" else "Unpinned chat",
+                    Toast.LENGTH_SHORT
+                ).show()
+            },
+            onOpenWakeFavoritesPicker = {
+                viewModel.openWakeFavoritesPicker()
+            },
+            onCreateNewWakeTargetChat = handleCreateNewWakeTargetChat,
+            onOpenBackupExportDialog = { showBackupExportDialog = true },
+            chatCategoryMap = viewModel.chatCategoryMap.collectAsStateWithLifecycle().value,
+            chatTagsMap = viewModel.chatTagsMap.collectAsStateWithLifecycle().value,
+            availableCategories = viewModel.availableCategories.collectAsStateWithLifecycle().value,
+            onOpenBufferBridgeDialog = { showBufferBridgeDialog = true },
+            onOpenSyncCompanionRelay = { showBufferBridgeDialog = true },
+            onClearChatThread = { chatId -> viewModel.clearChatHistory(chatId) }
+        )
+    }
+
+    if (showWakeFavoritesPickerDialog) {
+        val categoryMap = viewModel.chatCategoryMap.collectAsStateWithLifecycle().value
+        val matchedCategory = viewModel.matchedWakeCategory.collectAsStateWithLifecycle().value
+        val rankedSuggestions = remember(chats, favoriteChatIds) {
+            com.example.voice.WakeWordRoutingEngine.rankContextualChatSuggestions(
+                chats = chats,
+                favoriteChatIds = favoriteChatIds
+            )
+        }
+        val fallbackChat = remember(chats) {
+            com.example.voice.WakeWordRoutingEngine.resolveFallbackChat(chats)
+        }
+        val favoriteChatsList = remember(chats, favoriteChatIds) {
+            chats.filter { favoriteChatIds.contains(it.id) }
+        }
+        com.example.ui.components.WakeFavoritesAndSuggestionsDialog(
+            spokenWakePhrase = lastDetectedWakePhrase,
+            favoriteChats = favoriteChatsList,
+            contextualSuggestions = rankedSuggestions,
+            fallbackChat = fallbackChat,
+            favoriteChatIds = favoriteChatIds,
+            onSelectChat = { selectedChat ->
+                viewModel.dismissWakeFavoritesPicker()
+                viewModel.selectChat(selectedChat.id)
+                onNavigate(Screen.Chat(selectedChat.id))
+            },
+            onToggleFavorite = { chatId ->
+                viewModel.toggleFavoriteChat(chatId)
+            },
+            onDismiss = { viewModel.dismissWakeFavoritesPicker() },
+            chatCategoryMap = categoryMap,
+            initialCategoryFilter = matchedCategory
+        )
+    }
+
+    if (showBackupExportDialog) {
+        com.example.ui.components.BackupExportDialog(
+            statisticsState = sessionStatisticsState,
+            onDismiss = { showBackupExportDialog = false },
+            onSaveToDevice = launchSaveBackupToDevice,
+            onShareFile = launchShareBackupFile
         )
     }
 
@@ -1139,6 +1562,24 @@ fun MainApp(
         )
     }
 
+    if (showSelectCategoryDialog) {
+        val availableCats by viewModel.availableCategories.collectAsStateWithLifecycle()
+        val pendingCat by viewModel.pendingNewChatCategory.collectAsStateWithLifecycle()
+        com.example.ui.components.SelectCategoryDialog(
+            availableCategories = availableCats,
+            initialCategory = pendingCat ?: "Work",
+            onCategoryConfirmed = { chosenCategory ->
+                viewModel.setPendingNewChatCategory(chosenCategory)
+                showSelectCategoryDialog = false
+                chatToEdit = null
+                showCreateEditDialog = true
+            },
+            onDismiss = {
+                showSelectCategoryDialog = false
+            }
+        )
+    }
+
     if (showCreateEditDialog) {
         val enrollmentRecording by viewModel.isWakeWordEnrollmentRecording.collectAsStateWithLifecycle()
         val activeRecordingSlot by viewModel.activeRecordingSlot.collectAsStateWithLifecycle()
@@ -1148,6 +1589,7 @@ fun MainApp(
         val playbackPositionMs by viewModel.snippetPlaybackPositionMs.collectAsStateWithLifecycle()
         val playbackDurationMs by viewModel.snippetPlaybackDurationMs.collectAsStateWithLifecycle()
         val isSnippetPaused by viewModel.isSnippetPaused.collectAsStateWithLifecycle()
+        val pendingCategory by viewModel.pendingNewChatCategory.collectAsStateWithLifecycle()
 
         CreateEditChatDialog(
             initialChat = chatToEdit,
@@ -1201,9 +1643,22 @@ fun MainApp(
             onSave = { savedChat ->
                 viewModel.cancelRecordingWakeSnippet()
                 viewModel.stopSnippetPreview()
-                viewModel.saveChat(savedChat) { newId ->
+                viewModel.saveChat(savedChat) { _ ->
                     showCreateEditDialog = false
                     chatToEdit = null
+                }
+            },
+            initialCategory = chatToEdit?.let { viewModel.chatCategoryMap.collectAsStateWithLifecycle().value[it.id] }
+                ?: pendingCategory
+                ?: "Work",
+            initialTags = chatToEdit?.let { viewModel.chatTagsMap.collectAsStateWithLifecycle().value[it.id] }.orEmpty(),
+            availableCategories = viewModel.availableCategories.collectAsStateWithLifecycle().value,
+            onSaveCategoryAndTags = { selectedCat, selectedTags ->
+                val targetId = chatToEdit?.id ?: 0L
+                if (targetId > 0L) {
+                    viewModel.setChatCategoryAndTags(targetId, selectedCat, selectedTags)
+                } else {
+                    viewModel.setPendingNewChatCategory(selectedCat, selectedTags)
                 }
             }
         )
@@ -1214,117 +1669,6 @@ fun MainApp(
             onDismiss = {
                 showPermissionRationaleDialog = false
                 pendingAudioAction = null
-            }
-        )
-    }
-
-    if (showWakeSettingsDialog) {
-        val activeRecordingSlot by viewModel.activeRecordingSlot.collectAsStateWithLifecycle()
-        val recordingDurationMs by viewModel.snippetRecordingDurationMs.collectAsStateWithLifecycle()
-        val currentlyPlayingPath by viewModel.currentlyPlayingSnippetPath.collectAsStateWithLifecycle()
-        val isSnippetPaused by viewModel.isSnippetPaused.collectAsStateWithLifecycle()
-        val configuredWakeWords by wakeWordViewModel.chatWakeWords.collectAsStateWithLifecycle()
-
-        WakeWordSettingsDialog(
-            chats = chats,
-            isListening = isListening,
-            audioRmsDb = audioRmsDb,
-            statusMessage = statusMessage,
-            lastHeardText = lastHeardText,
-            dictateTrigger = dictateTrigger,
-            sendTrigger = sendTrigger,
-            heartbeatTrigger = heartbeatTrigger,
-            isHandsFreeActive = isHandsFreeActive,
-            voiceEngineMode = voiceEngineMode,
-            isOrionVoicePlaying = isOrionVoicePlaying,
-            selectedVoice = selectedVoice,
-            masterVolume = masterVolume,
-            autoStopLimitSec = autoStopLimitSec,
-            wakeWordSensitivity = wakeWordSensitivity,
-            activeRecordingSlot = activeRecordingSlot,
-            recordingDurationMs = recordingDurationMs,
-            currentlyPlayingPath = currentlyPlayingPath,
-            isSnippetPaused = isSnippetPaused,
-            wakeWordLogs = wakeWordLogs,
-            configuredWakeWords = configuredWakeWords,
-            onAddCustomWakeWord = { chatId, phrase ->
-                viewModel.addCustomWakeWord(chatId = chatId, phrase = phrase)
-            },
-            onAddCustomWakeWordWithSensitivity = { chatId, phrase, sensitivity ->
-                viewModel.addCustomWakeWord(chatId = chatId, phrase = phrase, sensitivity = sensitivity)
-            },
-            onAddCustomWakeWordWithNewChat = { phrase, newChatTitle, sensitivity ->
-                viewModel.addCustomWakeWordWithNewChat(
-                    phrase = phrase,
-                    newChatTitle = newChatTitle,
-                    sensitivity = sensitivity
-                )
-            },
-            onUpdateConfiguredWakeWord = { id, phrase -> wakeWordViewModel.updateWakeWordPhrase(id, phrase) },
-            onToggleConfiguredWakeWord = { id, enabled -> wakeWordViewModel.toggleWakeWordEnabled(id, enabled) },
-            onDeleteConfiguredWakeWord = { id -> wakeWordViewModel.removeWakeWordById(id) },
-            onSetIndividualWakeWordSensitivity = { id, sensitivity ->
-                viewModel.setIndividualWakeWordSensitivity(id, sensitivity)
-            },
-            onReassignWakeWordToChat = { wakeWordId, targetChatId ->
-                viewModel.reassignWakeWordToChat(wakeWordId, targetChatId)
-            },
-            onReassignWakeWordToNewChat = { wakeWordId, newChatTitle ->
-                viewModel.reassignWakeWordToNewChat(wakeWordId, newChatTitle)
-            },
-            onOpenChat = { chatId ->
-                showWakeSettingsDialog = false
-                viewModel.selectChat(chatId)
-                onNavigate(Screen.Chat(chatId))
-            },
-            getSamplesFlow = { chatId -> viewModel.getSamplesForChatFlow(chatId) },
-            onStartSnippetRecording = { chatId, slotIndex ->
-                requestAudioPermissionAndExecute(PendingAudioAction.RecordWakeSnippet(chatId, slotIndex))
-            },
-            onStopSnippetRecording = { chatId, slotIndex ->
-                viewModel.stopRecordingWakeSnippet(chatId, slotIndex)
-            },
-            onPlaySnippetPreview = { filePath -> viewModel.playSnippetPreview(filePath) },
-            onPauseSnippetPreview = { viewModel.pauseSnippetPreview() },
-            onResumeSnippetPreview = { viewModel.resumeSnippetPreview() },
-            onStopSnippetPreview = { viewModel.stopSnippetPreview() },
-            onDeleteSampleById = { chatId, sampleId, filePath ->
-                viewModel.deleteWakeWordSampleById(chatId, sampleId, filePath)
-            },
-            onDeleteSamples = { chatId -> viewModel.deleteWakeWordSamples(chatId) },
-            onSetWakeWordSensitivity = { viewModel.setWakeWordSensitivity(it) },
-            onSetVoiceEngineMode = { viewModel.setVoiceEngineMode(it) },
-            onSelectVoice = { viewModel.selectVoice(it) },
-            onPlayOrionTestSample = { viewModel.testVoice(selectedVoice) },
-            onSetMasterVolume = { viewModel.setMasterVolume(it) },
-            onSetAutoStopLimit = { viewModel.setAutoStopLimit(it) },
-            onUpdateDictateTrigger = { viewModel.setDictateTrigger(it) },
-            onUpdateSendTrigger = { viewModel.setSendTrigger(it) },
-            onUpdateHeartbeatTrigger = { viewModel.setHeartbeatTrigger(it) },
-            onToggleHandsFree = { viewModel.toggleHandsFreeMode(it) },
-            onResetTriggers = { viewModel.resetTriggersToDefaults() },
-            onManualHeartbeatPing = { viewModel.triggerManualHeartbeatPing() },
-            onToggleListening = { handleToggleListening() },
-            notifyActiveChatReplies = notifyActiveChatReplies,
-            permissionsResetCount = permissionsResetCount,
-            onToggleNotifyActiveChatReplies = { enabled ->
-                viewModel.setNotifyActiveChatReplies(enabled)
-                if (enabled && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                    }
-                }
-            },
-            onResetPermissions = { handleResetPermissions() },
-            onRequestRequiredPermissions = { launchRequiredPermissionsRequest() },
-            onOpenWakeWordStudio = {
-                showWakeSettingsDialog = false
-                onNavigate(Screen.WakeWordStudio)
-            },
-            onDismiss = {
-                viewModel.cancelRecordingWakeSnippet()
-                viewModel.stopSnippetPreview()
-                showWakeSettingsDialog = false
             }
         )
     }
@@ -1483,7 +1827,7 @@ fun MainApp(
                 onSetAppTheme = { viewModel.setAppTheme(it) },
                 isHandsFreeActive = isHandsFreeActive,
                 handsFreeVoiceState = handsFreeVoiceState,
-                onToggleHandsFree = { viewModel.toggleHandsFreeMode(it) },
+                onToggleHandsFree = { viewModel.toggleHandsFreeVoice(it) },
                 wakeWordSensitivity = wakeWordSensitivity,
                 onSetWakeWordSensitivity = { viewModel.setWakeWordSensitivity(it) },
                 stopwatchSeconds = openChatTimerSeconds,
@@ -1500,6 +1844,14 @@ fun MainApp(
                     showControlSheet = false
                     showBufferBridgeDialog = true
                 },
+                onOpenSettingsScreen = {
+                    showControlSheet = false
+                    navigateInApp(Screen.Settings)
+                },
+                onOpenDiagnosticLog = {
+                    showControlSheet = false
+                    navigateInApp(Screen.DiagnosticLog)
+                },
                 onEditChat = {
                     showControlSheet = false
                     chatToEdit = currentChat
@@ -1510,6 +1862,38 @@ fun MainApp(
                     val title = currentChat?.title ?: "chat"
                     val sanitized = title.replace("[^a-zA-Z0-9_-]".toRegex(), "_")
                     exportDocLauncher.launch("${sanitized}_export.txt")
+                },
+                onShareLogsAsJson = {
+                    showControlSheet = false
+                    if (sessionStatisticsViewModel != null) {
+                        sessionStatisticsViewModel.shareBackup(
+                            context = context,
+                            format = com.example.util.BackupExportFormat.JSON,
+                            chatId = currentChat?.id,
+                            onError = { err ->
+                                Toast.makeText(context, "JSON export failed: $err", Toast.LENGTH_SHORT).show()
+                            }
+                        )
+                    } else {
+                        viewModel.shareChatInteractionLogsAsJson(
+                            context = context,
+                            chatId = currentChat?.id,
+                            onError = { err ->
+                                Toast.makeText(context, "JSON export failed: $err", Toast.LENGTH_SHORT).show()
+                            }
+                        )
+                    }
+                },
+                onShareLogsAsCsv = {
+                    showControlSheet = false
+                    sessionStatisticsViewModel?.shareBackup(
+                        context = context,
+                        format = com.example.util.BackupExportFormat.CSV,
+                        chatId = currentChat?.id,
+                        onError = { err ->
+                            Toast.makeText(context, "CSV export failed: $err", Toast.LENGTH_SHORT).show()
+                        }
+                    )
                 },
                 notifyActiveChatReplies = notifyActiveChatReplies,
                 permissionsResetCount = permissionsResetCount,
@@ -1528,3 +1912,282 @@ fun MainApp(
         }
     }
 }
+
+@Composable
+private fun MainWakeWordStudioSection(
+    viewModel: MainViewModel,
+    wakeWordViewModel: WakeWordViewModel,
+    chats: List<ChatSession>,
+    onNavigate: (Screen) -> Unit,
+    onToggleListening: () -> Unit,
+    onRequestRecordSnippet: (Long, Int) -> Unit
+) {
+    val allWakeWordSamples by viewModel.allWakeWordSamples.collectAsStateWithLifecycle()
+    val isListening by viewModel.wakeWordManager.isListening.collectAsStateWithLifecycle()
+    val isSleepMode by viewModel.isSleepMode.collectAsStateWithLifecycle()
+    val sleepModeReason by viewModel.sleepModeReason.collectAsStateWithLifecycle()
+    val backgroundCueOnlyMode by viewModel.backgroundCueOnlyMode.collectAsStateWithLifecycle()
+    val wakeReadyVisualCue by viewModel.wakeReadyVisualCue.collectAsStateWithLifecycle()
+    val rawAudioRmsDb by viewModel.wakeWordManager.audioRmsDb.collectAsStateWithLifecycle()
+    val speechRecognizerRmsDb by viewModel.speechRecognizerRmsDb.collectAsStateWithLifecycle()
+    val audioRmsDb = maxOf(rawAudioRmsDb, speechRecognizerRmsDb)
+    val statusMessage by viewModel.wakeWordManager.statusMessage.collectAsStateWithLifecycle()
+    val wakeWordSensitivity by viewModel.wakeWordSensitivity.collectAsStateWithLifecycle()
+    val activeRecordingSlot by viewModel.activeRecordingSlot.collectAsStateWithLifecycle()
+    val recordingDurationMs by viewModel.snippetRecordingDurationMs.collectAsStateWithLifecycle()
+    val currentlyPlayingPath by viewModel.currentlyPlayingSnippetPath.collectAsStateWithLifecycle()
+    val isSnippetPaused by viewModel.isSnippetPaused.collectAsStateWithLifecycle()
+    val configuredWakeWords by wakeWordViewModel.chatWakeWords.collectAsStateWithLifecycle()
+
+    WakeWordRecordingScreen(
+        chats = chats,
+        configuredWakeWords = configuredWakeWords,
+        allSamples = allWakeWordSamples,
+        isListening = isListening,
+        isSleepMode = isSleepMode,
+        sleepModeReason = sleepModeReason,
+        backgroundCueOnlyMode = backgroundCueOnlyMode,
+        wakeReadyVisualCue = wakeReadyVisualCue,
+        audioRmsDb = audioRmsDb,
+        statusMessage = statusMessage,
+        wakeWordSensitivity = wakeWordSensitivity,
+        activeRecordingSlot = activeRecordingSlot,
+        recordingDurationMs = recordingDurationMs,
+        currentlyPlayingPath = currentlyPlayingPath,
+        isSnippetPaused = isSnippetPaused,
+        getSamplesFlow = { chatId -> viewModel.getSamplesForChatFlow(chatId) },
+        onBack = { onNavigate(Screen.Home) },
+        onToggleListening = onToggleListening,
+        onEnterSleepMode = { viewModel.enterSleepMode("Manual sleep mode enabled") },
+        onExitSleepMode = { viewModel.exitSleepModeAndResumeListening() },
+        onToggleBackgroundCueOnlyMode = { viewModel.setBackgroundCueOnlyMode(it) },
+        onDismissWakeReadyCue = { viewModel.dismissWakeReadyVisualCue() },
+        onSetWakeWordSensitivity = { viewModel.setWakeWordSensitivity(it) },
+        onSetWakeWordSensitivityLevel = { viewModel.setWakeWordSensitivityLevel(it) },
+        onStartSnippetRecording = onRequestRecordSnippet,
+        onStopSnippetRecording = { chatId, slotIndex ->
+            viewModel.stopRecordingWakeSnippet(chatId, slotIndex)
+        },
+        onPlaySnippetPreview = { filePath -> viewModel.playSnippetPreview(filePath) },
+        onPauseSnippetPreview = { viewModel.pauseSnippetPreview() },
+        onResumeSnippetPreview = { viewModel.resumeSnippetPreview() },
+        onDeleteSampleById = { chatId, sampleId, filePath ->
+            viewModel.deleteWakeWordSampleById(chatId, sampleId, filePath)
+        },
+        onDeleteAllSamplesForChat = { chatId -> viewModel.deleteWakeWordSamples(chatId) },
+        onSaveCustomWakeWordWithSamples = { phrase, chatId, sensitivity ->
+            viewModel.saveCustomWakeWordWithSamples(phrase, chatId, sensitivity)
+        },
+        onSaveCustomWakeWordWithNewChat = { phrase, newChatTitle, sensitivity ->
+            viewModel.addCustomWakeWordWithNewChat(
+                phrase = phrase,
+                newChatTitle = newChatTitle,
+                sensitivity = sensitivity
+            )
+        },
+        onSetIndividualWakeWordSensitivity = { id, sensitivity ->
+            viewModel.setIndividualWakeWordSensitivity(id, sensitivity)
+        },
+        onReassignWakeWordToChat = { wakeWordId, targetChatId ->
+            viewModel.reassignWakeWordToChat(wakeWordId, targetChatId)
+        },
+        onToggleWakeWordEnabled = { id, enabled -> wakeWordViewModel.toggleWakeWordEnabled(id, enabled) },
+        onDeleteWakeWord = { id -> wakeWordViewModel.removeWakeWordById(id) },
+        onTriggerWakeWordAndOpenChat = { wakeWord ->
+            val targetId = wakeWord.effectiveTargetChatId
+                ?: chats.firstOrNull { it.wakeWord.equals(wakeWord.phrase, ignoreCase = true) }?.id
+                ?: chats.firstOrNull()?.id
+                ?: 0L
+            if (targetId > 0L) {
+                viewModel.selectChat(targetId)
+                viewModel.wakeWordManager.onKeywordHit(
+                    keyword = wakeWord.phrase,
+                    initialQuery = "",
+                    targetChatIdOverride = targetId
+                )
+                onNavigate(Screen.Chat(targetId))
+            }
+        },
+        onOpenChat = { chatId ->
+            viewModel.selectChat(chatId)
+            onNavigate(Screen.Chat(chatId))
+        }
+    )
+}
+
+@Composable
+private fun MainSettingsSection(
+    viewModel: MainViewModel,
+    wakeWordViewModel: WakeWordViewModel,
+    chats: List<ChatSession>,
+    sessionStatisticsState: com.example.ui.SessionStatisticsUiState?,
+    onNavigate: (Screen) -> Unit,
+    onToggleListening: () -> Unit,
+    onCreateNewWakeTargetChat: (String, String) -> Unit,
+    onSaveBackupToDevice: (com.example.util.BackupExportFormat) -> Unit,
+    onShareBackupFile: (com.example.util.BackupExportFormat) -> Unit,
+    onRequestRecordSnippet: (Long, Int) -> Unit = { _, _ -> }
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val configuredWakeWords by wakeWordViewModel.chatWakeWords.collectAsStateWithLifecycle()
+    val wakeWordSensitivity by viewModel.wakeWordSensitivity.collectAsStateWithLifecycle()
+    val isListening by viewModel.wakeWordManager.isListening.collectAsStateWithLifecycle()
+    val isHandsFreeActive by viewModel.isHandsFreeActive.collectAsStateWithLifecycle()
+    val isSleepMode by viewModel.isSleepMode.collectAsStateWithLifecycle()
+    val sleepModeReason by viewModel.sleepModeReason.collectAsStateWithLifecycle()
+    val rawAudioRmsDb by viewModel.wakeWordManager.audioRmsDb.collectAsStateWithLifecycle()
+    val speechRecognizerRmsDb by viewModel.speechRecognizerRmsDb.collectAsStateWithLifecycle()
+    val audioRmsDb = maxOf(rawAudioRmsDb, speechRecognizerRmsDb)
+    val statusMessage by viewModel.wakeWordManager.statusMessage.collectAsStateWithLifecycle()
+    val lastHeardText by viewModel.wakeWordManager.lastHeardText.collectAsStateWithLifecycle()
+    val dictateTrigger by viewModel.dictateTrigger.collectAsStateWithLifecycle()
+    val sendTrigger by viewModel.sendTrigger.collectAsStateWithLifecycle()
+    val heartbeatTrigger by viewModel.heartbeatTrigger.collectAsStateWithLifecycle()
+    val relayServerState by viewModel.relayServerState.collectAsStateWithLifecycle()
+    val lastHygieneResetMessage by viewModel.lastHygieneResetMessage.collectAsStateWithLifecycle()
+    val favoriteChatIds by viewModel.favoriteChatIds.collectAsStateWithLifecycle()
+    val contextualRoutingEnabled by viewModel.contextualRoutingEnabled.collectAsStateWithLifecycle()
+    val promptFavoritesOnWake by viewModel.promptFavoritesOnWake.collectAsStateWithLifecycle()
+    val allWakeWordSamples by viewModel.allWakeWordSamples.collectAsStateWithLifecycle()
+    val activeRecordingSlot by viewModel.activeRecordingSlot.collectAsStateWithLifecycle()
+    val recordingDurationMs by viewModel.snippetRecordingDurationMs.collectAsStateWithLifecycle()
+    val currentlyPlayingPath by viewModel.currentlyPlayingSnippetPath.collectAsStateWithLifecycle()
+    val voiceEngineMode by viewModel.voiceEngineMode.collectAsStateWithLifecycle()
+    val masterVolume by viewModel.masterVolume.collectAsStateWithLifecycle()
+    val autoStopLimitSec by viewModel.autoStopLimitSec.collectAsStateWithLifecycle()
+    val defaultPersistenceEnabled by viewModel.defaultPersistenceEnabled.collectAsStateWithLifecycle()
+    val preserveCacheAcrossSessions by viewModel.preserveCacheAcrossSessions.collectAsStateWithLifecycle()
+    val bufferMetrics by viewModel.bufferMetrics.collectAsStateWithLifecycle()
+
+    SettingsScreen(
+        chats = chats,
+        configuredWakeWords = configuredWakeWords,
+        wakeWordSensitivity = wakeWordSensitivity,
+        isListening = isListening,
+        isHandsFreeActive = isHandsFreeActive,
+        isSleepMode = isSleepMode,
+        sleepModeReason = sleepModeReason,
+        audioRmsDb = audioRmsDb,
+        statusMessage = statusMessage,
+        lastHeardText = lastHeardText,
+        dictateTrigger = dictateTrigger,
+        sendTrigger = sendTrigger,
+        heartbeatTrigger = heartbeatTrigger,
+        onBack = { onNavigate(Screen.Home) },
+        onSetWakeWordSensitivity = { viewModel.setWakeWordSensitivity(it) },
+        onSetWakeWordSensitivityLevel = { viewModel.setWakeWordSensitivityLevel(it) },
+        onToggleListening = onToggleListening,
+        onToggleHandsFree = { viewModel.toggleHandsFreeVoice(it) },
+        onExitSleepMode = { viewModel.exitSleepModeAndResumeListening() },
+        onAddCustomWakeWord = { chatId, phrase, sensitivity ->
+            viewModel.addCustomWakeWord(chatId = chatId, phrase = phrase, sensitivity = sensitivity)
+        },
+        onAddCustomWakeWordWithNewChat = { phrase, newChatTitle, sensitivity ->
+            viewModel.addCustomWakeWordWithNewChat(
+                phrase = phrase,
+                newChatTitle = newChatTitle,
+                sensitivity = sensitivity
+            )
+        },
+        onUpdateWakeWordPhrase = { id, newPhrase ->
+            viewModel.updateConfiguredWakeWordPhrase(id, newPhrase)
+        },
+        onToggleWakeWordEnabled = { id, enabled ->
+            viewModel.toggleConfiguredWakeWord(id, enabled)
+        },
+        onDeleteWakeWord = { id ->
+            viewModel.deleteConfiguredWakeWord(id)
+        },
+        onSetIndividualWakeWordSensitivity = { id, sensitivity ->
+            viewModel.setIndividualWakeWordSensitivity(id, sensitivity)
+        },
+        onReassignWakeWordToChat = { wakeWordId, targetChatId ->
+            viewModel.reassignWakeWordToChat(wakeWordId, targetChatId)
+        },
+        onUpdateChatSessionWakeWord = { chatSession, newWakeWord ->
+            viewModel.saveChat(chatSession.copy(wakeWord = newWakeWord.trim()))
+        },
+        onUpdateDictateTrigger = { viewModel.setDictateTrigger(it) },
+        onUpdateSendTrigger = { viewModel.setSendTrigger(it) },
+        onUpdateHeartbeatTrigger = { viewModel.setHeartbeatTrigger(it) },
+        onResetTriggersToDefaults = { viewModel.resetTriggersToDefaults() },
+        onOpenWakeWordStudio = { onNavigate(Screen.WakeWordStudio) },
+        onOpenDiagnosticLog = { onNavigate(Screen.DiagnosticLog) },
+        onOpenChat = { chatId ->
+            viewModel.selectChat(chatId)
+            onNavigate(Screen.Chat(chatId))
+        },
+        onSetDefaultWakeChat = { chatId -> viewModel.setDefaultWakeChat(chatId) },
+        onCreateNewWakeTargetChat = onCreateNewWakeTargetChat,
+        sessionStatisticsState = sessionStatisticsState,
+        onSaveBackupToDevice = onSaveBackupToDevice,
+        onShareBackupFile = onShareBackupFile,
+        relayServerState = relayServerState,
+        onToggleRelayServer = { enabled -> viewModel.toggleRelayServer(enabled) },
+        onRotateRelaySessionToken = {
+            val newToken = viewModel.rotateRelaySessionToken()
+            Toast.makeText(context, "Session token rotated: ${newToken.take(8)}…", Toast.LENGTH_SHORT).show()
+        },
+        onCopyRelaySessionToken = { token ->
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = ClipData.newPlainText("Gemini Wake Relay Session Token", token)
+            clipboard.setPrimaryClip(clip)
+            Toast.makeText(context, "Relay session token copied to clipboard!", Toast.LENGTH_SHORT).show()
+        },
+        onForceResetAndClearHygiene = {
+            val report = viewModel.forceResetAndClearSystemHygiene()
+            Toast.makeText(context, report.summaryMessage, Toast.LENGTH_LONG).show()
+        },
+        lastHygieneResetMessage = lastHygieneResetMessage,
+        favoriteChatIds = favoriteChatIds,
+        onToggleFavoriteChat = { chatId -> viewModel.toggleFavoriteChat(chatId) },
+        contextualRoutingEnabled = contextualRoutingEnabled,
+        onToggleContextualRouting = { enabled -> viewModel.setContextualRoutingEnabled(enabled) },
+        promptFavoritesOnWake = promptFavoritesOnWake,
+        onTogglePromptFavoritesOnWake = { enabled -> viewModel.setPromptFavoritesOnWake(enabled) },
+        allSamples = allWakeWordSamples,
+        activeRecordingSlot = activeRecordingSlot,
+        recordingDurationMs = recordingDurationMs,
+        currentlyPlayingPath = currentlyPlayingPath,
+        onStartSnippetRecording = onRequestRecordSnippet,
+        onStopSnippetRecording = { chatId, slotIndex ->
+            viewModel.stopRecordingWakeSnippet(chatId, slotIndex)
+        },
+        onPlaySnippetPreview = { filePath -> viewModel.playSnippetPreview(filePath) },
+        onStopSnippetPreview = { viewModel.stopSnippetPreview() },
+        onDeleteSampleById = { chatId, sampleId, filePath ->
+            viewModel.deleteWakeWordSampleById(chatId, sampleId, filePath)
+        },
+        voiceEngineMode = voiceEngineMode,
+        onSetVoiceEngineMode = { viewModel.setVoiceEngineMode(it) },
+        masterVolume = masterVolume,
+        onSetMasterVolume = { viewModel.setMasterVolume(it) },
+        autoStopLimitSec = autoStopLimitSec,
+        onSetAutoStopLimit = { viewModel.setAutoStopLimit(it) },
+        defaultPersistenceEnabled = defaultPersistenceEnabled,
+        onToggleDefaultPersistence = { viewModel.setDefaultPersistenceEnabled(it) },
+        preserveCacheAcrossSessions = preserveCacheAcrossSessions,
+        onTogglePreserveCacheAcrossSessions = { viewModel.setPreserveCacheAcrossSessions(it) },
+        bufferMetrics = bufferMetrics,
+        onClearActiveInMemoryBuffer = {
+            viewModel.clearActiveInMemoryBuffer()
+            Toast.makeText(
+                context,
+                "Cleared active in-memory RAM window (hot messages reset to 0).",
+                Toast.LENGTH_SHORT
+            ).show()
+        },
+        onPurgeStagedDiskCache = {
+            val report = viewModel.forceResetAndClear()
+            Toast.makeText(
+                context,
+                report.summaryMessage,
+                Toast.LENGTH_SHORT
+            ).show()
+        },
+        onCreateGeneralLogFile = {
+            viewModel.createAndCopyGeneralLogFileToClipboard(context)
+        }
+    )
+}
+

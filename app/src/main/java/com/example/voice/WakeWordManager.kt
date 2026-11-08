@@ -20,6 +20,8 @@ import com.example.data.model.SyncStatus
 import com.example.data.model.TriggerType
 import com.example.data.model.WakeWord
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -28,6 +30,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.consumeAsFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.withContext
@@ -157,6 +160,9 @@ class WakeWordManager(
 
     fun setUserVoiceTurn(active: Boolean) {
         _isUserVoiceTurn.value = active
+        if (active) {
+            _engineState.value = WakeWordManagerState.ACTIVE_STREAMING
+        }
     }
 
     internal fun setTransitioningAudioStateForTest(transitioning: Boolean) {
@@ -280,6 +286,22 @@ class WakeWordManager(
     private val _sleepModeReason = MutableStateFlow("")
     val sleepModeReason: StateFlow<String> = _sleepModeReason.asStateFlow()
 
+    /**
+     * Guard flag indicating whether the microphone loop is intentionally paused (e.g., Sleep Mode).
+     * When `true`, the [AudioRecord.read] loop exits immediately and releases microphone hardware.
+     */
+    @Volatile
+    var isIntentionallyPaused: Boolean = false
+        private set
+
+    fun setIntentionallyPaused(paused: Boolean) {
+        isIntentionallyPaused = paused
+        if (paused) {
+            isRecording = false
+            releaseAudioRecordHardware(stopForegroundService = false)
+        }
+    }
+
     var onSleepModeChanged: ((Boolean, String) -> Unit)? = null
 
     /**
@@ -287,6 +309,7 @@ class WakeWordManager(
      * temporarily disabling wake word triggers and providing visual status feedback.
      */
     fun enterSleepMode(reason: String = "Sleep mode enabled — say \"Gemini, wake up\" or tap Wake Up") {
+        isIntentionallyPaused = true
         _isSleepMode.value = true
         _sleepModeReason.value = reason
         _handsFreeState.value = HandsFreeVoiceState.SLEEPING
@@ -300,6 +323,7 @@ class WakeWordManager(
      * Exits Sleep Mode (e.g., via UI tap or "Gemini, wake up" voice command) and resumes listening.
      */
     fun exitSleepMode(reason: String = "Listening resumed") {
+        isIntentionallyPaused = false
         _isSleepMode.value = false
         _sleepModeReason.value = ""
         WakeWordVoiceService.setSleepMode(false)
@@ -320,10 +344,12 @@ class WakeWordManager(
         val cleaned = transcript.trim()
         if (cleaned.isEmpty()) return false
         if (AudioCommandSanitizer.containsWakeUpCommand(cleaned)) {
+            AudioCommandSanitizer.playVoiceCommandHaptic(context, "Wake Up (\"$cleaned\")")
             exitSleepMode("Voice command: \"$cleaned\"")
             return true
         }
         if (AudioCommandSanitizer.containsSleepCommand(cleaned)) {
+            AudioCommandSanitizer.playVoiceCommandHaptic(context, "Sleep (\"$cleaned\")")
             enterSleepMode("Voice command: \"$cleaned\"")
             return true
         }
@@ -336,6 +362,10 @@ class WakeWordManager(
     private val _wakeWordLogs = MutableStateFlow<List<WakeWordLogEntry>>(emptyList())
     val wakeWordLogs: StateFlow<List<WakeWordLogEntry>> = _wakeWordLogs.asStateFlow()
 
+    fun clearWakeWordLogs() {
+        _wakeWordLogs.value = emptyList()
+    }
+
     private fun recordLog(wakeWord: String, chatTitle: String) {
         val entry = WakeWordLogEntry(
             wakeWord = wakeWord,
@@ -344,12 +374,59 @@ class WakeWordManager(
             chatTitle = chatTitle
         )
         _wakeWordLogs.update { current ->
-            listOf(entry) + current.take(4)
+            listOf(entry) + current.take(99)
+        }
+    }
+
+    /**
+     * Appends a structured SpeechRecognizer / voice navigation mutex diagnostic trace entry to both
+     * Android Logcat and the in-app copyable diagnostic log (`wakeWordLogs`).
+     */
+    fun appendDiagnosticTraceLog(stage: String, details: String) {
+        val thread = Thread.currentThread()
+        val isMain = android.os.Looper.myLooper() == android.os.Looper.getMainLooper()
+        val formattedDetails = "[${thread.name}#${thread.id} main=$isMain] $details"
+        Log.d(TAG, "[SR-Trace] $stage -> $formattedDetails")
+        val entry = WakeWordLogEntry(
+            wakeWord = "[SR-Trace] $stage",
+            timestamp = resolvePresentationTimestamp(System.currentTimeMillis()),
+            rmsDb = _audioRmsDb.value,
+            chatTitle = formattedDetails
+        )
+        _wakeWordLogs.update { current ->
+            listOf(entry) + current.take(99)
         }
     }
 
     private val _triggerEvents = MutableSharedFlow<WakeWordTriggerEvent>(extraBufferCapacity = 4)
     val triggerEvents: SharedFlow<WakeWordTriggerEvent> = _triggerEvents.asSharedFlow()
+
+    /**
+     * Thread-safe ring buffer (`Channel<ByteArray>` with `capacity = 32` and
+     * `BufferOverflow.DROP_OLDEST`) acting as the `AudioPipelineBuffer` for raw PCM chunks.
+     */
+    var audioPipelineBuffer: Channel<ByteArray> = Channel(
+        capacity = 32,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+        private set
+
+    /**
+     * Exposes [audioPipelineBuffer] as a [Flow] via [consumeAsFlow] for downstream components.
+     */
+    var audioPipelineFlow: Flow<ByteArray> = audioPipelineBuffer.consumeAsFlow()
+        private set
+
+    @Synchronized
+    fun resetAudioPipelineBuffer(): Flow<ByteArray> {
+        audioPipelineBuffer.close()
+        audioPipelineBuffer = Channel(
+            capacity = 32,
+            onBufferOverflow = BufferOverflow.DROP_OLDEST
+        )
+        audioPipelineFlow = audioPipelineBuffer.consumeAsFlow()
+        return audioPipelineFlow
+    }
 
     private val _audioFrameFlow = MutableSharedFlow<ByteArray>(extraBufferCapacity = 128)
     val audioFrameFlow: SharedFlow<ByteArray> = _audioFrameFlow.asSharedFlow()
@@ -657,6 +734,21 @@ class WakeWordManager(
     private var isSpeechActive = false
     @Volatile
     private var silenceStartTimestamp = 0L
+
+    /**
+     * Window focus guard: prevents `AudioRecord.startRecording()` from starting or looping
+     * in the background when `MainActivity` does not have active window focus.
+     */
+    @Volatile
+    var hasActiveWindowFocus: Boolean = true
+        private set
+
+    fun setWindowFocused(focused: Boolean) {
+        hasActiveWindowFocus = focused
+        if (!focused && (audioRecord != null || isRecording)) {
+            releaseAudioRecordHardware(stopForegroundService = false)
+        }
+    }
 
     var onAudioFrameCaptured: ((ByteArray) -> Unit)? = null
     var onAudioPacketCaptured: ((AudioPacket) -> Unit)? = null
@@ -1211,10 +1303,12 @@ class WakeWordManager(
         }
         val combinedCommandText = if (initialQuery.isNullOrBlank()) keyword else "$keyword $initialQuery"
         if (AudioCommandSanitizer.containsWakeUpCommand(combinedCommandText)) {
+            AudioCommandSanitizer.playVoiceCommandHaptic(context, "Wake Up (\"$combinedCommandText\")")
             exitSleepMode("Voice command: \"$combinedCommandText\"")
             return
         }
         if (AudioCommandSanitizer.containsSleepCommand(combinedCommandText)) {
+            AudioCommandSanitizer.playVoiceCommandHaptic(context, "Sleep (\"$combinedCommandText\")")
             enterSleepMode("Voice command: \"$combinedCommandText\"")
             return
         }
@@ -1223,6 +1317,7 @@ class WakeWordManager(
             return
         }
         Log.d(TAG, "KEYWORD HIT DETECTED: '$keyword' (initialQuery: '$initialQuery', targetChatIdOverride: $targetChatIdOverride)")
+        AudioCommandSanitizer.playWakeWordHaptic(context, keyword)
         val matchedConfigured = configuredWakeWords.firstOrNull {
             it.isEnabled &&
                 it.triggerType == WakeWord.TYPE_CHAT &&
@@ -1855,6 +1950,15 @@ class WakeWordManager(
         if (evaluateVoiceSleepOrWakeCommand(normalized)) {
             return null
         }
+        // Handle voice history navigation commands ("open history", "show history", "voice history")
+        // before matching "open" or chat wake words so they never trigger a chat wake event
+        val customWakeList = (
+            configuredWakeWords.map { it.phrase } +
+                activeChats.map { it.wakeWord }
+            ).filter { it.isNotBlank() }
+        if (AudioCommandSanitizer.isVoiceHistoryNavigationCommand(normalized, customWakeList)) {
+            return null
+        }
         if (_isSleepMode.value) {
             return null
         }
@@ -1918,8 +2022,20 @@ class WakeWordManager(
             }
         }
 
-        // 2. Check default wake phrases ("hey gemini", "ok gemini", "gemini", "jimmy", "open")
-        val defaultPhrases = listOf("hey gemini", "ok gemini", "okay gemini", "gemini", "jimmy", "open")
+        // 2. Check default wake phrases ("hey gemini", "hey jimmy", "ok gemini", "gemini", "jimmy", "open")
+        val defaultPhrases = listOf(
+            "hey gemini",
+            "ok gemini",
+            "okay gemini",
+            "hi gemini",
+            "hey jimmy",
+            "ok jimmy",
+            "okay jimmy",
+            "hi jimmy",
+            "gemini",
+            "jimmy",
+            "open"
+        )
         for (phrase in defaultPhrases) {
             val regex = Regex("""^${Regex.escape(phrase)}\b[\s,.:;!?-]*""", RegexOption.IGNORE_CASE)
             val match = regex.find(lower)
@@ -2251,6 +2367,20 @@ class WakeWordManager(
     }
 
     fun startContinuousListening(forceActiveTurn: Boolean = false) {
+        if (!hasActiveWindowFocus) {
+            Log.d(TAG, "Ignoring startContinuousListening: MainActivity does not have active window focus")
+            if (audioRecord != null || isRecording) {
+                releaseAudioRecordHardware(stopForegroundService = false)
+            }
+            return
+        }
+        if (isIntentionallyPaused || _isSleepMode.value) {
+            Log.d(TAG, "Ignoring startContinuousListening: isIntentionallyPaused=$isIntentionallyPaused, isSleepMode=${_isSleepMode.value}")
+            if (audioRecord != null || isRecording) {
+                releaseAudioRecordHardware(stopForegroundService = false)
+            }
+            return
+        }
         if (isTransitioningAudioState) {
             Log.d(TAG, "Ignoring startContinuousListening(forceActiveTurn=$forceActiveTurn) while isTransitioningAudioState=true")
             return
@@ -2379,10 +2509,15 @@ class WakeWordManager(
                     Log.d(TAG, "AudioRecord STARTING (16000Hz MONO PCM_16BIT $sourceLabel, bufferSize=$bufferSize)")
 
                     val startedSuccessfully = try {
-                        if (record.state == AudioRecord.STATE_INITIALIZED) {
-                            record.startRecording()
+                        if (!hasActiveWindowFocus) {
+                            Log.d(TAG, "Aborting AudioRecord.startRecording(): MainActivity lost window focus")
+                            false
+                        } else {
+                            if (record.state == AudioRecord.STATE_INITIALIZED) {
+                                record.startRecording()
+                            }
+                            record.recordingState == AudioRecord.RECORDSTATE_RECORDING
                         }
-                        record.recordingState == AudioRecord.RECORDSTATE_RECORDING
                     } catch (e: IllegalStateException) {
                         Log.e(TAG, "IllegalStateException calling AudioRecord.startRecording()", e)
                         false
@@ -2418,147 +2553,151 @@ class WakeWordManager(
                         var framesProcessed = 0
                         var initRetryAttempt = 0
 
-                        while (isRecording) {
-                            try {
-                                if (isExternalSpeechRecognizerActive || !hasRecordAudioPermission()) {
-                                    Log.d(TAG, "AudioRecord loop yielding (externalRecognizer=$isExternalSpeechRecognizerActive)")
-                                    isRecording = false
-                                    break
-                                }
+                        try {
+                            while (isRecording && !isIntentionallyPaused && !_isSleepMode.value) {
+                                try {
+                                    if (isIntentionallyPaused || _isSleepMode.value || isExternalSpeechRecognizerActive || !hasRecordAudioPermission()) {
+                                        Log.d(TAG, "AudioRecord loop yielding (paused=$isIntentionallyPaused, sleep=${_isSleepMode.value}, externalRecognizer=$isExternalSpeechRecognizerActive)")
+                                        isRecording = false
+                                        break
+                                    }
 
-                                val activeRecord = audioRecord
-                                val readSize = if (canReadFromAudioRecord(activeRecord)) {
-                                    try {
-                                        if (activeRecord!!.state == AudioRecord.STATE_INITIALIZED) {
-                                            activeRecord.read(shortBuffer, 0, shortBuffer.size)
-                                        } else {
+                                    val activeRecord = audioRecord
+                                    val readSize = if (canReadFromAudioRecord(activeRecord)) {
+                                        try {
+                                            if (activeRecord!!.state == AudioRecord.STATE_INITIALIZED) {
+                                                activeRecord.read(shortBuffer, 0, shortBuffer.size)
+                                            } else {
+                                                AudioRecord.ERROR_INVALID_OPERATION
+                                            }
+                                        } catch (e: IllegalStateException) {
+                                            Log.w(TAG, "IllegalStateException during AudioRecord.read: ${e.message}")
+                                            AudioRecord.ERROR_INVALID_OPERATION
+                                        } catch (readEx: Throwable) {
+                                            Log.w(TAG, "Transient AudioRecord.read exception: ${readEx.message}")
                                             AudioRecord.ERROR_INVALID_OPERATION
                                         }
-                                    } catch (e: IllegalStateException) {
-                                        Log.w(TAG, "IllegalStateException during AudioRecord.read: ${e.message}")
-                                        AudioRecord.ERROR_INVALID_OPERATION
-                                    } catch (readEx: Throwable) {
-                                        Log.w(TAG, "Transient AudioRecord.read exception: ${readEx.message}")
+                                    } else {
                                         AudioRecord.ERROR_INVALID_OPERATION
                                     }
-                                } else {
-                                    AudioRecord.ERROR_INVALID_OPERATION
-                                }
 
-                                if (readSize == 0) {
-                                    try {
-                                        Thread.sleep(20)
-                                    } catch (_: InterruptedException) {
-                                        break
+                                    if (readSize == 0) {
+                                        try {
+                                            Thread.sleep(20)
+                                        } catch (_: InterruptedException) {
+                                            break
+                                        }
+                                        continue
                                     }
-                                    continue
-                                }
 
-                                if (readSize < 0) {
-                                    // Exponential backoff & circuit-breaker abort on initialization/read failure (-20 / NO_INIT)
-                                    if (initRetryAttempt >= MAX_AUDIO_RECORD_INIT_RETRIES) {
-                                        Log.e(
+                                    if (readSize < 0) {
+                                        // Exponential backoff & circuit-breaker abort on initialization/read failure (-20 / NO_INIT)
+                                        if (initRetryAttempt >= MAX_AUDIO_RECORD_INIT_RETRIES) {
+                                            Log.e(
+                                                TAG,
+                                                "Aborting AudioRecord capture after $initRetryAttempt failed recovery attempts (readSize=$readSize)"
+                                            )
+                                            isRecording = false
+                                            _isListening.value = false
+                                            _statusMessage.value = "Microphone busy or unavailable — paused"
+                                            break
+                                        }
+
+                                        val backoffMs = calculateExponentialBackoffMs(initRetryAttempt)
+                                        initRetryAttempt++
+                                        Log.w(
                                             TAG,
-                                            "Aborting AudioRecord capture after $initRetryAttempt failed recovery attempts (readSize=$readSize)"
+                                            "AudioRecord read/init error ($readSize). Backing off for ${backoffMs}ms (attempt $initRetryAttempt/$MAX_AUDIO_RECORD_INIT_RETRIES)"
                                         )
-                                        isRecording = false
-                                        _isListening.value = false
-                                        _statusMessage.value = "Microphone busy or unavailable — paused"
-                                        break
-                                    }
+                                        try {
+                                            Thread.sleep(backoffMs)
+                                        } catch (_: InterruptedException) {
+                                            break
+                                        }
 
-                                    val backoffMs = calculateExponentialBackoffMs(initRetryAttempt)
-                                    initRetryAttempt++
-                                    Log.w(
-                                        TAG,
-                                        "AudioRecord read/init error ($readSize). Backing off for ${backoffMs}ms (attempt $initRetryAttempt/$MAX_AUDIO_RECORD_INIT_RETRIES)"
-                                    )
-                                    try {
-                                        Thread.sleep(backoffMs)
-                                    } catch (_: InterruptedException) {
-                                        break
-                                    }
+                                        if (!isRecording || isIntentionallyPaused || _isSleepMode.value || isExternalSpeechRecognizerActive || !hasRecordAudioPermission()) {
+                                            break
+                                        }
 
-                                    if (!isRecording || isExternalSpeechRecognizerActive || !hasRecordAudioPermission()) {
-                                        break
-                                    }
-
-                                    synchronized(audioRecordMutex) {
-                                        if (isRecording && !isExternalSpeechRecognizerActive && hasRecordAudioPermission()) {
-                                            val oldRecord = audioRecord
-                                            audioRecord = null
-                                            if (oldRecord != null) {
-                                                try {
-                                                    if (oldRecord.state == AudioRecord.STATE_INITIALIZED) {
-                                                        oldRecord.stop()
-                                                    }
-                                                } catch (_: Throwable) {}
-                                                try {
-                                                    oldRecord.release()
-                                                } catch (_: Throwable) {}
-                                            }
-                                            val (recreated, newSrc) = createInitializedAudioRecord(bufferSize)
-                                            if (recreated != null && recreated.state == AudioRecord.STATE_INITIALIZED) {
-                                                val restarted = try {
-                                                    if (recreated.state == AudioRecord.STATE_INITIALIZED) {
-                                                        recreated.startRecording()
-                                                    }
-                                                    recreated.recordingState == AudioRecord.RECORDSTATE_RECORDING
-                                                } catch (e: IllegalStateException) {
-                                                    Log.w(TAG, "IllegalStateException restarting AudioRecord: ${e.message}")
-                                                    false
-                                                } catch (_: Throwable) {
-                                                    false
-                                                }
-                                                if (restarted) {
-                                                    audioSource = newSrc
-                                                    audioRecord = recreated
-                                                    WakeWordVoiceService.registerOwnAudioSessionId(recreated.audioSessionId)
-                                                    initRetryAttempt = 0
-                                                    Log.w(TAG, "Recovered background AudioRecord stream (source=$newSrc)")
-                                                } else {
+                                        synchronized(audioRecordMutex) {
+                                            if (isRecording && !isIntentionallyPaused && !_isSleepMode.value && !isExternalSpeechRecognizerActive && hasRecordAudioPermission()) {
+                                                val oldRecord = audioRecord
+                                                audioRecord = null
+                                                if (oldRecord != null) {
                                                     try {
-                                                        recreated.release()
+                                                        if (oldRecord.state == AudioRecord.STATE_INITIALIZED) {
+                                                            oldRecord.stop()
+                                                        }
                                                     } catch (_: Throwable) {}
+                                                    try {
+                                                        oldRecord.release()
+                                                    } catch (_: Throwable) {}
+                                                }
+                                                val (recreated, newSrc) = createInitializedAudioRecord(bufferSize)
+                                                if (recreated != null && recreated.state == AudioRecord.STATE_INITIALIZED) {
+                                                    val restarted = try {
+                                                        if (recreated.state == AudioRecord.STATE_INITIALIZED) {
+                                                            recreated.startRecording()
+                                                        }
+                                                        recreated.recordingState == AudioRecord.RECORDSTATE_RECORDING
+                                                    } catch (e: IllegalStateException) {
+                                                        Log.w(TAG, "IllegalStateException restarting AudioRecord: ${e.message}")
+                                                        false
+                                                    } catch (_: Throwable) {
+                                                        false
+                                                    }
+                                                    if (restarted) {
+                                                        audioSource = newSrc
+                                                        audioRecord = recreated
+                                                        WakeWordVoiceService.registerOwnAudioSessionId(recreated.audioSessionId)
+                                                        initRetryAttempt = 0
+                                                        Log.w(TAG, "Recovered background AudioRecord stream (source=$newSrc)")
+                                                    } else {
+                                                        try {
+                                                            recreated.release()
+                                                        } catch (_: Throwable) {}
+                                                    }
                                                 }
                                             }
                                         }
+                                        continue
                                     }
-                                    continue
-                                }
 
-                                initRetryAttempt = 0
-                                val bytesRead = readSize * 2
+                                    initRetryAttempt = 0
+                                    val bytesRead = readSize * 2
 
-                                // 1. Feed Keyword Spotter / Wake Engine (Continuous in both modes)
-                                onKeywordProcessing?.invoke(shortBuffer.copyOf(readSize))
-
-                                // 2. Compute volume RMS dB and verify non-zero hardware amplitude (cycle to MIC if zeroed)
-                                val db = inspectAndLogAmplitude(shortBuffer, readSize)
-
-                                // Compute Zero-Crossing Rate (ZCR) for this frame
-                                var crossings = 0
-                                for (i in 1 until readSize) {
-                                    val prev = shortBuffer[i - 1].toInt()
-                                    val curr = shortBuffer[i].toInt()
-                                    if ((prev >= 0 && curr < 0) || (prev < 0 && curr >= 0)) {
-                                        crossings++
-                                    }
-                                }
-                                val frameZcr = (crossings.toFloat() / readSize.toFloat()) * 10f
-
-                                // Buffer non-silent passive speech frames in rolling wake pre-roll & snippet buffer
-                                if (_engineState.value == WakeWordManagerState.PASSIVE_LISTENING &&
-                                    !isShortBufferSilent(shortBuffer, readSize)
-                                ) {
-                                    val preRollBytes = ByteArray(bytesRead)
+                                    // Immediately push raw 16-bit PCM byte chunk into the non-blocking AudioPipelineBuffer (trySend)
+                                    val pcmChunkBytes = ByteArray(bytesRead)
                                     for (i in 0 until readSize) {
                                         val s = shortBuffer[i].toInt()
-                                        preRollBytes[i * 2] = (s and 0xFF).toByte()
-                                        preRollBytes[i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
+                                        pcmChunkBytes[i * 2] = (s and 0xFF).toByte()
+                                        pcmChunkBytes[i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
                                     }
-                                    appendPreRollPcm(preRollBytes, bytesRead)
-                                }
+                                    audioPipelineBuffer.trySend(pcmChunkBytes)
+
+                                    // 1. Feed Keyword Spotter / Wake Engine (Continuous in both modes)
+                                    onKeywordProcessing?.invoke(shortBuffer.copyOf(readSize))
+
+                                    // 2. Compute volume RMS dB and verify non-zero hardware amplitude (cycle to MIC if zeroed)
+                                    val db = inspectAndLogAmplitude(shortBuffer, readSize)
+
+                                    // Compute Zero-Crossing Rate (ZCR) for this frame
+                                    var crossings = 0
+                                    for (i in 1 until readSize) {
+                                        val prev = shortBuffer[i - 1].toInt()
+                                        val curr = shortBuffer[i].toInt()
+                                        if ((prev >= 0 && curr < 0) || (prev < 0 && curr >= 0)) {
+                                            crossings++
+                                        }
+                                    }
+                                    val frameZcr = (crossings.toFloat() / readSize.toFloat()) * 10f
+
+                                    // Buffer non-silent passive speech frames in rolling wake pre-roll & snippet buffer
+                                    if (_engineState.value == WakeWordManagerState.PASSIVE_LISTENING &&
+                                        !isShortBufferSilent(shortBuffer, readSize)
+                                    ) {
+                                        appendPreRollPcm(pcmChunkBytes, bytesRead)
+                                    }
 
                                 // Update sliding RMS & ZCR buffers for acoustic template matching
                                 slidingRmsBuffer[slidingPtr] = db
@@ -2668,6 +2807,11 @@ class WakeWordManager(
                                 } catch (_: InterruptedException) {
                                     break
                                 }
+                            }
+                            }
+                        } finally {
+                            if (isIntentionallyPaused || _isSleepMode.value) {
+                                releaseAudioRecordHardware(stopForegroundService = false)
                             }
                         }
                         Log.d(TAG, "AudioRecord THREAD EXITING")

@@ -91,7 +91,10 @@ fun FloatingMovableChatInput(
     stagedAttachment: AttachmentPayload? = null,
     onTakePhoto: () -> Unit = {},
     onBrowseFiles: () -> Unit = {},
+    isInChatDictationActive: Boolean = false,
+    viewModel: com.example.ui.MainViewModel? = null,
     onStartVoiceRecording: () -> Unit = {},
+    onToggleInChatDictation: () -> Unit = onStartVoiceRecording,
     onTextInputFocusChanged: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
@@ -293,18 +296,27 @@ fun FloatingMovableChatInput(
                         Spacer(modifier = Modifier.width(6.dp))
 
                         IconButton(
-                            onClick = onStartVoiceRecording,
+                            onClick = {
+                                if (viewModel != null) {
+                                    viewModel.toggleInChatDictation()
+                                } else {
+                                    onToggleInChatDictation()
+                                }
+                            },
                             enabled = !isGenerating && !isSending,
                             modifier = Modifier
                                 .size(38.dp)
                                 .clip(CircleShape)
-                                .background(MaterialTheme.colorScheme.surfaceVariant)
+                                .background(
+                                    if (isInChatDictationActive) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.surfaceVariant
+                                )
                                 .testTag("floating_voice_button")
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Mic,
-                                contentDescription = "Voice input",
-                                tint = MaterialTheme.colorScheme.primary,
+                                contentDescription = if (isInChatDictationActive) "Stop in-chat voice dictation" else "In-chat voice dictation",
+                                tint = if (isInChatDictationActive) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary,
                                 modifier = Modifier.size(18.dp)
                             )
                         }

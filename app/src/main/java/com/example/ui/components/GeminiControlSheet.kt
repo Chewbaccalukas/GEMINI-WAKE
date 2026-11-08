@@ -36,8 +36,12 @@ fun GeminiControlSheet(
     onResetStopwatch: () -> Unit,
     onOpenCoupler: () -> Unit,
     onOpenBufferBridge: () -> Unit,
+    onOpenSettingsScreen: () -> Unit = {},
+    onOpenDiagnosticLog: () -> Unit = {},
     onEditChat: () -> Unit,
     onExportConversation: () -> Unit,
+    onShareLogsAsJson: () -> Unit = {},
+    onShareLogsAsCsv: () -> Unit = {},
     notifyActiveChatReplies: Boolean = true,
     onToggleNotifyActiveChatReplies: (Boolean) -> Unit = {},
     permissionsResetCount: Int = 0,
@@ -131,11 +135,33 @@ fun GeminiControlSheet(
                     .fillMaxWidth()
                     .testTag("control_sheet_sensitivity_slider")
             )
+            Spacer(modifier = Modifier.height(8.dp))
+            FilledTonalButton(
+                onClick = onOpenSettingsScreen,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("control_sheet_open_settings_button")
+            ) {
+                Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Customize Wake Words & Sensitivity")
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+            OutlinedButton(
+                onClick = onOpenDiagnosticLog,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("control_sheet_open_diagnostics_button")
+            ) {
+                Icon(Icons.Default.BugReport, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Open Speech & Mutex Diagnostic Log")
+            }
         }
 
-        // 2. Chat Export & Session Tools (if inside an active chat session)
-        if (chat != null) {
-            ControlSection(title = "Chat History & Export", icon = Icons.Default.Description) {
+        // 2. Chat Export & Session Tools
+        ControlSection(title = "Chat History & Export", icon = Icons.Default.Description) {
+            if (chat != null) {
                 Text(
                     text = "Active: \"${chat.title}\" (Trigger: \"${chat.wakeWord}\")",
                     style = MaterialTheme.typography.bodySmall,
@@ -143,11 +169,33 @@ fun GeminiControlSheet(
                 )
                 Spacer(modifier = Modifier.height(10.dp))
                 Button(
+                    onClick = onShareLogsAsJson,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("share_json_logs_button"),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                ) {
+                    Icon(Icons.Default.Share, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Share Interaction Logs (.json)")
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                FilledTonalButton(
+                    onClick = onShareLogsAsCsv,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("share_csv_logs_button")
+                ) {
+                    Icon(Icons.Default.Share, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Share Chat & Usage Data (.csv)")
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedButton(
                     onClick = onExportConversation,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .testTag("export_conversation_button"),
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                        .testTag("export_conversation_button")
                 ) {
                     Icon(Icons.Default.Download, contentDescription = null)
                     Spacer(modifier = Modifier.width(8.dp))
@@ -163,6 +211,35 @@ fun GeminiControlSheet(
                     Icon(Icons.Default.Edit, contentDescription = null)
                     Spacer(modifier = Modifier.width(8.dp))
                     Text("Edit Chat & Wake Samples")
+                }
+            } else {
+                Text(
+                    text = "Export all Room database chat interaction logs and share via temporary FileProvider URI.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Button(
+                    onClick = onShareLogsAsJson,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("share_json_logs_button"),
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                ) {
+                    Icon(Icons.Default.Share, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Share Interaction Logs (.json)")
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                FilledTonalButton(
+                    onClick = onShareLogsAsCsv,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("share_csv_logs_button")
+                ) {
+                    Icon(Icons.Default.Share, contentDescription = null)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Share Chat & Usage Data (.csv)")
                 }
             }
         }

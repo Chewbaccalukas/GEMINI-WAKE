@@ -724,7 +724,9 @@ class HandsFreeVoiceCommandTest {
         viewModel.wakeWordManager.updateActiveChats(listOf(customChat))
         viewModel.selectChat(99L)
 
-        // Simulate user already in ChatDetailScreen with an unsent partial draft in the buffer
+        // Simulate user in ChatDetailScreen with active in-chat dictation holding an unsent partial draft
+        viewModel.toggleInChatDictation()
+        assertTrue(viewModel.isInChatDictationActive.value)
         val partialBundle = android.os.Bundle().apply {
             putStringArrayList(
                 android.speech.SpeechRecognizer.RESULTS_RECOGNITION,
@@ -732,11 +734,13 @@ class HandsFreeVoiceCommandTest {
             )
         }
         viewModel.wakeRecognitionListener.onPartialResults(partialBundle)
-        assertEquals("unfinished stale draft", viewModel.currentDraftText.value)
+        assertEquals("", viewModel.currentDraftText.value)
+        assertEquals("unfinished stale draft", viewModel.wakeWordManager.lastHeardText.value)
         val retriggerIdBefore = viewModel.wakeRetriggerEventId.value
 
         // Re-trigger wake word while already in ChatDetailScreen: must force state reset and clear stale draft
         viewModel.wakeWordManager.onKeywordHit("Hey Atlas", initialQuery = null)
+        assertFalse(viewModel.isInChatDictationActive.value)
         assertEquals("", viewModel.currentDraftText.value)
         assertEquals("", viewModel.wakeWordManager.lastHeardText.value)
         assertEquals(retriggerIdBefore + 1L, viewModel.wakeRetriggerEventId.value)
@@ -764,7 +768,19 @@ class HandsFreeVoiceCommandTest {
         viewModel.wakeWordManager.updateActiveChats(listOf(customChat))
         viewModel.selectChat(99L)
 
-        // 1. SpeechRecognizer onResults() automatically dispatches finalized spoken text to Gemini
+        // 0. When in-chat dictation is NOT active, partial speech transcripts must NOT leak into currentDraftText
+        val strayPartialBundle = android.os.Bundle().apply {
+            putStringArrayList(
+                android.speech.SpeechRecognizer.RESULTS_RECOGNITION,
+                arrayListOf("unrelated background speech")
+            )
+        }
+        viewModel.wakeRecognitionListener.onPartialResults(strayPartialBundle)
+        assertEquals("", viewModel.currentDraftText.value)
+
+        // 1. When in-chat dictation IS active, SpeechRecognizer onResults() automatically dispatches finalized spoken text to Gemini
+        viewModel.toggleInChatDictation()
+        assertTrue(viewModel.isInChatDictationActive.value)
         val finalBundle = android.os.Bundle().apply {
             putStringArrayList(
                 android.speech.SpeechRecognizer.RESULTS_RECOGNITION,
@@ -772,6 +788,7 @@ class HandsFreeVoiceCommandTest {
             )
         }
         viewModel.wakeRecognitionListener.onResults(finalBundle)
+        assertFalse(viewModel.isInChatDictationActive.value)
         assertEquals("Explain quantum tunneling", viewModel.lastDispatchedVoicePrompt.value)
         assertEquals("", viewModel.currentDraftText.value)
         assertEquals("", viewModel.wakeWordManager.lastHeardText.value)
@@ -780,7 +797,8 @@ class HandsFreeVoiceCommandTest {
         viewModel.selectChat(null)
         viewModel.selectChat(99L)
 
-        // 2. Manual Send button grabs partial transcription from buffer, stops SpeechRecognizer, and dispatches immediately
+        // 2. Manual Send button grabs partial transcription from buffer during active in-chat dictation, stops SpeechRecognizer, and dispatches immediately
+        viewModel.toggleInChatDictation()
         val partialBundle = android.os.Bundle().apply {
             putStringArrayList(
                 android.speech.SpeechRecognizer.RESULTS_RECOGNITION,
@@ -788,7 +806,8 @@ class HandsFreeVoiceCommandTest {
             )
         }
         viewModel.wakeRecognitionListener.onPartialResults(partialBundle)
-        assertEquals("Summarize the Schrödinger equation", viewModel.currentDraftText.value)
+        assertEquals("", viewModel.currentDraftText.value)
+        assertEquals("Summarize the Schrödinger equation", viewModel.wakeWordManager.lastHeardText.value)
 
         // Tapping manual Send with empty inputText argument still grabs the buffered partial transcription
         viewModel.sendMessage(chatId = 99L, text = "")
@@ -843,5 +862,401 @@ class HandsFreeVoiceCommandTest {
         org.robolectric.Shadows.shadowOf(app)
             .grantPermissions(android.Manifest.permission.RECORD_AUDIO)
         viewModel.cleanShutdown(null)
+    }
+
+    @Test
+    fun testLegacyAudioPlaceholdersBlockedAndTranscribedTextPersisted() = kotlinx.coroutines.runBlocking {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val db = androidx.room.Room.inMemoryDatabaseBuilder(
+            app,
+            com.example.data.db.AppDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val repo = com.example.data.repository.ChatRepository(db.chatDao(), db.messageDao())
+
+        val chatId = repo.saveChat(
+            com.example.data.model.ChatSession(
+                title = "Voice Transcript Chat",
+                wakeWord = "Hey Gemini",
+                systemInstruction = "Helpful assistant"
+            )
+        )
+        assertTrue(chatId > 0L)
+
+        // 1. Legacy audio placeholder or empty audio-only message must be rejected (-1L)
+        val placeholderMsg = com.example.data.model.ChatMessage(
+            chatId = chatId,
+            sender = "user",
+            content = "[Audio Turn]",
+            attachmentName = "turn_capture.pcm",
+            attachmentMimeType = "audio/pcm"
+        )
+        assertFalse(placeholderMsg.hasTranscribedText)
+        assertFalse(placeholderMsg.sanitizeForPersistence().hasPersistableContent)
+        val rejectedId = repo.insertMessage(placeholderMsg)
+        assertEquals(-1L, rejectedId)
+
+        // 2. Spoken message with actual transcribed text strips legacy audio attachment metadata and persists words
+        val transcribedMsg = com.example.data.model.ChatMessage(
+            chatId = chatId,
+            sender = "user",
+            content = "What is the weather in Tokyo tomorrow?",
+            triggeredByWakeWord = true,
+            attachmentName = "turn_capture.pcm",
+            attachmentMimeType = "audio/pcm"
+        )
+        val savedId = repo.insertMessage(transcribedMsg)
+        assertTrue(savedId > 0L)
+
+        val storedMessages = repo.getMessagesForChatSync(chatId)
+        assertEquals(1, storedMessages.size)
+        assertEquals("What is the weather in Tokyo tomorrow?", storedMessages.first().content)
+        assertEquals(null, storedMessages.first().attachmentName)
+        assertTrue(storedMessages.first().hasTranscribedText)
+
+        db.close()
+    }
+
+    @Test
+    fun testDuplicateMessageInsertIgnoredAndTotalVoiceCommandsIncremented() = kotlinx.coroutines.runBlocking {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val db = androidx.room.Room.inMemoryDatabaseBuilder(
+            app,
+            com.example.data.db.AppDatabase::class.java
+        ).allowMainThreadQueries().build()
+        val messageDao = db.messageDao()
+        val chatDao = db.chatDao()
+
+        val chatId = chatDao.insertChat(
+            com.example.data.model.ChatSession(
+                title = "Voice Counter Chat",
+                wakeWord = "Hey Gemini",
+                systemInstruction = "Helpful assistant"
+            )
+        )
+        assertTrue(chatId > 0L)
+
+        // 1. Verify "Hey Jimmy" and "Hey Gemini" prefixes are cleanly stripped
+        val (jimmyWake, jimmyStripped) = SpeechRecognitionCoordinator.extractWakeTriggeredTranscript(
+            rawTranscript = "Hey Jimmy, explain coroutine structured concurrency",
+            customWakeWords = listOf("Hey Gemini")
+        )
+        assertTrue(jimmyWake)
+        assertEquals("explain coroutine structured concurrency", jimmyStripped)
+
+        val (geminiWake, geminiStripped) = SpeechRecognitionCoordinator.extractWakeTriggeredTranscript(
+            rawTranscript = "Hey Gemini: summarize the meeting notes",
+            customWakeWords = listOf("Hey Gemini")
+        )
+        assertTrue(geminiWake)
+        assertEquals("summarize the meeting notes", geminiStripped)
+
+        // 2. Insert wake-word-triggered message and verify totalVoiceCommands increments to 1
+        val fixedTs = 1730000000000L
+        val firstWakeMsg = com.example.data.model.ChatMessage(
+            chatId = chatId,
+            sender = "user",
+            content = "Hey Jimmy, explain coroutine structured concurrency",
+            timestamp = fixedTs,
+            triggeredByWakeWord = true
+        )
+        val firstId = messageDao.insertMessageSafely(firstWakeMsg)
+        assertTrue(firstId > 0L)
+
+        val updatedChatAfterFirst = chatDao.getChatByIdSync(chatId)!!
+        assertEquals(1, updatedChatAfterFirst.totalVoiceCommands)
+
+        // Verify stored message has stripped wake prefix and triggeredByWakeWord = true
+        val savedMsg = messageDao.getMessageByIdSync(firstId)!!
+        assertEquals("explain coroutine structured concurrency", savedMsg.content)
+        assertTrue(savedMsg.triggeredByWakeWord)
+
+        // 3. Attempt duplicate insert with identical [chatId, timestamp, sender] -> must be ignored (-1L)
+        //    and totalVoiceCommands must NOT increment a second time
+        val duplicateWakeMsg = com.example.data.model.ChatMessage(
+            chatId = chatId,
+            sender = "user",
+            content = "explain coroutine structured concurrency",
+            timestamp = fixedTs,
+            triggeredByWakeWord = true
+        )
+        val duplicateId = messageDao.insertMessageSafely(duplicateWakeMsg)
+        assertEquals(-1L, duplicateId)
+
+        val updatedChatAfterDuplicate = chatDao.getChatByIdSync(chatId)!!
+        assertEquals(1, updatedChatAfterDuplicate.totalVoiceCommands)
+        assertEquals(1, messageDao.getMessagesForChatSync(chatId).size)
+
+        db.close()
+    }
+
+    @Test
+    fun testVoiceHistoryNavigationCommandAudioMutexAndStateConsumption() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val viewModel = com.example.ui.MainViewModel(app)
+
+        // 1. Verify "open history", "show history", and "voice history" (with or without leading wake words) match
+        assertTrue(AudioCommandSanitizer.isVoiceHistoryNavigationCommand("open history"))
+        assertTrue(AudioCommandSanitizer.isVoiceHistoryNavigationCommand("Show History!"))
+        assertTrue(AudioCommandSanitizer.isVoiceHistoryNavigationCommand("voice history"))
+        assertTrue(AudioCommandSanitizer.isVoiceHistoryNavigationCommand("Hey Gemini, open history"))
+        assertTrue(AudioCommandSanitizer.isVoiceHistoryNavigationCommand("Hey Jimmy, show history"))
+        assertFalse(AudioCommandSanitizer.isVoiceHistoryNavigationCommand("tell me about ancient history"))
+
+        // 2. Verify SpeechRecognitionCoordinator.extractMatchedWakeWordAndPrompt returns null for history commands
+        //    so "open history" is never mis-routed as a chat wake word ("open") + prompt ("history")
+        org.junit.Assert.assertNull(SpeechRecognitionCoordinator.extractMatchedWakeWordAndPrompt("open history"))
+        org.junit.Assert.assertNull(SpeechRecognitionCoordinator.extractMatchedWakeWordAndPrompt("Hey Gemini, show history"))
+
+        // 3. Dispatching a voice history command immediately suspends SpeechRecognitionCoordinator & WakeWordVoiceService
+        //    and emits pendingVoiceNavigationRoute = "history" without populating pendingWakeQuery
+        val handled = viewModel.processSpeechRecognizerResults(listOf("open history"), isFinal = true)
+        assertTrue(handled)
+        assertEquals("history", viewModel.pendingVoiceNavigationRoute.value)
+        assertTrue(viewModel.isNavigatingViaVoiceCommand.value)
+        assertTrue(viewModel.speechRecognitionCoordinator.isIntentionallyPaused)
+        assertTrue(viewModel.speechRecognitionCoordinator.isProcessing)
+        assertTrue(WakeWordVoiceService.isIntentionallyPaused)
+        org.junit.Assert.assertNull(viewModel.pendingWakeQuery.value)
+
+        // 4. Consuming the pending route immediately resets pendingVoiceNavigationRoute to null so it cannot loop on resume
+        viewModel.consumePendingVoiceNavigationRoute()
+        org.junit.Assert.assertNull(viewModel.pendingVoiceNavigationRoute.value)
+
+        // 5. Verify heavy AI and Cloud Sync subsystems remain lazily uninitialized during voice history navigation
+        assertFalse(viewModel.isGeminiServiceInitialized)
+        assertFalse(viewModel.isFirebaseSyncInitialized)
+
+        // 6. Verify SpeechRecognizer trace logs are recorded in both coordinator traceHistory and in-app wakeWordLogs
+        val coordinatorTraces = viewModel.speechRecognitionCoordinator.traceHistory.value
+        assertTrue(coordinatorTraces.any { it.contains("stage=PAUSE_FOR_COMMAND_DISPATCH") && it.contains("thread=") })
+        val inAppLogs = viewModel.wakeWordLogs.value
+        assertTrue(inAppLogs.any { it.wakeWord.contains("VOICE_NAV_DISPATCH_START") })
+        assertTrue(inAppLogs.any { it.wakeWord.contains("VOICE_NAV_ROUTE_CONSUMED") })
+
+        // 7. Simulate NavController destination commit ("history") + settle handshake and verify mutex unlocks cleanly
+        viewModel.onVoiceNavigationDestinationCommitted("history", settleDelayMs = 100L)
+        assertTrue(viewModel.wakeWordLogs.value.any { it.wakeWord.contains("VOICE_NAV_DESTINATION_COMMITTED") })
+
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper())
+            .idleFor(java.time.Duration.ofMillis(250))
+
+        assertFalse(viewModel.isNavigatingViaVoiceCommand.value)
+        assertFalse(WakeWordVoiceService.isIntentionallyPaused)
+        assertTrue(viewModel.wakeWordLogs.value.any { it.wakeWord.contains("VOICE_NAV_MUTEX_RESUMED") })
+
+        viewModel.wakeWordManager.destroy()
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+    }
+
+    @Test
+    fun testWindowFocusGuardAndVoicePayloadSanitization() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val viewModel = com.example.ui.MainViewModel(app)
+        viewModel.setPermissionGrantedOverrideForTest(true)
+
+        // 1. Verify Window Focus Guard blocks startListening() and AudioRecord.startRecording() when unfocused
+        viewModel.onWindowFocusChanged(false)
+        assertFalse(viewModel.hasWindowFocus.value)
+        assertFalse(viewModel.speechRecognitionCoordinator.isWindowFocused)
+        assertFalse(viewModel.wakeWordManager.hasActiveWindowFocus)
+        assertTrue(viewModel.speechRecognitionCoordinator.shouldAbortListening())
+        assertFalse(viewModel.speechRecognitionCoordinator.startListening(userInitiated = true))
+        assertFalse(viewModel.toggleInChatDictation())
+        assertFalse(viewModel.isInChatDictationActive.value)
+        viewModel.wakeWordManager.startContinuousListening(forceActiveTurn = true)
+        assertFalse(viewModel.wakeWordManager.isListening.value)
+
+        // Restore window focus and verify ChatScreen mic button stops background service listener before starting interactive dictation
+        viewModel.onWindowFocusChanged(true)
+        assertTrue(viewModel.hasWindowFocus.value)
+        assertTrue(viewModel.speechRecognitionCoordinator.isWindowFocused)
+        assertTrue(viewModel.wakeWordManager.hasActiveWindowFocus)
+        assertTrue(viewModel.toggleInChatDictation())
+        assertTrue(viewModel.isInChatDictationActive.value)
+        assertTrue(WakeWordVoiceService.isIntentionallyPaused)
+        assertFalse(viewModel.toggleInChatDictation())
+        assertFalse(viewModel.isInChatDictationActive.value)
+
+        // 2. Verify empty, blank, or < 2 character voice payloads are discarded completely
+        org.junit.Assert.assertNull(viewModel.sanitizeValidWakeQuery(null))
+        org.junit.Assert.assertNull(viewModel.sanitizeValidWakeQuery(""))
+        org.junit.Assert.assertNull(viewModel.sanitizeValidWakeQuery("   "))
+        org.junit.Assert.assertNull(viewModel.sanitizeValidWakeQuery("a"))
+        org.junit.Assert.assertNull(viewModel.sanitizeValidWakeQuery(" ? "))
+        assertEquals("hi", viewModel.sanitizeValidWakeQuery("  hi "))
+
+        viewModel.setPendingWakeQuery("x")
+        org.junit.Assert.assertNull(viewModel.pendingWakeQuery.value)
+        org.junit.Assert.assertNull(viewModel.consumePendingWakeQuery())
+
+        // 3. Verify _pendingWakeQuery is cleared immediately when entering ChatScreen (selectChat / onEnterChatScreen)
+        viewModel.setPendingWakeQuery("Summarize our roadmap")
+        assertEquals("Summarize our roadmap", viewModel.pendingWakeQuery.value)
+        viewModel.selectChat(1L)
+        org.junit.Assert.assertNull(viewModel.pendingWakeQuery.value)
+
+        viewModel.setPendingWakeQuery("Check deployment status")
+        assertEquals("Check deployment status", viewModel.pendingWakeQuery.value)
+        viewModel.onEnterChatScreen(1L)
+        org.junit.Assert.assertNull(viewModel.pendingWakeQuery.value)
+        org.junit.Assert.assertNull(viewModel.wakeConversationSummary.value)
+
+        viewModel.wakeWordManager.destroy()
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+    }
+
+    @Test
+    fun testDistinctHapticPatternsForRadarToggleWakeWordsAndVoiceCommands() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        AudioCommandSanitizer.resetHapticDiagnosticsForTest()
+
+        // 1. Verify each HapticPatternType has distinct waveform timings and amplitudes
+        val patterns = HapticPatternType.entries
+        assertEquals(5, patterns.size)
+        for (pattern in patterns) {
+            assertEquals(pattern.timingsMs.size, pattern.amplitudes.size)
+            assertTrue(pattern.timingsMs.isNotEmpty())
+        }
+        assertFalse(
+            HapticPatternType.RADAR_TOGGLE_ON.timingsMs.contentEquals(
+                HapticPatternType.RADAR_TOGGLE_OFF.timingsMs
+            )
+        )
+        assertFalse(
+            HapticPatternType.RADAR_TOGGLE_ON.timingsMs.contentEquals(
+                HapticPatternType.WAKE_WORD_DETECTED.timingsMs
+            )
+        )
+        assertFalse(
+            HapticPatternType.WAKE_WORD_DETECTED.timingsMs.contentEquals(
+                HapticPatternType.VOICE_COMMAND_TRIGGERED.timingsMs
+            )
+        )
+
+        // 2. Verify Hands-Free Radar toggle ON and OFF trigger distinct haptic patterns
+        AudioCommandSanitizer.playRadarToggleHaptic(app, isActivating = true, reason = "TestRadarToggleOn")
+        assertEquals(HapticPatternType.RADAR_TOGGLE_ON, AudioCommandSanitizer.lastHapticPattern)
+        assertEquals(1, AudioCommandSanitizer.hapticTriggerCount)
+
+        AudioCommandSanitizer.playRadarToggleHaptic(app, isActivating = false, reason = "TestRadarToggleOff")
+        assertEquals(HapticPatternType.RADAR_TOGGLE_OFF, AudioCommandSanitizer.lastHapticPattern)
+        assertEquals(2, AudioCommandSanitizer.hapticTriggerCount)
+
+        // 3. Verify Wake Word detection triggers WAKE_WORD_DETECTED pattern
+        AudioCommandSanitizer.resetHapticDiagnosticsForTest()
+        val manager = WakeWordManager(app)
+        manager.onKeywordHit("Hey Gemini", initialQuery = "what is the time")
+        assertEquals(HapticPatternType.WAKE_WORD_DETECTED, AudioCommandSanitizer.lastHapticPattern)
+        assertTrue(AudioCommandSanitizer.hapticTriggerCount >= 1)
+
+        // 4. Verify Voice Command triggers VOICE_COMMAND_TRIGGERED pattern
+        AudioCommandSanitizer.resetHapticDiagnosticsForTest()
+        AudioCommandSanitizer.playVoiceCommandHaptic(app, commandLabel = "TestVoiceCommand:open_history")
+        assertEquals(HapticPatternType.VOICE_COMMAND_TRIGGERED, AudioCommandSanitizer.lastHapticPattern)
+        assertEquals(1, AudioCommandSanitizer.hapticTriggerCount)
+        assertTrue(
+            AudioCommandSanitizer.getRecentHapticEvents().any {
+                it.contains("VOICE_COMMAND_TRIGGERED") && it.contains("TestVoiceCommand:open_history")
+            }
+        )
+
+        manager.destroy()
+    }
+
+    @Test
+    fun testCreateGeneralLogFileCollectsSessionDiagnosticsAndCopiesToClipboard() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        AudioCommandSanitizer.resetHapticDiagnosticsForTest()
+        val viewModel = com.example.ui.MainViewModel(app)
+
+        // Trigger a Radar haptic event and a warning/diagnostic event in the session
+        AudioCommandSanitizer.playRadarToggleHaptic(app, isActivating = true, reason = "HandsFreeRadarPill")
+        viewModel.wakeRecognitionListener.onError(android.speech.SpeechRecognizer.ERROR_NETWORK)
+
+        // Execute "Create a general log file" action which builds per-use session diagnostics and copies to clipboard
+        val logOutput = viewModel.createAndCopyGeneralLogFileToClipboard(app)
+
+        // 1. Verify key diagnostic sections are present (Network, Permissions, Recent Error Logs, Haptics)
+        assertTrue(logOutput.contains("=== GEMINI WAKE GENERAL SESSION DIAGNOSTIC LOG FILE ==="))
+        assertTrue(logOutput.contains("--- 1. NETWORK & CONNECTIVITY STATE ---"))
+        assertTrue(logOutput.contains("Network Connection State:"))
+        assertTrue(logOutput.contains("--- 2. PERMISSION & AUDIO FOCUS STATES ---"))
+        assertTrue(logOutput.contains("RECORD_AUDIO Permission:"))
+        assertTrue(logOutput.contains("CAMERA Permission:"))
+        assertTrue(logOutput.contains("POST_NOTIFICATIONS Permission:"))
+        assertTrue(logOutput.contains("Hands-Free Radar Active:"))
+        assertTrue(logOutput.contains("--- 3. RECENT ERROR LOGS & WARNINGS ---"))
+        assertTrue(logOutput.contains("--- 4. HAPTIC FEEDBACK & VOICE ACTIVATION TELEMETRY ---"))
+        assertTrue(logOutput.contains("Last Pattern: RADAR_TOGGLE_ON"))
+        assertTrue(logOutput.contains("RADAR_TOGGLE_ON: HandsFreeRadarPill"))
+
+        // 2. Verify the generated general log was copied directly to the Android ClipboardManager
+        val clipboard = app.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        assertTrue(clipboard.hasPrimaryClip())
+        val clipText = clipboard.primaryClip?.getItemAt(0)?.text?.toString().orEmpty()
+        assertEquals(logOutput, clipText)
+
+        viewModel.cleanShutdown(null)
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+    }
+
+    @Test
+    fun testHandsFreeRadarToggleDebounce400ms_andTransientIsListeningDoesNotForceHandsFreeOff() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val viewModel = com.example.ui.MainViewModel(app)
+        viewModel.setPermissionGrantedOverrideForTest(true)
+
+        var simulatedClockMs = 10_000L
+        viewModel.handsFreeToggleClockMs = { simulatedClockMs }
+        viewModel.resetHandsFreeToggleDebounceForTest()
+
+        // Ensure starting from OFF
+        if (viewModel.isHandsFreeActive.value) {
+            viewModel.toggleHandsFreeVoice(false)
+            simulatedClockMs += 500L
+        }
+        assertFalse(viewModel.isHandsFreeActive.value)
+
+        // 1. Toggle ON at t = 10_500ms -> succeeds
+        viewModel.toggleHandsFreeVoice()
+        assertTrue(viewModel.isHandsFreeActive.value)
+        assertFalse(viewModel.speechRecognitionCoordinator.isIntentionallyPaused)
+
+        // 2. Rapid duplicate click 150ms later (< 400ms debounce) -> ignored, stays ON
+        simulatedClockMs += 150L
+        viewModel.toggleHandsFreeVoice()
+        assertTrue(
+            "Rapid click within 400ms debounce window must not bounce handsFreeMode OFF",
+            viewModel.isHandsFreeActive.value
+        )
+
+        // 3. Simulate a transient isListening == false while WakeWordManager is active ->
+        //    toggling after 500ms must still use _isHandsFreeActive as source of truth
+        simulatedClockMs += 500L
+        viewModel.speechRecognitionCoordinator.stopListening(markIntentionallyPaused = false)
+        assertFalse(viewModel.isSpeechRecognizerListening.value)
+        assertTrue(
+            "Transient isListening == false must never force isHandsFreeActive to OFF",
+            viewModel.isHandsFreeActive.value
+        )
+
+        // 4. Stale pause recovery on window focus: if a background glitch set isIntentionallyPaused = true,
+        //    onWindowFocusChanged(true) forces isIntentionallyPaused = false when hands-free is ON
+        viewModel.speechRecognitionCoordinator.setIntentionallyPaused(true)
+        assertTrue(viewModel.speechRecognitionCoordinator.isIntentionallyPaused)
+        viewModel.onWindowFocusChanged(true)
+        assertFalse(
+            "onWindowFocusChanged(true) must clear isIntentionallyPaused when hands-free is ON and not processing",
+            viewModel.speechRecognitionCoordinator.isIntentionallyPaused
+        )
+
+        // 5. Explicit user toggle OFF after > 400ms -> sets isHandsFreeActive = false and isIntentionallyPaused = true
+        simulatedClockMs += 500L
+        viewModel.toggleHandsFreeVoice()
+        assertFalse(viewModel.isHandsFreeActive.value)
+        assertTrue(viewModel.speechRecognitionCoordinator.isIntentionallyPaused)
+
+        viewModel.cleanShutdown(null)
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
     }
 }

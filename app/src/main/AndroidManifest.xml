@@ -51,16 +51,6 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
             <intent-filter>
-                <action android:name="android.intent.action.SEND" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <data android:mimeType="text/plain" />
-            </intent-filter>
-            <intent-filter>
-                <action android:name="android.intent.action.SEND" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <data android:mimeType="image/*" />
-            </intent-filter>
-            <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
@@ -97,53 +87,6 @@
             android:name=".importer.FileProcessingService"
             android:exported="false"
             android:foregroundServiceType="microphone" />
-
-        <activity
-            android:name="androidx.compose.ui.tooling.PreviewActivity"
-            android:exported="true"
-            tools:node="merge">
-            <intent-filter tools:node="remove">
-                <action android:name="android.intent.action.MAIN" tools:node="remove" />
-                <category android:name="android.intent.category.LAUNCHER" tools:node="remove" />
-            </intent-filter>
-        </activity>
-
-        <activity
-            android:name="androidx.activity.ComponentActivity"
-            android:exported="true"
-            tools:node="merge">
-            <intent-filter tools:node="remove">
-                <action android:name="android.intent.action.MAIN" tools:node="remove" />
-                <category android:name="android.intent.category.LAUNCHER" tools:node="remove" />
-            </intent-filter>
-        </activity>
-
-        <activity
-            android:name="androidx.test.core.app.InstrumentationActivityInvoker$BootstrapActivity"
-            android:exported="true"
-            tools:node="merge">
-            <intent-filter tools:node="remove">
-                <category android:name="android.intent.category.LAUNCHER" tools:node="remove" />
-            </intent-filter>
-        </activity>
-
-        <activity
-            android:name="androidx.test.core.app.InstrumentationActivityInvoker$EmptyActivity"
-            android:exported="true"
-            tools:node="merge">
-            <intent-filter tools:node="remove">
-                <category android:name="android.intent.category.LAUNCHER" tools:node="remove" />
-            </intent-filter>
-        </activity>
-
-        <activity
-            android:name="androidx.test.core.app.InstrumentationActivityInvoker$EmptyFloatingActivity"
-            android:exported="true"
-            tools:node="merge">
-            <intent-filter tools:node="remove">
-                <category android:name="android.intent.category.LAUNCHER" tools:node="remove" />
-            </intent-filter>
-        </activity>
     </application>
 
 </manifest>

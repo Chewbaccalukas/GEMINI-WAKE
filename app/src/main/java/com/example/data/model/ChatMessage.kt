@@ -11,6 +11,8 @@ typealias Message = ChatMessage
 /**
  * Room `@Entity` representing a chat message turn (`Message` / `ChatMessage`)
  * in the hybrid offline-first Room + Cloud Firestore synchronization architecture.
+ *
+ * Stores the user's actual spoken/transcribed or typed words in [content].
  */
 @Entity(
     tableName = "chat_messages",
@@ -24,6 +26,7 @@ typealias Message = ChatMessage
     ],
     indices = [
         Index(value = ["chatId"]),
+        Index(value = ["chatId", "timestamp", "sender"], unique = true),
         Index(value = ["remoteId"]),
         Index(value = ["syncStatus"]),
         Index(value = ["userId"]),
@@ -93,10 +96,27 @@ data class ChatMessage(
         get() = SyncState.fromStatus(syncStatus)
 
     /**
-     * Returns true when this message holds actual user/model text rather than a legacy audio placeholder.
+     * Returns true when this message holds actual user/model transcribed or typed text
+     * rather than a blank string or a legacy audio placeholder.
      */
     val hasTranscribedText: Boolean
-        get() = content.isNotBlank() && !isLegacyAudioPlaceholder(content)
+        get() = sanitizedTextContent.isNotBlank()
+
+    /**
+     * Returns the trimmed message text (with any leading wake phrase stripped when [triggeredByWakeWord] is true)
+     * if valid, or an empty string if [content] is blank or a legacy audio placeholder.
+     */
+    val sanitizedTextContent: String
+        get() {
+            if (content.isBlank() || isLegacyAudioPlaceholder(content)) return ""
+            val raw = content.trim()
+            val cleaned = if (triggeredByWakeWord && sender.equals("user", ignoreCase = true)) {
+                com.example.voice.AudioCommandSanitizer.stripWakeWordTrigger(raw)
+            } else {
+                raw
+            }
+            return if (cleaned.isNotBlank() && !isLegacyAudioPlaceholder(cleaned)) cleaned else ""
+        }
 
     /**
      * Returns true if the attachment is a legacy raw audio placeholder file/MIME type.
@@ -105,11 +125,49 @@ data class ChatMessage(
         get() {
             val mime = attachmentMimeType?.lowercase().orEmpty()
             val name = attachmentName?.lowercase().orEmpty()
+            val uri = attachmentUri?.lowercase().orEmpty()
             return mime.startsWith("audio/") ||
                 name.endsWith(".pcm") ||
                 name.endsWith(".wav") ||
-                name.endsWith(".m4a")
+                name.endsWith(".m4a") ||
+                name.endsWith(".ogg") ||
+                uri.endsWith(".pcm") ||
+                uri.endsWith(".wav") ||
+                uri.endsWith(".m4a")
         }
+
+    /**
+     * Returns true when a real non-audio attachment (such as an image or document) is attached.
+     */
+    val hasVisibleNonAudioAttachment: Boolean
+        get() = (!attachmentName.isNullOrBlank() || !attachmentUri.isNullOrBlank()) &&
+            !isAudioPlaceholderAttachment
+
+    /**
+     * Returns true when this message contains actual transcribed/typed text or a valid
+     * non-audio attachment worth persisting in Room and rendering in the UI.
+     */
+    val hasPersistableContent: Boolean
+        get() = hasTranscribedText || hasVisibleNonAudioAttachment
+
+    /**
+     * Returns a sanitized copy with legacy audio placeholder strings and audio-only attachment
+     * metadata stripped so Room only persists clean text and non-audio attachments.
+     */
+    fun sanitizeForPersistence(): ChatMessage {
+        val cleanContent = sanitizedTextContent
+        return if (isAudioPlaceholderAttachment) {
+            copy(
+                content = cleanContent,
+                attachmentUri = null,
+                attachmentName = null,
+                attachmentMimeType = null,
+                attachmentSizeBytes = null
+            )
+        } else {
+            copy(content = cleanContent)
+        }
+    }
 
     companion object {
         private val LEGACY_AUDIO_PLACEHOLDERS = setOf(
@@ -118,13 +176,21 @@ data class ChatMessage(
             "[audio placeholder]",
             "[voice message]",
             "[audio turn]",
-            "audio message"
+            "[audio]",
+            "[voice turn]",
+            "audio message",
+            "voice message",
+            "voice input audio turn"
         )
 
         fun isLegacyAudioPlaceholder(text: String?): Boolean {
             if (text.isNullOrBlank()) return true
             val normalized = text.trim().lowercase()
-            return normalized in LEGACY_AUDIO_PLACEHOLDERS
+            if (normalized in LEGACY_AUDIO_PLACEHOLDERS) return true
+            if (normalized.endsWith(".pcm") || normalized.endsWith(".wav") || normalized.endsWith(".m4a")) {
+                if (!normalized.contains(" ")) return true
+            }
+            return false
         }
     }
 }

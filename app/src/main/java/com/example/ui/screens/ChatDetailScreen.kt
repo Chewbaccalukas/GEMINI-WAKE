@@ -31,11 +31,14 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -57,6 +60,7 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Memory
@@ -65,7 +69,9 @@ import androidx.compose.material.icons.filled.Hearing
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.PowerSettingsNew
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.foundation.Image
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
@@ -115,7 +121,9 @@ import com.example.ui.components.ChatImportProgressBanner
 import com.example.ai.ActiveKeyType
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Folder
+import com.example.ui.components.SubtleWakeWordWaveformPill
 import com.example.ui.components.VoiceWaveformVisualizer
+import com.example.ui.components.WakeWordListeningStatusBanner
 import com.example.data.model.ChatMessage
 import com.example.data.model.ChatSession
 import com.example.coupler.StagedImageInfo
@@ -147,15 +155,28 @@ import com.example.util.NetworkConnectionState
 import com.example.util.VoiceCommandHistoryEntry
 import com.example.util.WebLinkHistoryEntry
 import com.example.util.WebLinkHistoryManager
-import androidx.compose.foundation.text.ClickableText
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.text.selection.DisableSelection
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.OpenWith
+import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.VerticalAlignBottom
+import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextDecoration
+import com.example.ui.components.ChatCustomizableBackgroundLayer
+import com.example.ui.components.ChatThemeCustomizationDialog
+import com.example.ui.components.MarkdownMessageContent
+import com.example.ui.components.PREDEFINED_CHAT_COLOR_PALETTES
 import kotlinx.coroutines.delay
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -219,8 +240,17 @@ fun ChatDetailScreen(
     onClearStagedAttachment: () -> Unit = {},
     onUpdateChatTheme: (com.example.ui.theme.AppTheme) -> Unit = {},
     isVoiceRecording: Boolean = false,
+    isInChatDictationActive: Boolean = false,
     audioRmsDb: Float = 0f,
+    viewModel: com.example.ui.MainViewModel? = null,
     onStartVoiceRecording: () -> Unit = {},
+    onToggleInChatDictation: () -> Unit = {
+        if (viewModel != null) {
+            viewModel.toggleInChatDictation()
+        } else {
+            onStartVoiceRecording()
+        }
+    },
     onSendVoiceRecording: (String) -> Unit = {},
     onCancelVoiceRecording: () -> Unit = {},
     onOpenControlSheet: () -> Unit = {},
@@ -243,7 +273,33 @@ fun ChatDetailScreen(
     isSleepMode: Boolean = false,
     sleepModeReason: String = "",
     onEnterSleepMode: () -> Unit = {},
-    onExitSleepMode: () -> Unit = {}
+    onExitSleepMode: () -> Unit = {},
+    onShareLogsAsJson: () -> Unit = {},
+    onShareLogsAsCsv: () -> Unit = {},
+    isWakeWordListening: Boolean = false,
+    lastHeardText: String = "",
+    wakeConversationSummary: com.example.voice.WakeConversationSummary? = null,
+    isFavoriteChat: Boolean = false,
+    onToggleFavoriteChat: () -> Unit = {},
+    isPinnedChat: Boolean = false,
+    onTogglePinChat: () -> Unit = {},
+    onGenerateWakeAiSummary: () -> Unit = {},
+    onOpenWakeFavoritesPicker: () -> Unit = {},
+    onDismissWakeSummary: () -> Unit = {},
+    chatCategory: String? = null,
+    chatTags: Set<String> = emptySet(),
+    allChats: List<ChatSession> = emptyList(),
+    chatCategoryMap: Map<Long, String> = emptyMap(),
+    messageCategoryMap: Map<Long, String> = emptyMap(),
+    onSelectChatFromCategoryBar: (Long) -> Unit = {},
+    onReassignChatCategory: (String) -> Unit = {},
+    attachedImageUri: Uri? = stagedAttachment?.uri?.takeIf { stagedAttachment.mimeType.startsWith("image/") },
+    onStageAttachedImageUri: (Uri?) -> Unit = {},
+    onClearAttachedImage: () -> Unit = onClearStagedAttachment,
+    onCheckAndStageClipboardImage: () -> Boolean = { false },
+    onUpdateChatAppearance: (paletteId: String, backgroundStyle: String, primaryHex: String) -> Unit = { _, _, _ -> },
+    pendingWakeQuery: String? = null,
+    onConsumePendingWakeQuery: () -> String? = { pendingWakeQuery }
 ) {
     BackHandler {
         onBack()
@@ -255,71 +311,166 @@ fun ChatDetailScreen(
     var menuExpanded by remember(chat.id) { mutableStateOf(false) }
     var showPromptsBar by remember(chat.id) { mutableStateOf(false) }
     var showCreatePromptDialog by remember(chat.id) { mutableStateOf(false) }
+    var showThemeCustomizationDialog by remember(chat.id) { mutableStateOf(false) }
     var showWebHistoryBar by remember(chat.id) { mutableStateOf(false) }
+    var isSummaryCardVisible by remember(chat.id) { mutableStateOf(false) }
+    var isSummaryCardExpanded by remember(chat.id) { mutableStateOf(false) }
+    var isChatCategoryBarCollapsed by remember(chat.id) { mutableStateOf(true) }
+    var selectedChatCategoryFilter by remember(chat.id, chatCategory) { mutableStateOf<String?>(chatCategory) }
     var isInputFloating by remember(chat.id) { mutableStateOf(false) }
     var isFloatingCollapsedToDot by remember(chat.id) { mutableStateOf(false) }
     var floatingOffsetX by remember(chat.id) { mutableStateOf(24f) }
     var floatingOffsetY by remember(chat.id) { mutableStateOf(160f) }
     val listState = rememberLazyListState()
 
-    val accentColor = remember(chat.themeColorHex) {
-        try {
+    // Photo Picker for Staging Image Attachment
+    val attachImagePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {}
+            onStageAttachedImageUri(uri)
+        }
+    }
+
+    // Photo Picker for Custom Chat Background Image
+    val customBackgroundPhotoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {}
+            val matchedPalette = PREDEFINED_CHAT_COLOR_PALETTES.firstOrNull { it.id == chat.colorPaletteId }
+            val hex = matchedPalette?.primaryHex ?: chat.themeColorHex
+            onUpdateChatAppearance(chat.colorPaletteId, "custom:$uri", hex)
+        }
+    }
+
+    // Helper to inspect system ClipboardManager.primaryClip for image/png or image/jpeg URI
+    val tryPasteImageFromClipboard: (Boolean) -> Boolean = { showFeedbackToast ->
+        val handledByViewModel = onCheckAndStageClipboardImage()
+        if (handledByViewModel) {
+            if (showFeedbackToast) {
+                Toast.makeText(context, "Image pasted from clipboard", Toast.LENGTH_SHORT).show()
+            }
+            true
+        } else {
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            val clip = clipboard?.primaryClip
+            val desc = clip?.description
+            val hasImageMime = desc != null && (
+                desc.hasMimeType("image/png") ||
+                    desc.hasMimeType("image/jpeg") ||
+                    desc.hasMimeType("image/*")
+                )
+            var foundUri: Uri? = null
+            if (clip != null && clip.itemCount > 0) {
+                for (i in 0 until clip.itemCount) {
+                    val candidateUri = clip.getItemAt(i)?.uri
+                    if (candidateUri != null) {
+                        val resolvedMime = context.contentResolver.getType(candidateUri)?.lowercase().orEmpty()
+                        if (hasImageMime || resolvedMime.startsWith("image/")) {
+                            foundUri = candidateUri
+                            break
+                        }
+                    }
+                }
+            }
+            if (foundUri != null) {
+                onStageAttachedImageUri(foundUri)
+                if (showFeedbackToast) {
+                    Toast.makeText(context, "Image pasted from clipboard", Toast.LENGTH_SHORT).show()
+                }
+                true
+            } else {
+                if (showFeedbackToast) {
+                    Toast.makeText(context, "No image (PNG/JPEG) found on clipboard", Toast.LENGTH_SHORT).show()
+                }
+                false
+            }
+        }
+    }
+
+    val matchedPalette = remember(chat.colorPaletteId) {
+        PREDEFINED_CHAT_COLOR_PALETTES.firstOrNull { it.id.equals(chat.colorPaletteId, ignoreCase = true) }
+    }
+    val accentColor = remember(chat.themeColorHex, matchedPalette) {
+        matchedPalette?.primaryColor ?: try {
             Color(android.graphics.Color.parseColor(chat.themeColorHex.trim()))
         } catch (_: Throwable) {
             Color(0xFF38BDF8)
         }
     }
 
-    // STRICT SESSION ISOLATION: Filter messages strictly to this chat.id to prevent cross-session bleeding
+    // STRICT SESSION ISOLATION & PLACEHOLDER FILTERING:
+    // Filter messages strictly to this chat.id and exclude empty/legacy audio placeholders
     val isolatedMessages = remember(chat.id, messages) {
-        messages.filter { it.chatId == chat.id }
+        messages.filter { it.chatId == chat.id && it.hasPersistableContent }
     }
 
-    // Re-key LaunchedEffect(chat.id) so switching between different chats immediately purges active state & scrolls to fresh thread
+    // Re-key LaunchedEffect(chat.id) so switching between different chats immediately purges active state & scrolls to fresh thread.
+    // Immediately clear _pendingWakeQuery when entering ChatScreen so it cannot auto-submit or generate unsolicited summary overlays.
     LaunchedEffect(chat.id) {
+        viewModel?.onEnterChatScreen(chat.id)
+        onConsumePendingWakeQuery()
+        isSummaryCardVisible = false
+        isSummaryCardExpanded = false
         inputText = TextFieldValue("")
         isSending = false
         menuExpanded = false
         showPromptsBar = false
         if (isolatedMessages.isNotEmpty()) {
-            listState.scrollToItem(isolatedMessages.size - 1)
+            val headerOffset = if (hasMoreOlderMessages) 1 else 0
+            listState.scrollToItem((headerOffset + isolatedMessages.size - 1).coerceAtLeast(0))
         } else {
             listState.scrollToItem(0)
         }
     }
 
-    // Force reset stale draft text when a wake-word re-triggers while already inside ChatDetailScreen
+    // Voice recognition is decoupled from the bottom text input box:
+    // When a wake-word or voice trigger executes, keep inputText completely blank and do NOT request focus or trigger the soft keyboard (IME).
     LaunchedEffect(wakeRetriggerEventId) {
         if (wakeRetriggerEventId > 0L) {
-            inputText = TextFieldValue(
-                text = draftSpokenText,
-                selection = androidx.compose.ui.text.TextRange(draftSpokenText.length)
-            )
+            inputText = TextFieldValue("")
             isSending = false
         }
     }
 
-    // Real-time partial streaming: types hands-free voice input directly into message input field
-    LaunchedEffect(draftSpokenText) {
-        if (draftSpokenText.isNotBlank()) {
-            inputText = TextFieldValue(
-                text = draftSpokenText,
-                selection = androidx.compose.ui.text.TextRange(draftSpokenText.length)
-            )
-        } else if (isVoiceRecording || handsFreeVoiceState == HandsFreeVoiceState.TRANSCRIBING) {
-            inputText = TextFieldValue("")
-        }
-    }
+    // Voice recognition is strictly decoupled from the bottom text input box:
+    // Both partial and final speech transcripts never populate inputText; finalized speech dispatches directly via sendMessage.
+    val isDictationScopedToComposer = false
 
     val density = androidx.compose.ui.platform.LocalDensity.current
     val imeBottomPx = WindowInsets.ime.getBottom(density)
+    val latestMessage = isolatedMessages.lastOrNull()
 
-    // Scroll to bottom on new message, streaming chunk, or when the virtual keyboard (IME) opens
-    LaunchedEffect(isolatedMessages.size, streamingText, imeBottomPx > 0) {
+    // Automatically scroll to the bottom whenever a new turn is added at the end of the conversation
+    // (especially after a wake-word trigger), during streaming responses, or when the keyboard opens,
+    // without jumping to the bottom when older messages are prepended at the top via keyset pagination.
+    LaunchedEffect(
+        latestMessage?.id,
+        latestMessage?.timestamp,
+        latestMessage?.triggeredByWakeWord,
+        wakeRetriggerEventId,
+        streamingText,
+        imeBottomPx > 0
+    ) {
         if (isolatedMessages.isNotEmpty() || streamingText != null) {
-            val totalItems = isolatedMessages.size + (if (streamingText != null) 1 else 0)
+            val headerCount = if (hasMoreOlderMessages) 1 else 0
+            val streamingCount = if (streamingText != null) 1 else 0
+            val totalItems = headerCount + isolatedMessages.size + streamingCount
             if (totalItems > 0) {
-                listState.animateScrollToItem(totalItems - 1)
+                val targetIndex = maxOf(totalItems - 1, listState.layoutInfo.totalItemsCount - 1)
+                listState.animateScrollToItem(targetIndex.coerceAtMost(totalItems - 1))
             }
         }
     }
@@ -380,6 +531,18 @@ fun ChatDetailScreen(
                                     )
                                 }
 
+                                if (isPinnedChat) {
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Icon(
+                                        imageVector = Icons.Default.PushPin,
+                                        contentDescription = "Pinned to Top of Chat List",
+                                        tint = accentColor,
+                                        modifier = Modifier
+                                            .size(14.dp)
+                                            .testTag("chat_detail_pinned_indicator")
+                                    )
+                                }
+
                                 if (chat.isDefaultWakeChat) {
                                     Spacer(modifier = Modifier.width(4.dp))
                                     Icon(
@@ -390,24 +553,148 @@ fun ChatDetailScreen(
                                     )
                                 }
                             }
-                            Text(
-                                text = "Wake: \"${chat.wakeWord}\"",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.primary
-                            )
+                            val isActivelyListeningForWake = (
+                                isWakeWordListening ||
+                                    isVoiceRecording ||
+                                    (isHandsFreeActive && handsFreeVoiceState == HandsFreeVoiceState.LISTENING)
+                                ) && !isSleepMode
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Text(
+                                    text = buildString {
+                                        append("Wake: \"${chat.wakeWord}\"")
+                                        if (!chatCategory.isNullOrBlank()) {
+                                            append(" • 📁 $chatCategory")
+                                        }
+                                        if (chatTags.isNotEmpty()) {
+                                            append(" • ${chatTags.take(2).joinToString(" ") { "#$it" }}")
+                                        }
+                                        if (chat.totalVoiceCommands > 0) {
+                                            append(" • ${chat.totalVoiceCommands} cmd${if (chat.totalVoiceCommands == 1) "" else "s"}")
+                                        }
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    maxLines = 1
+                                )
+                                AnimatedVisibility(
+                                    visible = isActivelyListeningForWake,
+                                    enter = fadeIn(),
+                                    exit = fadeOut()
+                                ) {
+                                    SubtleWakeWordWaveformPill(
+                                        isListening = isActivelyListeningForWake,
+                                        audioRmsDb = audioRmsDb,
+                                        barCount = 7,
+                                        waveformWidth = 34.dp,
+                                        waveformHeight = 13.dp
+                                    )
+                                }
+                            }
                         }
                     }
                 },
                 actions = {
-                    IconButton(
-                        onClick = onToggleAutoSpeak,
-                        modifier = Modifier.testTag("toggle_auto_speak_button")
+                    val isActivelyListeningInChat = (
+                        isWakeWordListening ||
+                            isVoiceRecording ||
+                            isHandsFreeActive
+                        ) && !isSleepMode
+
+                    // Prominent Hands-Free Radar Toggle Pill bound directly to audioRmsDb
+                    com.example.ui.components.TopBarHandsFreeRadarPill(
+                        isActive = isActivelyListeningInChat,
+                        audioRmsDb = audioRmsDb,
+                        isSleepMode = isSleepMode,
+                        onToggle = {
+                            if (isSleepMode) {
+                                onExitSleepMode()
+                            } else {
+                                onToggleHandsFree()
+                            }
+                        },
+                        testTagPrefix = "chat"
+                    )
+
+                    // Persistent Category Filter Toggle + Icon in Chat Interface Header
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = if (!isChatCategoryBarCollapsed) {
+                            MaterialTheme.colorScheme.primaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f)
+                        },
+                        modifier = Modifier
+                            .padding(start = 4.dp, end = 2.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable { isChatCategoryBarCollapsed = !isChatCategoryBarCollapsed }
+                            .testTag("chat_header_category_filter_toggle")
                     ) {
-                        Icon(
-                            imageVector = if (isAutoSpeakEnabled) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff,
-                            contentDescription = "Toggle Read Aloud",
-                            tint = if (isAutoSpeakEnabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Folder,
+                                contentDescription = "Toggle Category Filter Bar",
+                                tint = if (!isChatCategoryBarCollapsed) {
+                                    MaterialTheme.colorScheme.onPrimaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.primary
+                                },
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Text(
+                                text = (chatCategory ?: selectedChatCategoryFilter ?: "All").take(8),
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                color = if (!isChatCategoryBarCollapsed) {
+                                    MaterialTheme.colorScheme.onPrimaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            )
+                        }
+                    }
+
+                    // Header Toggle to Expand / Collapse Conversation Summary & Sync Drawer (collapsed by default)
+                    IconButton(
+                        onClick = {
+                            if (!isSummaryCardVisible) {
+                                isSummaryCardVisible = true
+                                isSummaryCardExpanded = true
+                            } else {
+                                isSummaryCardExpanded = !isSummaryCardExpanded
+                                isSummaryCardVisible = isSummaryCardExpanded
+                            }
+                        },
+                        modifier = Modifier.testTag("chat_header_summary_toggle_button")
+                    ) {
+                        Box(contentAlignment = Alignment.TopEnd) {
+                            Icon(
+                                imageVector = Icons.Default.Description,
+                                contentDescription = if (isSummaryCardVisible && isSummaryCardExpanded) {
+                                    "Collapse Conversation Summary Drawer"
+                                } else {
+                                    "Expand Conversation Summary Drawer"
+                                },
+                                tint = if (isSummaryCardVisible && isSummaryCardExpanded) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            )
+                            if (triggerBanner != null || wakeConversationSummary != null) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(7.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFF10B981))
+                                )
+                            }
+                        }
                     }
 
                     if (isSpeaking) {
@@ -423,50 +710,6 @@ fun ChatDetailScreen(
                         }
                     }
 
-                    IconButton(
-                        onClick = { showWebHistoryBar = !showWebHistoryBar },
-                        modifier = Modifier.testTag("chat_web_history_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Public,
-                            contentDescription = "Web Search & Link History",
-                            tint = if (showWebHistoryBar) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary
-                        )
-                    }
-
-                    IconButton(
-                        onClick = onOpenImportDialog,
-                        modifier = Modifier.testTag("chat_import_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Add,
-                            contentDescription = "Import Chat or Context",
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                    }
-
-                    IconButton(
-                        onClick = onOpenControlSheet,
-                        modifier = Modifier.testTag("chat_control_sheet_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Tune,
-                            contentDescription = "Gemini Control & Settings",
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                    }
-
-                    IconButton(
-                        onClick = onPowerExit,
-                        modifier = Modifier.testTag("chat_power_exit_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.PowerSettingsNew,
-                            contentDescription = "Power Off / Exit App",
-                            tint = MaterialTheme.colorScheme.error.copy(alpha = 0.85f)
-                        )
-                    }
-
                     Box {
                         IconButton(
                             onClick = { menuExpanded = true },
@@ -480,6 +723,31 @@ fun ChatDetailScreen(
                             onDismissRequest = { menuExpanded = false }
                         ) {
                             DropdownMenuItem(
+                                text = {
+                                    Text(if (isAutoSpeakEnabled) "Disable Read Aloud (TTS)" else "Enable Read Aloud (TTS)")
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = if (isAutoSpeakEnabled) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff,
+                                        contentDescription = null,
+                                        tint = if (isAutoSpeakEnabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                },
+                                modifier = Modifier.testTag("toggle_auto_speak_button"),
+                                onClick = {
+                                    menuExpanded = false
+                                    onToggleAutoSpeak()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Two-Tier Buffer & Chrome Bridge") },
+                                leadingIcon = { Icon(Icons.Default.Memory, contentDescription = null, tint = MaterialTheme.colorScheme.primary) },
+                                onClick = {
+                                    menuExpanded = false
+                                    onOpenBufferBridgeDialog()
+                                }
+                            )
+                            DropdownMenuItem(
                                 text = { Text("Gemini Coupler & Piggyback") },
                                 leadingIcon = { Icon(Icons.Default.SwapHoriz, contentDescription = null, tint = MaterialTheme.colorScheme.primary) },
                                 onClick = {
@@ -488,11 +756,30 @@ fun ChatDetailScreen(
                                 }
                             )
                             DropdownMenuItem(
-                                text = { Text("Memory Buffer & Chrome Bridge") },
-                                leadingIcon = { Icon(Icons.Default.Memory, contentDescription = null, tint = MaterialTheme.colorScheme.primary) },
+                                text = { Text("Web Search & Link History Bar") },
+                                leadingIcon = { Icon(Icons.Default.Public, contentDescription = null, tint = MaterialTheme.colorScheme.primary) },
+                                modifier = Modifier.testTag("chat_web_history_button"),
                                 onClick = {
                                     menuExpanded = false
-                                    onOpenBufferBridgeDialog()
+                                    showWebHistoryBar = !showWebHistoryBar
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Import Chat or Context") },
+                                leadingIcon = { Icon(Icons.Default.Add, contentDescription = null, tint = MaterialTheme.colorScheme.primary) },
+                                modifier = Modifier.testTag("chat_import_button"),
+                                onClick = {
+                                    menuExpanded = false
+                                    onOpenImportDialog()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Gemini Control & Settings Sheet") },
+                                leadingIcon = { Icon(Icons.Default.Tune, contentDescription = null, tint = MaterialTheme.colorScheme.primary) },
+                                modifier = Modifier.testTag("chat_control_sheet_button"),
+                                onClick = {
+                                    menuExpanded = false
+                                    onOpenControlSheet()
                                 }
                             )
                             DropdownMenuItem(
@@ -501,6 +788,58 @@ fun ChatDetailScreen(
                                 onClick = {
                                     menuExpanded = false
                                     onEditChat()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = {
+                                    Text(if (isPinnedChat) "Unpin from Top of List" else "Pin Chat to Top of List")
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = if (isPinnedChat) Icons.Default.PushPin else Icons.Outlined.PushPin,
+                                        contentDescription = null,
+                                        tint = if (isPinnedChat) accentColor else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                },
+                                modifier = Modifier.testTag("chat_menu_toggle_pin"),
+                                onClick = {
+                                    menuExpanded = false
+                                    onTogglePinChat()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = {
+                                    Text(if (isFavoriteChat) "Remove from Favorite Chats" else "Star as Favorite Chat")
+                                },
+                                leadingIcon = {
+                                    Icon(
+                                        imageVector = Icons.Default.Star,
+                                        contentDescription = null,
+                                        tint = if (isFavoriteChat) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                },
+                                modifier = Modifier.testTag("chat_menu_toggle_favorite"),
+                                onClick = {
+                                    menuExpanded = false
+                                    onToggleFavoriteChat()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Export & Share Logs (.json)") },
+                                leadingIcon = { Icon(Icons.Default.Share, contentDescription = null) },
+                                modifier = Modifier.testTag("chat_menu_share_json_logs"),
+                                onClick = {
+                                    menuExpanded = false
+                                    onShareLogsAsJson()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Export & Share Data (.csv)") },
+                                leadingIcon = { Icon(Icons.Default.Share, contentDescription = null) },
+                                modifier = Modifier.testTag("chat_menu_share_csv_logs"),
+                                onClick = {
+                                    menuExpanded = false
+                                    onShareLogsAsCsv()
                                 }
                             )
                             DropdownMenuItem(
@@ -523,11 +862,29 @@ fun ChatDetailScreen(
                                 }
                             )
                             DropdownMenuItem(
-                                text = { Text("Clear Chat History") },
-                                leadingIcon = { Icon(Icons.Default.DeleteSweep, contentDescription = null) },
+                                text = { Text("Customize Palette & Background") },
+                                leadingIcon = { Icon(Icons.Default.Palette, contentDescription = null, tint = accentColor) },
+                                modifier = Modifier.testTag("chat_menu_customize_theme"),
+                                onClick = {
+                                    menuExpanded = false
+                                    showThemeCustomizationDialog = true
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Clear Chat History", color = MaterialTheme.colorScheme.error) },
+                                leadingIcon = { Icon(Icons.Default.DeleteSweep, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
                                 onClick = {
                                     menuExpanded = false
                                     onClearHistory()
+                                }
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Power Off / Exit App", color = MaterialTheme.colorScheme.error) },
+                                leadingIcon = { Icon(Icons.Default.PowerSettingsNew, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
+                                modifier = Modifier.testTag("chat_power_exit_button"),
+                                onClick = {
+                                    menuExpanded = false
+                                    onPowerExit()
                                 }
                             )
 
@@ -605,8 +962,7 @@ fun ChatDetailScreen(
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .navigationBarsPadding()
-                                .imePadding()
+                                .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))
                                 .padding(horizontal = 12.dp, vertical = 6.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
@@ -644,7 +1000,7 @@ fun ChatDetailScreen(
                         onInputChange = { inputText = it },
                         onSend = {
                             val messageToSend = inputText.text.trim().ifBlank { draftSpokenText.trim() }
-                            if ((messageToSend.isNotBlank() || stagedAttachment != null || isVoiceRecording) && !isSending) {
+                            if ((messageToSend.isNotBlank() || attachedImageUri != null || stagedAttachment != null || isVoiceRecording) && !isSending) {
                                 isSending = true
                                 inputText = TextFieldValue("")
                                 onSendMessage(messageToSend)
@@ -666,13 +1022,37 @@ fun ChatDetailScreen(
                         },
                         onOpenCreatePrompt = { showCreatePromptDialog = true },
                         onDeletePrompt = onDeleteCustomPrompt,
+                        onPickImage = {
+                            attachImagePickerLauncher.launch(
+                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                            )
+                        },
+                        onPasteClipboardImage = {
+                            tryPasteImageFromClipboard(true)
+                        },
                         onTakePhoto = onTakePhoto,
                         onBrowseFiles = onBrowseFiles,
+                        attachedImageUri = attachedImageUri,
                         stagedAttachment = stagedAttachment,
-                        onClearStagedAttachment = onClearStagedAttachment,
+                        onClearStagedAttachment = onClearAttachedImage,
                         isVoiceRecording = isVoiceRecording,
+                        isInChatDictationActive = isInChatDictationActive,
                         audioRmsDb = audioRmsDb,
-                        onStartVoiceRecording = onStartVoiceRecording,
+                        viewModel = viewModel,
+                        onStartVoiceRecording = {
+                            if (viewModel != null) {
+                                viewModel.toggleInChatDictation()
+                            } else {
+                                onToggleInChatDictation()
+                            }
+                        },
+                        onToggleInChatDictation = {
+                            if (viewModel != null) {
+                                viewModel.toggleInChatDictation()
+                            } else {
+                                onToggleInChatDictation()
+                            }
+                        },
                         onSendVoiceRecording = {
                             val textToInclude = inputText.text.trim().ifBlank { draftSpokenText.trim() }
                             if (!isSending) {
@@ -689,8 +1069,13 @@ fun ChatDetailScreen(
                             isInputFloating = true
                             isFloatingCollapsedToDot = false
                         },
-                        onTextInputFocusChanged = onTextInputFocusChanged,
-                        hasBufferedSpeech = draftSpokenText.isNotBlank()
+                        onTextInputFocusChanged = { focused ->
+                            if (focused) {
+                                tryPasteImageFromClipboard(false)
+                            }
+                            onTextInputFocusChanged(focused)
+                        },
+                        hasBufferedSpeech = isDictationScopedToComposer && draftSpokenText.isNotBlank()
                     )
                 }
             }
@@ -702,6 +1087,12 @@ fun ChatDetailScreen(
                 .padding(innerPadding)
                 .consumeWindowInsets(innerPadding)
         ) {
+            // Custom / Curated Background Layer for Chat Interface
+            ChatCustomizableBackgroundLayer(
+                backgroundStyle = chat.backgroundStyle,
+                modifier = Modifier.fillMaxSize()
+            )
+
             Column(
                 modifier = Modifier.fillMaxSize()
             ) {
@@ -741,53 +1132,109 @@ fun ChatDetailScreen(
                 onWakeUpTap = onExitSleepMode
             )
 
-            // Wake Word Triggered Banner
+            // Collapsible Top Summary & Wake Telemetry Drawer (collapsed by default behind chat_header_summary_toggle_button)
+            val resolvedWakeSummary = remember(wakeConversationSummary, triggerBanner, isSummaryCardVisible, chat, isolatedMessages) {
+                wakeConversationSummary ?: if (triggerBanner != null || isSummaryCardVisible) {
+                    com.example.voice.WakeWordRoutingEngine.buildInstantWakeConversationSummary(
+                        chat = chat,
+                        messages = isolatedMessages,
+                        matchedWakeWord = triggerBanner?.matchedWord ?: chat.wakeWord
+                    )
+                } else {
+                    null
+                }
+            }
             AnimatedVisibility(
-                visible = triggerBanner != null,
-                enter = fadeIn(),
-                exit = fadeOut()
+                visible = isSummaryCardVisible && isSummaryCardExpanded,
+                enter = fadeIn() + slideInVertically { -it / 2 },
+                exit = fadeOut() + slideOutVertically { -it / 2 }
             ) {
-                if (triggerBanner != null) {
-                    Surface(
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainerLow,
+                    tonalElevation = 4.dp,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("chat_top_summary_drawer")
+                ) {
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 6.dp),
-                        shape = RoundedCornerShape(12.dp),
-                        color = MaterialTheme.colorScheme.primaryContainer
+                            .padding(bottom = 6.dp)
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Row(
-                                modifier = Modifier.weight(1f),
-                                verticalAlignment = Alignment.CenterVertically
+                        val showWakeWaveformBanner = (
+                            isWakeWordListening ||
+                                isVoiceRecording ||
+                                (isHandsFreeActive && handsFreeVoiceState == HandsFreeVoiceState.LISTENING)
+                            ) && !isSleepMode
+                        WakeWordListeningStatusBanner(
+                            isListening = showWakeWaveformBanner,
+                            audioRmsDb = audioRmsDb,
+                            activeWakePhrase = chat.wakeWord.ifBlank { "Hey Gemini" },
+                            lastHeardText = lastHeardText.ifBlank { draftSpokenText },
+                            totalVoiceCommands = chat.totalVoiceCommands
+                        )
+
+                        if (triggerBanner != null) {
+                            Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.primaryContainer
                             ) {
-                                Icon(
-                                    imageVector = Icons.Default.Mic,
-                                    contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = "Opened by wake word: \"${triggerBanner.matchedWord}\"",
-                                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer
-                                )
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(
+                                        modifier = Modifier.weight(1f),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Mic,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = "Opened by wake word: \"${triggerBanner.matchedWord}\"",
+                                            style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
+                                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                                        )
+                                    }
+                                    IconButton(
+                                        onClick = onDismissTriggerBanner,
+                                        modifier = Modifier.size(24.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Close,
+                                            contentDescription = "Dismiss",
+                                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                }
                             }
-                            IconButton(
-                                onClick = onDismissTriggerBanner,
-                                modifier = Modifier.size(24.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = "Dismiss",
-                                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                            }
+                        }
+
+                        if (resolvedWakeSummary != null) {
+                            com.example.ui.components.CollapsibleWakeWordSummaryCard(
+                                summary = resolvedWakeSummary,
+                                isFavorite = isFavoriteChat,
+                                externalExpanded = isSummaryCardExpanded,
+                                onExpandedChange = { isSummaryCardExpanded = it },
+                                onToggleFavorite = onToggleFavoriteChat,
+                                onGenerateAiSummary = onGenerateWakeAiSummary,
+                                onOpenQuickSwitchDialog = onOpenWakeFavoritesPicker,
+                                onDismiss = {
+                                    isSummaryCardVisible = false
+                                    isSummaryCardExpanded = false
+                                    onDismissWakeSummary()
+                                    onDismissTriggerBanner()
+                                }
+                            )
                         }
                     }
                 }
@@ -887,22 +1334,39 @@ fun ChatDetailScreen(
                 )
             }
 
-            // Message List
+            if (showThemeCustomizationDialog) {
+                ChatThemeCustomizationDialog(
+                    currentPaletteId = chat.colorPaletteId,
+                    currentBackgroundStyle = chat.backgroundStyle,
+                    onSelectAppearance = { paletteId, bgStyle, primaryHex ->
+                        onUpdateChatAppearance(paletteId, bgStyle, primaryHex)
+                    },
+                    onPickCustomBackgroundPhoto = {
+                        customBackgroundPhotoPickerLauncher.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                        )
+                    },
+                    onDismiss = { showThemeCustomizationDialog = false }
+                )
+            }
+
+            // Message List (Maximized Vertical Viewport with SelectionContainer Handle Clearance)
             LazyColumn(
                 state = listState,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .weight(1f),
+                    .weight(1f)
+                    .testTag("chat_messages_lazy_column"),
                 contentPadding = PaddingValues(
                     start = 16.dp,
                     end = 16.dp,
-                    top = 12.dp,
-                    bottom = if (isInputFloating) 96.dp else 24.dp
+                    top = 16.dp,
+                    bottom = if (isInputFloating) 108.dp else 36.dp
                 ),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 if (hasMoreOlderMessages) {
-                    item {
+                    item(key = "load_older_messages_header") {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.Center
@@ -929,12 +1393,14 @@ fun ChatDetailScreen(
                     }
                 }
 
-                itemsIndexed(
+                items(
                     items = isolatedMessages,
-                    key = { index, item -> "${item.id}_${item.chatId}_$index" }
-                ) { _, message ->
+                    key = { message -> message.id }
+                ) { message ->
+                    val effectiveMessageCategory = messageCategoryMap[message.id] ?: chatCategory
                     ChatMessageBubble(
                         message = message,
+                        messageCategory = effectiveMessageCategory,
                         onCopy = {
                             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                             val clip = ClipData.newPlainText("Gemini Message", message.content)
@@ -952,7 +1418,7 @@ fun ChatDetailScreen(
 
                 // Streaming in-progress message
                 if (streamingText != null) {
-                    item {
+                    item(key = "streaming_in_progress_bubble") {
                         GeminiStreamingBubble(text = streamingText)
                     }
                 }
@@ -1021,10 +1487,50 @@ fun ChatDetailScreen(
                     stagedAttachment = stagedAttachment,
                     onTakePhoto = onTakePhoto,
                     onBrowseFiles = onBrowseFiles,
-                    onStartVoiceRecording = onStartVoiceRecording,
-                    onTextInputFocusChanged = onTextInputFocusChanged
+                    isInChatDictationActive = isInChatDictationActive,
+                    viewModel = viewModel,
+                    onStartVoiceRecording = {
+                        if (viewModel != null) {
+                            viewModel.toggleInChatDictation()
+                        } else {
+                            onToggleInChatDictation()
+                        }
+                    },
+                    onToggleInChatDictation = {
+                        if (viewModel != null) {
+                            viewModel.toggleInChatDictation()
+                        } else {
+                            onToggleInChatDictation()
+                        }
+                    },
+                    onTextInputFocusChanged = {}
                 )
             }
+
+            // Persistent Right-Edge Collapsible Category Filter Chip Bar inside Chat Interface
+            com.example.ui.components.CollapsibleSideCategoryFilterBar(
+                selectedCategory = selectedChatCategoryFilter,
+                onSelectCategory = { selectedChatCategoryFilter = it },
+                isCollapsed = isChatCategoryBarCollapsed,
+                onToggleCollapsed = { isChatCategoryBarCollapsed = !isChatCategoryBarCollapsed },
+                chats = allChats,
+                chatCategoryMap = chatCategoryMap,
+                currentChatId = chat.id,
+                currentChatCategory = chatCategory,
+                isInChatInterface = true,
+                onNavigateToChat = { targetId: Long ->
+                    isChatCategoryBarCollapsed = true
+                    onSelectChatFromCategoryBar(targetId)
+                },
+                onReassignCurrentChatCategory = { newCategory: String ->
+                    selectedChatCategoryFilter = newCategory
+                    onReassignChatCategory(newCategory)
+                },
+                testTagPrefix = "chat",
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 2.dp)
+            )
         }
     }
 }
@@ -1032,6 +1538,7 @@ fun ChatDetailScreen(
 @Composable
 fun ChatMessageBubble(
     message: ChatMessage,
+    messageCategory: String? = null,
     onCopy: () -> Unit,
     onSpeak: () -> Unit,
     onOpenLink: (String, String?) -> Unit = { _, _ -> }
@@ -1051,12 +1558,13 @@ fun ChatMessageBubble(
     ) {
         if (isUser) {
             val context = LocalContext.current
-            val hasTranscribedText = message.hasTranscribedText
-            val isAudioPlaceholder = message.isAudioPlaceholderAttachment || ChatMessage.isLegacyAudioPlaceholder(message.content)
-            // Hide legacy audio attachment placeholders when actual transcribed text is available
-            val hasVisibleAttachment = (!message.attachmentName.isNullOrBlank() || !message.attachmentUri.isNullOrBlank()) &&
-                !(hasTranscribedText && message.isAudioPlaceholderAttachment) &&
-                !message.isAudioPlaceholderAttachment
+            val transcribedText = message.sanitizedTextContent
+            val hasTranscribedText = transcribedText.isNotEmpty()
+            // Hide legacy audio attachment placeholders when actual transcribed text is available or when placeholder-only
+            val hasVisibleAttachment = message.hasVisibleNonAudioAttachment
+            if (!hasTranscribedText && !hasVisibleAttachment) {
+                return@Column
+            }
             val isImageAttachment = message.attachmentMimeType?.startsWith("image/") == true
 
             // User message bubble
@@ -1071,167 +1579,237 @@ fun ChatMessageBubble(
                         .widthIn(max = 300.dp)
                         .testTag("user_message_bubble_${message.id}")
                 ) {
-                    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-                        if (hasVisibleAttachment) {
-                            if (isImageAttachment) {
-                                val decodedBitmap = remember(message.attachmentUri) {
-                                    try {
-                                        message.attachmentUri?.let { uriStr ->
-                                            val uri = Uri.parse(uriStr)
-                                            context.contentResolver.openInputStream(uri)?.use { stream ->
-                                                BitmapFactory.decodeStream(stream)?.asImageBitmap()
+                    SelectionContainer(
+                        modifier = Modifier.testTag("user_message_selection_container_${message.id}")
+                    ) {
+                        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                            if (hasVisibleAttachment) {
+                                DisableSelection {
+                                    if (isImageAttachment) {
+                                        val decodedBitmap = remember(message.attachmentUri) {
+                                            try {
+                                                message.attachmentUri?.let { uriStr ->
+                                                    val uri = Uri.parse(uriStr)
+                                                    context.contentResolver.openInputStream(uri)?.use { stream ->
+                                                        BitmapFactory.decodeStream(stream)?.asImageBitmap()
+                                                    }
+                                                }
+                                            } catch (_: Exception) {
+                                                null
                                             }
                                         }
-                                    } catch (_: Exception) {
-                                        null
-                                    }
-                                }
-                                Surface(
-                                    shape = RoundedCornerShape(10.dp),
-                                    color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.14f),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(bottom = if (hasTranscribedText) 8.dp else 4.dp)
-                                        .testTag("message_attachment_image_preview")
-                                ) {
-                                    Column {
-                                        if (decodedBitmap != null) {
-                                            Image(
-                                                bitmap = decodedBitmap,
-                                                contentDescription = message.attachmentName ?: "Attached photo",
-                                                contentScale = ContentScale.Crop,
-                                                modifier = Modifier
-                                                    .fillMaxWidth()
-                                                    .height(150.dp)
-                                                    .clip(RoundedCornerShape(topStart = 10.dp, topEnd = 10.dp))
-                                            )
-                                        } else {
-                                            Box(
-                                                modifier = Modifier
-                                                    .fillMaxWidth()
-                                                    .height(96.dp)
-                                                    .background(MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.1f)),
-                                                contentAlignment = Alignment.Center
+                                        Surface(
+                                            shape = RoundedCornerShape(10.dp),
+                                            color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.14f),
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(bottom = if (hasTranscribedText) 8.dp else 4.dp)
+                                                .testTag("message_attachment_image_preview")
+                                        ) {
+                                            Column {
+                                                if (decodedBitmap != null) {
+                                                    Image(
+                                                        bitmap = decodedBitmap,
+                                                        contentDescription = message.attachmentName ?: "Attached photo",
+                                                        contentScale = ContentScale.Crop,
+                                                        modifier = Modifier
+                                                            .fillMaxWidth()
+                                                            .height(150.dp)
+                                                            .clip(RoundedCornerShape(topStart = 10.dp, topEnd = 10.dp))
+                                                    )
+                                                } else {
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .fillMaxWidth()
+                                                            .height(96.dp)
+                                                            .background(MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.1f)),
+                                                        contentAlignment = Alignment.Center
+                                                    ) {
+                                                        Icon(
+                                                            imageVector = Icons.Default.CameraAlt,
+                                                            contentDescription = "Photo preview",
+                                                            tint = MaterialTheme.colorScheme.onPrimary,
+                                                            modifier = Modifier.size(32.dp)
+                                                        )
+                                                    }
+                                                }
+                                                Row(
+                                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Default.CameraAlt,
+                                                        contentDescription = null,
+                                                        tint = MaterialTheme.colorScheme.onPrimary,
+                                                        modifier = Modifier.size(14.dp)
+                                                    )
+                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                    Text(
+                                                        text = message.attachmentName ?: "Image",
+                                                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium),
+                                                        color = MaterialTheme.colorScheme.onPrimary,
+                                                        maxLines = 1,
+                                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        Surface(
+                                            shape = RoundedCornerShape(10.dp),
+                                            color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.16f),
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(bottom = if (hasTranscribedText) 8.dp else 4.dp)
+                                                .testTag("message_attachment_file_chip")
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                                verticalAlignment = Alignment.CenterVertically
                                             ) {
                                                 Icon(
-                                                    imageVector = Icons.Default.CameraAlt,
-                                                    contentDescription = "Photo preview",
+                                                    imageVector = Icons.Default.Description,
+                                                    contentDescription = "Attached document",
                                                     tint = MaterialTheme.colorScheme.onPrimary,
-                                                    modifier = Modifier.size(32.dp)
+                                                    modifier = Modifier.size(20.dp)
                                                 )
-                                            }
-                                        }
-                                        Row(
-                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Default.CameraAlt,
-                                                contentDescription = null,
-                                                tint = MaterialTheme.colorScheme.onPrimary,
-                                                modifier = Modifier.size(14.dp)
-                                            )
-                                            Spacer(modifier = Modifier.width(6.dp))
-                                            Text(
-                                                text = message.attachmentName ?: "Image",
-                                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium),
-                                                color = MaterialTheme.colorScheme.onPrimary,
-                                                maxLines = 1,
-                                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
-                                            )
-                                        }
-                                    }
-                                }
-                            } else {
-                                Surface(
-                                    shape = RoundedCornerShape(10.dp),
-                                    color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.16f),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(bottom = if (hasTranscribedText) 8.dp else 4.dp)
-                                        .testTag("message_attachment_file_chip")
-                                ) {
-                                    Row(
-                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.Description,
-                                            contentDescription = "Attached document",
-                                            tint = MaterialTheme.colorScheme.onPrimary,
-                                            modifier = Modifier.size(20.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text(
-                                                text = message.attachmentName ?: "Document",
-                                                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
-                                                color = MaterialTheme.colorScheme.onPrimary,
-                                                maxLines = 1,
-                                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
-                                            )
-                                            if (message.attachmentSizeBytes != null) {
-                                                Text(
-                                                    text = formatFileSize(message.attachmentSizeBytes),
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.8f)
-                                                )
+                                                Spacer(modifier = Modifier.width(8.dp))
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    Text(
+                                                        text = message.attachmentName ?: "Document",
+                                                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+                                                        color = MaterialTheme.colorScheme.onPrimary,
+                                                        maxLines = 1,
+                                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                                    )
+                                                    if (message.attachmentSizeBytes != null) {
+                                                        Text(
+                                                            text = formatFileSize(message.attachmentSizeBytes),
+                                                            style = MaterialTheme.typography.labelSmall,
+                                                            color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.8f)
+                                                        )
+                                                    }
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        if (hasTranscribedText) {
-                            Text(
-                                text = message.content.trim(),
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.onPrimary,
-                                modifier = Modifier.testTag("user_message_text_${message.id}")
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                        } else if (!hasVisibleAttachment && !isAudioPlaceholder && message.content.isNotBlank()) {
-                            Text(
-                                text = message.content.trim(),
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.onPrimary,
-                                modifier = Modifier.testTag("user_message_text_${message.id}")
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
+                            if (hasTranscribedText) {
+                                MarkdownMessageContent(
+                                    content = transcribedText,
+                                    textColor = MaterialTheme.colorScheme.onPrimary,
+                                    linkColor = MaterialTheme.colorScheme.onPrimary,
+                                    messageId = message.id,
+                                    onOpenLink = onOpenLink,
+                                    wrapInSelectionContainer = false,
+                                    modifier = Modifier.testTag("user_message_text_${message.id}")
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                            }
+                            var userMessageCopied by remember(message.id) { mutableStateOf(false) }
+                            LaunchedEffect(userMessageCopied) {
+                                if (userMessageCopied) {
+                                    delay(1800)
+                                    userMessageCopied = false
+                                }
+                            }
+                            // Wrap category badge, timestamp, sender metadata, and copy button in DisableSelection
+                            // so "Select All" only selects the actual message body text.
+                            DisableSelection {
+                                Row(
+                                    modifier = Modifier.align(Alignment.End),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    if (!messageCategory.isNullOrBlank()) {
+                                        Surface(
+                                            shape = RoundedCornerShape(6.dp),
+                                            color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.18f),
+                                            modifier = Modifier.testTag("message_category_badge_${message.id}")
+                                        ) {
+                                            Text(
+                                                text = "📁 $messageCategory",
+                                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.SemiBold),
+                                                color = MaterialTheme.colorScheme.onPrimary,
+                                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                                            )
+                                        }
+                                    }
+                                    Text(
+                                        text = timeFormatted,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.7f)
+                                    )
+                                    // Out-of-Turn Message Copy button on User bubble (reads directly from Room ChatMessage.content)
+                                    Surface(
+                                        shape = RoundedCornerShape(6.dp),
+                                        color = if (userMessageCopied) {
+                                            MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.28f)
+                                        } else {
+                                            MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.14f)
+                                        },
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .clickable {
+                                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                                val rawText = message.content.ifBlank { transcribedText }
+                                                clipboard.setPrimaryClip(ClipData.newPlainText("Chat Message", rawText))
+                                                userMessageCopied = true
+                                            }
+                                            .testTag("copy_message_button_${message.id}")
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Icon(
+                                                imageVector = if (userMessageCopied) Icons.Default.Check else Icons.Default.ContentCopy,
+                                                contentDescription = "Copy user message to clipboard",
+                                                tint = MaterialTheme.colorScheme.onPrimary,
+                                                modifier = Modifier.size(11.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(3.dp))
+                                            Text(
+                                                text = if (userMessageCopied) "Copied!" else "Copy",
+                                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.SemiBold),
+                                                color = MaterialTheme.colorScheme.onPrimary
+                                            )
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        Text(
-                            text = timeFormatted,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.7f),
-                            modifier = Modifier.align(Alignment.End)
-                        )
                     }
                 }
             }
         } else {
             // Gemini message bubble
+            val context = LocalContext.current
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.Start
             ) {
-                Box(
-                    modifier = Modifier
-                        .size(30.dp)
-                        .clip(CircleShape)
-                        .background(
-                            androidx.compose.ui.graphics.Brush.linearGradient(
-                                listOf(Color(0xFF38BDF8), Color(0xFFA855F7))
-                            )
-                        ),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.AutoAwesome,
-                        contentDescription = "Gemini",
-                        tint = Color.White,
-                        modifier = Modifier.size(16.dp)
-                    )
+                DisableSelection {
+                    Box(
+                        modifier = Modifier
+                            .size(30.dp)
+                            .clip(CircleShape)
+                            .background(
+                                androidx.compose.ui.graphics.Brush.linearGradient(
+                                    listOf(Color(0xFF38BDF8), Color(0xFFA855F7))
+                                )
+                            ),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AutoAwesome,
+                            contentDescription = "Gemini",
+                            tint = Color.White,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
                 }
 
                 Spacer(modifier = Modifier.width(8.dp))
@@ -1239,167 +1817,183 @@ fun ChatMessageBubble(
                 Surface(
                     shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp, bottomStart = 4.dp, bottomEnd = 16.dp),
                     color = MaterialTheme.colorScheme.surfaceVariant,
-                    modifier = Modifier.widthIn(max = 300.dp)
+                    modifier = Modifier
+                        .widthIn(max = 320.dp)
+                        .testTag("gemini_message_bubble_${message.id}")
                 ) {
-                    Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-                        // Simple Markdown/Code Block Rendering
-                        val contentParts = message.content.split("```")
-                        contentParts.forEachIndexed { index, part ->
-                            if (index % 2 == 1) {
-                                // Code Block
-                                Surface(
-                                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.6f),
-                                    shape = RoundedCornerShape(8.dp),
-                                    modifier = Modifier.padding(vertical = 4.dp)
-                                ) {
-                                    Text(
-                                        text = part,
-                                        style = androidx.compose.ui.text.TextStyle(
-                                            fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                                            fontSize = 13.sp
-                                        ),
-                                        modifier = Modifier.padding(8.dp)
-                                    )
-                                }
-                            } else {
-                                // Regular Text with clickable web links
-                                LinkifiedMessageText(
-                                    text = part,
-                                    textColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    linkColor = MaterialTheme.colorScheme.primary,
-                                    onOpenLink = onOpenLink
-                                )
-                            }
-                        }
+                    SelectionContainer(
+                        modifier = Modifier.testTag("gemini_message_selection_container_${message.id}")
+                    ) {
+                        Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                            // Markdown prose, lists, inline styles & fenced code blocks inside parent SelectionContainer
+                            MarkdownMessageContent(
+                                content = message.content,
+                                textColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                                linkColor = MaterialTheme.colorScheme.primary,
+                                messageId = message.id,
+                                onOpenLink = onOpenLink,
+                                wrapInSelectionContainer = false
+                            )
 
-                        if (extractedLinks.isNotEmpty()) {
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Column(
-                                verticalArrangement = Arrangement.spacedBy(6.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                extractedLinks.forEachIndexed { linkIdx, link ->
-                                    Surface(
-                                        shape = RoundedCornerShape(10.dp),
-                                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.85f),
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .clip(RoundedCornerShape(10.dp))
-                                            .clickable { onOpenLink(link.url, link.label) }
-                                            .testTag("chat_message_link_chip_${message.id}_$linkIdx")
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.SpaceBetween
+                            if (extractedLinks.isNotEmpty()) {
+                                DisableSelection {
+                                    Column {
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        Column(
+                                            verticalArrangement = Arrangement.spacedBy(6.dp),
+                                            modifier = Modifier.fillMaxWidth()
                                         ) {
-                                            Row(
-                                                modifier = Modifier.weight(1f),
-                                                verticalAlignment = Alignment.CenterVertically
-                                            ) {
-                                                Icon(
-                                                    imageVector = Icons.Default.Public,
-                                                    contentDescription = "Web link",
-                                                    tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                                                    modifier = Modifier.size(15.dp)
-                                                )
-                                                Spacer(modifier = Modifier.width(6.dp))
-                                                Column {
-                                                    Text(
-                                                        text = link.label,
-                                                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                                        maxLines = 1,
-                                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
-                                                    )
-                                                    Text(
-                                                        text = link.url,
-                                                        style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                                                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.78f),
-                                                        maxLines = 1,
-                                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
-                                                    )
+                                            extractedLinks.forEachIndexed { linkIdx, link ->
+                                                Surface(
+                                                    shape = RoundedCornerShape(10.dp),
+                                                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.85f),
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .clip(RoundedCornerShape(10.dp))
+                                                        .clickable { onOpenLink(link.url, link.label) }
+                                                        .testTag("chat_message_link_chip_${message.id}_$linkIdx")
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.SpaceBetween
+                                                    ) {
+                                                        Row(
+                                                            modifier = Modifier.weight(1f),
+                                                            verticalAlignment = Alignment.CenterVertically
+                                                        ) {
+                                                            Icon(
+                                                                imageVector = Icons.Default.Public,
+                                                                contentDescription = "Web link",
+                                                                tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                                                modifier = Modifier.size(15.dp)
+                                                            )
+                                                            Spacer(modifier = Modifier.width(6.dp))
+                                                            Column {
+                                                                Text(
+                                                                    text = link.label,
+                                                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                                                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                                                    maxLines = 1,
+                                                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                                                )
+                                                                Text(
+                                                                    text = link.url,
+                                                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                                                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.78f),
+                                                                    maxLines = 1,
+                                                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                                                                )
+                                                            }
+                                                        }
+                                                        Spacer(modifier = Modifier.width(6.dp))
+                                                        Icon(
+                                                            imageVector = Icons.Default.OpenInNew,
+                                                            contentDescription = "Open link in default browser",
+                                                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                                            modifier = Modifier.size(15.dp)
+                                                        )
+                                                    }
                                                 }
                                             }
-                                            Spacer(modifier = Modifier.width(6.dp))
-                                            Icon(
-                                                imageVector = Icons.Default.OpenInNew,
-                                                contentDescription = "Open link in default browser",
-                                                tint = MaterialTheme.colorScheme.onPrimaryContainer,
-                                                modifier = Modifier.size(15.dp)
-                                            )
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        Spacer(modifier = Modifier.height(6.dp))
-                        var copied by remember(message.id) { mutableStateOf(false) }
-                        LaunchedEffect(copied) {
-                            if (copied) {
-                                delay(1800)
-                                copied = false
-                            }
-                        }
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = timeFormatted,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
-                            )
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(4.dp)
-                            ) {
-                                IconButton(
-                                    onClick = onSpeak,
-                                    modifier = Modifier
-                                        .size(26.dp)
-                                        .testTag("speak_message_button_${message.id}")
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.AutoMirrored.Filled.VolumeUp,
-                                        contentDescription = "Read message aloud",
-                                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
-                                        modifier = Modifier.size(14.dp)
-                                    )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            var copied by remember(message.id) { mutableStateOf(false) }
+                            LaunchedEffect(copied) {
+                                if (copied) {
+                                    delay(1800)
+                                    copied = false
                                 }
-                                Surface(
-                                    shape = RoundedCornerShape(8.dp),
-                                    color = if (copied) {
-                                        MaterialTheme.colorScheme.primaryContainer
-                                    } else {
-                                        MaterialTheme.colorScheme.surface.copy(alpha = 0.7f)
-                                    },
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(8.dp))
-                                        .clickable {
-                                            copied = true
-                                            onCopy()
-                                        }
-                                        .testTag("copy_message_button_${message.id}")
+                            }
+                            // Wrap category badge, timestamp, speaker icon, and copy button in DisableSelection
+                            // so "Select All" only grabs the actual message body without trailing UI metadata.
+                            DisableSelection {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Row(
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                                        verticalAlignment = Alignment.CenterVertically
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                                     ) {
-                                        Icon(
-                                            imageVector = if (copied) Icons.Default.Check else Icons.Default.ContentCopy,
-                                            contentDescription = "Copy model response to clipboard",
-                                            tint = if (copied) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.primary,
-                                            modifier = Modifier.size(13.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(4.dp))
+                                        if (!messageCategory.isNullOrBlank()) {
+                                            Surface(
+                                                shape = RoundedCornerShape(6.dp),
+                                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.14f),
+                                                modifier = Modifier.testTag("message_category_badge_${message.id}")
+                                            ) {
+                                                Text(
+                                                    text = "📁 $messageCategory",
+                                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp, fontWeight = FontWeight.SemiBold),
+                                                    color = MaterialTheme.colorScheme.primary,
+                                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                                                )
+                                            }
+                                        }
                                         Text(
-                                            text = if (copied) "Copied" else "Copy",
-                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                            color = if (copied) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.primary
+                                            text = timeFormatted,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
                                         )
+                                    }
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        IconButton(
+                                            onClick = onSpeak,
+                                            modifier = Modifier
+                                                .size(26.dp)
+                                                .testTag("speak_message_button_${message.id}")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.AutoMirrored.Filled.VolumeUp,
+                                                contentDescription = "Read message aloud",
+                                                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+                                                modifier = Modifier.size(14.dp)
+                                            )
+                                        }
+                                        Surface(
+                                            shape = RoundedCornerShape(8.dp),
+                                            color = if (copied) {
+                                                MaterialTheme.colorScheme.primaryContainer
+                                            } else {
+                                                MaterialTheme.colorScheme.surface.copy(alpha = 0.7f)
+                                            },
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .clickable {
+                                                    // Out-of-Turn Message Copy: read directly from Room ChatMessage.content
+                                                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                                    clipboard.setPrimaryClip(ClipData.newPlainText("Gemini Message", message.content))
+                                                    copied = true
+                                                    onCopy()
+                                                }
+                                                .testTag("copy_message_button_${message.id}")
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Icon(
+                                                    imageVector = if (copied) Icons.Default.Check else Icons.Default.ContentCopy,
+                                                    contentDescription = "Copy model response to clipboard",
+                                                    tint = if (copied) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.primary,
+                                                    modifier = Modifier.size(13.dp)
+                                                )
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text(
+                                                    text = if (copied) "Copied!" else "Copy",
+                                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                                    color = if (copied) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.primary
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1435,18 +2029,24 @@ fun LinkifiedMessageText(
                 val safeStart = link.startIndex.coerceIn(0, text.length)
                 val safeEnd = link.endIndex.coerceIn(safeStart, text.length)
                 if (safeStart < safeEnd) {
+                    val linkStyle = SpanStyle(
+                        color = linkColor,
+                        fontWeight = FontWeight.SemiBold,
+                        textDecoration = TextDecoration.Underline
+                    )
                     addStyle(
-                        style = SpanStyle(
-                            color = linkColor,
-                            fontWeight = FontWeight.SemiBold,
-                            textDecoration = TextDecoration.Underline
-                        ),
+                        style = linkStyle,
                         start = safeStart,
                         end = safeEnd
                     )
-                    addStringAnnotation(
-                        tag = "URL",
-                        annotation = link.url,
+                    addLink(
+                        url = LinkAnnotation.Url(
+                            url = link.url,
+                            styles = TextLinkStyles(style = linkStyle),
+                            linkInteractionListener = {
+                                onOpenLink(link.url, link.label)
+                            }
+                        ),
                         start = safeStart,
                         end = safeEnd
                     )
@@ -1455,17 +2055,9 @@ fun LinkifiedMessageText(
         }
     }
 
-    @Suppress("DEPRECATION")
-    ClickableText(
+    Text(
         text = annotatedString,
-        style = MaterialTheme.typography.bodyLarge.copy(color = textColor),
-        onClick = { offset ->
-            annotatedString.getStringAnnotations(tag = "URL", start = offset, end = offset)
-                .firstOrNull()?.let { annotation ->
-                    val matchedLink = links.firstOrNull { it.url == annotation.item }
-                    onOpenLink(annotation.item, matchedLink?.label)
-                }
-        }
+        style = MaterialTheme.typography.bodyLarge.copy(color = textColor)
     )
 }
 
@@ -1486,23 +2078,25 @@ fun GeminiStreamingBubble(text: String) {
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.Start
     ) {
-        Box(
-            modifier = Modifier
-                .size(30.dp)
-                .clip(CircleShape)
-                .background(
-                    androidx.compose.ui.graphics.Brush.linearGradient(
-                        listOf(Color(0xFF38BDF8), Color(0xFFA855F7))
-                    )
-                ),
-            contentAlignment = Alignment.Center
-        ) {
-            Icon(
-                imageVector = Icons.Default.AutoAwesome,
-                contentDescription = "Gemini",
-                tint = Color.White,
-                modifier = Modifier.size(16.dp)
-            )
+        DisableSelection {
+            Box(
+                modifier = Modifier
+                    .size(30.dp)
+                    .clip(CircleShape)
+                    .background(
+                        androidx.compose.ui.graphics.Brush.linearGradient(
+                            listOf(Color(0xFF38BDF8), Color(0xFFA855F7))
+                        )
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.AutoAwesome,
+                    contentDescription = "Gemini",
+                    tint = Color.White,
+                    modifier = Modifier.size(16.dp)
+                )
+            }
         }
 
         Spacer(modifier = Modifier.width(8.dp))
@@ -1514,28 +2108,33 @@ fun GeminiStreamingBubble(text: String) {
             ),
             modifier = Modifier.widthIn(max = 320.dp)
         ) {
-            Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-                if (text.isNotBlank()) {
-                    Text(
-                        text = text,
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(
-                        modifier = Modifier
-                            .size(8.dp)
-                            .clip(CircleShape)
-                            .background(MaterialTheme.colorScheme.primary.copy(alpha = alpha))
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "Gemini is replying...",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary
-                    )
+            SelectionContainer {
+                Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+                    if (text.isNotBlank()) {
+                        MarkdownMessageContent(
+                            content = text,
+                            textColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                            linkColor = MaterialTheme.colorScheme.primary,
+                            wrapInSelectionContainer = false
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                    }
+                    DisableSelection {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.primary.copy(alpha = alpha))
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Gemini is replying...",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -1555,13 +2154,25 @@ fun ChatBottomInputBar(
     onSelectPrompt: (PromptTemplate) -> Unit = {},
     onOpenCreatePrompt: () -> Unit = {},
     onDeletePrompt: (String) -> Unit = {},
+    onPickImage: () -> Unit = {},
+    onPasteClipboardImage: () -> Unit = {},
     onTakePhoto: () -> Unit = {},
     onBrowseFiles: () -> Unit = {},
+    attachedImageUri: Uri? = null,
     stagedAttachment: com.example.ui.AttachmentPayload? = null,
     onClearStagedAttachment: () -> Unit = {},
     isVoiceRecording: Boolean = false,
+    isInChatDictationActive: Boolean = false,
     audioRmsDb: Float = 0f,
+    viewModel: com.example.ui.MainViewModel? = null,
     onStartVoiceRecording: () -> Unit = {},
+    onToggleInChatDictation: () -> Unit = {
+        if (viewModel != null) {
+            viewModel.toggleInChatDictation()
+        } else {
+            onStartVoiceRecording()
+        }
+    },
     onSendVoiceRecording: () -> Unit = {},
     onCancelVoiceRecording: () -> Unit = {},
     networkState: NetworkConnectionState = NetworkConnectionState.ONLINE_WIFI,
@@ -1570,18 +2181,23 @@ fun ChatBottomInputBar(
     onTextInputFocusChanged: (Boolean) -> Unit = {},
     hasBufferedSpeech: Boolean = false
 ) {
+    val context = LocalContext.current
+    val hasStagedPreview = attachedImageUri != null || stagedAttachment != null
+
     Surface(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("chat_bottom_composer_surface"),
         color = MaterialTheme.colorScheme.surface,
         tonalElevation = 4.dp
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .navigationBarsPadding()
-                .imePadding()
+                .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))
+                .padding(top = 4.dp)
         ) {
-            // Compact Bottom Bar Utility Strip: Network Status Icon + Floating Input Anchor Toggle
+            // Compact Bottom Bar Utility Strip: Network Status Icon + Paste Image + Floating Input Anchor Toggle
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1593,52 +2209,93 @@ fun ChatBottomInputBar(
                     networkState = networkState,
                     onRefreshNetwork = onRefreshNetwork
                 )
-                Surface(
-                    shape = RoundedCornerShape(14.dp),
-                    color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(14.dp))
-                        .clickable { onUndockToFloating() }
-                        .testTag("toggle_floating_input_button")
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(14.dp))
+                            .clickable { onPasteClipboardImage() }
+                            .testTag("paste_clipboard_image_button")
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .clip(CircleShape)
-                                .background(MaterialTheme.colorScheme.primary)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Icon(
-                            imageVector = Icons.Default.OpenWith,
-                            contentDescription = "Float Input Box with Anchor Dot",
-                            tint = MaterialTheme.colorScheme.onSecondaryContainer,
-                            modifier = Modifier.size(13.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "Float Input",
-                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                            color = MaterialTheme.colorScheme.onSecondaryContainer
-                        )
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.ContentPaste,
+                                contentDescription = "Paste image from clipboard",
+                                tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Paste Image",
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                color = MaterialTheme.colorScheme.onPrimaryContainer
+                            )
+                        }
+                    }
+
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(14.dp))
+                            .clickable { onUndockToFloating() }
+                            .testTag("toggle_floating_input_button")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.primary)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Icon(
+                                imageVector = Icons.Default.OpenWith,
+                                contentDescription = "Float Input Box with Anchor Dot",
+                                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Float Input",
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                        }
                     }
                 }
             }
-            // Compact Staged Attachment Thumbnail / Chip above text field
+
+            // Removable Image Thumbnail Preview Chip with dismiss "✕" icon above text input bar
             AnimatedVisibility(
-                visible = stagedAttachment != null,
+                visible = hasStagedPreview,
                 enter = fadeIn() + slideInVertically(initialOffsetY = { it / 2 }),
                 exit = fadeOut() + slideOutVertically(targetOffsetY = { it / 2 })
             ) {
-                if (stagedAttachment != null) {
-                    val isImage = stagedAttachment.mimeType.startsWith("image/")
-                    val thumbnailBitmap = remember(stagedAttachment.bytes, isImage) {
-                        if (isImage && stagedAttachment.bytes.isNotEmpty()) {
+                if (hasStagedPreview) {
+                    val isImage = attachedImageUri != null || stagedAttachment?.mimeType?.startsWith("image/") == true
+                    val thumbnailBitmap = remember(stagedAttachment?.bytes, attachedImageUri, isImage) {
+                        if (stagedAttachment != null && isImage && stagedAttachment.bytes.isNotEmpty()) {
                             try {
                                 BitmapFactory.decodeByteArray(stagedAttachment.bytes, 0, stagedAttachment.bytes.size)?.asImageBitmap()
+                            } catch (_: Exception) {
+                                null
+                            }
+                        } else if (attachedImageUri != null) {
+                            try {
+                                context.contentResolver.openInputStream(attachedImageUri)?.use { stream ->
+                                    BitmapFactory.decodeStream(stream)?.asImageBitmap()
+                                }
                             } catch (_: Exception) {
                                 null
                             }
@@ -1656,7 +2313,8 @@ fun ChatBottomInputBar(
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                                .padding(horizontal = 12.dp, vertical = 8.dp)
+                                .testTag("attached_image_preview_chip"),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
@@ -1668,24 +2326,24 @@ fun ChatBottomInputBar(
                                     if (thumbnailBitmap != null) {
                                         Image(
                                             bitmap = thumbnailBitmap,
-                                            contentDescription = stagedAttachment.fileName,
+                                            contentDescription = stagedAttachment?.fileName ?: "Staged image preview",
                                             contentScale = ContentScale.Crop,
                                             modifier = Modifier
-                                                .size(40.dp)
+                                                .size(44.dp)
                                                 .clip(RoundedCornerShape(8.dp))
                                                 .testTag("staged_attachment_thumbnail")
                                         )
                                     } else {
                                         Box(
                                             modifier = Modifier
-                                                .size(40.dp)
+                                                .size(44.dp)
                                                 .clip(RoundedCornerShape(8.dp))
                                                 .background(MaterialTheme.colorScheme.primaryContainer)
                                                 .testTag("staged_attachment_thumbnail"),
                                             contentAlignment = Alignment.Center
                                         ) {
                                             Icon(
-                                                imageVector = Icons.Default.CameraAlt,
+                                                imageVector = Icons.Default.Image,
                                                 contentDescription = "Photo attachment",
                                                 tint = MaterialTheme.colorScheme.onPrimaryContainer,
                                                 modifier = Modifier.size(20.dp)
@@ -1703,14 +2361,18 @@ fun ChatBottomInputBar(
                                 Spacer(modifier = Modifier.width(10.dp))
                                 Column(modifier = Modifier.weight(1f)) {
                                     Text(
-                                        text = stagedAttachment.fileName,
+                                        text = stagedAttachment?.fileName ?: attachedImageUri?.lastPathSegment ?: "Attached Image",
                                         style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
                                         color = MaterialTheme.colorScheme.onSurface,
                                         maxLines = 1,
                                         overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                                     )
                                     Text(
-                                        text = formatFileSize(stagedAttachment.sizeBytes),
+                                        text = if (stagedAttachment != null) {
+                                            formatFileSize(stagedAttachment.sizeBytes)
+                                        } else {
+                                            "Ready to send with message"
+                                        },
                                         style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
@@ -1722,19 +2384,16 @@ fun ChatBottomInputBar(
                                     .size(28.dp)
                                     .testTag("remove_attachment_button")
                             ) {
-                                Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = "Remove attachment",
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(16.dp)
+                                Text(
+                                    text = "✕",
+                                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
                         }
                     }
                 }
             }
-
-            // Quick Prompts Carousel Toggle (Now inside the Box below)
 
             AnimatedVisibility(visible = showPromptsBar) {
                 Column(
@@ -1767,7 +2426,6 @@ fun ChatBottomInputBar(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // + Add New Prompt Button
                         item {
                             Surface(
                                 shape = RoundedCornerShape(16.dp),
@@ -1908,13 +2566,32 @@ fun ChatBottomInputBar(
                                     if (showPromptsBar) MaterialTheme.colorScheme.primary
                                     else MaterialTheme.colorScheme.surfaceVariant
                                 )
-                                .size(42.dp)
+                                .size(40.dp)
                                 .testTag("toggle_custom_prompts_button")
                         ) {
-                            Icon(Icons.Default.Tune, null, tint = if (showPromptsBar) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary)
+                            Icon(Icons.Default.Tune, "Quick Prompts", tint = if (showPromptsBar) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary)
                         }
 
-                        Spacer(modifier = Modifier.width(6.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+
+                        // Dedicated Attach Image button (PickVisualMedia)
+                        IconButton(
+                            onClick = onPickImage,
+                            enabled = !isSending,
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(MaterialTheme.colorScheme.surfaceVariant)
+                                .size(40.dp)
+                                .testTag("attach_image_picker_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Image,
+                                contentDescription = "Attach Image",
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.width(4.dp))
 
                         Box {
                             var showAttachmentMenu by remember { mutableStateOf(false) }
@@ -1924,18 +2601,36 @@ fun ChatBottomInputBar(
                                 modifier = Modifier
                                     .clip(CircleShape)
                                     .background(MaterialTheme.colorScheme.surfaceVariant)
-                                    .size(42.dp)
+                                    .size(40.dp)
                                     .testTag("attachment_button")
                             ) {
-                                Icon(Icons.Default.Add, null, tint = MaterialTheme.colorScheme.primary)
+                                Icon(Icons.Default.Add, "More attachments", tint = MaterialTheme.colorScheme.primary)
                             }
                             DropdownMenu(expanded = showAttachmentMenu, onDismissRequest = { showAttachmentMenu = false }) {
-                                DropdownMenuItem(text = { Text("Take Photo") }, leadingIcon = { Icon(Icons.Default.CameraAlt, null) }, onClick = { showAttachmentMenu = false; onTakePhoto() })
-                                DropdownMenuItem(text = { Text("Browse Files") }, leadingIcon = { Icon(Icons.Default.Folder, null) }, onClick = { showAttachmentMenu = false; onBrowseFiles() })
+                                DropdownMenuItem(
+                                    text = { Text("Pick Image from Gallery") },
+                                    leadingIcon = { Icon(Icons.Default.Image, null) },
+                                    onClick = { showAttachmentMenu = false; onPickImage() }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Paste Image from Clipboard") },
+                                    leadingIcon = { Icon(Icons.Default.ContentPaste, null) },
+                                    onClick = { showAttachmentMenu = false; onPasteClipboardImage() }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Take Photo") },
+                                    leadingIcon = { Icon(Icons.Default.CameraAlt, null) },
+                                    onClick = { showAttachmentMenu = false; onTakePhoto() }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Browse Files") },
+                                    leadingIcon = { Icon(Icons.Default.Folder, null) },
+                                    onClick = { showAttachmentMenu = false; onBrowseFiles() }
+                                )
                             }
                         }
 
-                        Spacer(modifier = Modifier.width(8.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
 
                         OutlinedTextField(
                             value = inputText,
@@ -1944,7 +2639,9 @@ fun ChatBottomInputBar(
                             placeholder = { Text("Ask Gemini...") },
                             modifier = Modifier
                                 .weight(1f)
-                                .onFocusChanged { onTextInputFocusChanged(it.isFocused) }
+                                .onFocusChanged { focusState ->
+                                    onTextInputFocusChanged(focusState.isFocused)
+                                }
                                 .testTag("chat_input_textfield"),
                             shape = RoundedCornerShape(24.dp),
                             maxLines = 4,
@@ -1958,29 +2655,46 @@ fun ChatBottomInputBar(
                         Spacer(modifier = Modifier.width(6.dp))
 
                         IconButton(
-                            onClick = onStartVoiceRecording,
+                            onClick = {
+                                if (viewModel != null) {
+                                    viewModel.toggleInChatDictation()
+                                } else {
+                                    onToggleInChatDictation()
+                                }
+                            },
                             enabled = !isGenerating && !isSending,
-                            modifier = Modifier.clip(CircleShape).background(MaterialTheme.colorScheme.surfaceVariant).size(42.dp).testTag("start_voice_button")
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(
+                                    if (isInChatDictationActive) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.surfaceVariant
+                                )
+                                .size(40.dp)
+                                .testTag("start_voice_button")
                         ) {
-                            Icon(Icons.Default.Mic, null, tint = MaterialTheme.colorScheme.primary)
+                            Icon(
+                                imageVector = Icons.Default.Mic,
+                                contentDescription = if (isInChatDictationActive) "Stop in-chat voice dictation" else "In-chat voice dictation",
+                                tint = if (isInChatDictationActive) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary
+                            )
                         }
 
                         Spacer(modifier = Modifier.width(6.dp))
 
-                        val canSend = (inputText.text.isNotBlank() || hasBufferedSpeech || stagedAttachment != null) && !isGenerating && !isSending
+                        val canSend = (inputText.text.isNotBlank() || hasBufferedSpeech || hasStagedPreview) && !isGenerating && !isSending
                         IconButton(
                             onClick = onSend,
                             enabled = canSend,
                             modifier = Modifier
                                 .clip(CircleShape)
                                 .background(if (canSend) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant)
-                                .size(42.dp)
+                                .size(40.dp)
                                 .testTag("send_message_button")
                         ) {
                             if (isGenerating) {
                                 CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             } else {
-                                Icon(Icons.AutoMirrored.Filled.Send, null, tint = if (canSend) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f))
+                                Icon(Icons.AutoMirrored.Filled.Send, "Send message", tint = if (canSend) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f))
                             }
                         }
                     }

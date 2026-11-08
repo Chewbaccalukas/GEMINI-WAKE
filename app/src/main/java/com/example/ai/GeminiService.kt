@@ -6,7 +6,9 @@ import kotlinx.coroutines.flow.flow
 
 class GeminiService {
 
-    private val apiService = GeminiApiService()
+    private val apiService: GeminiApiService by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        GeminiApiService()
+    }
 
     /**
      * Streams responses from Gemini with support for Orion neural speech, graceful text fallback, and 429 failover.

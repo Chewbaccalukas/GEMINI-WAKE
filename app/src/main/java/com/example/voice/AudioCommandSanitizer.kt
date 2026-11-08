@@ -54,6 +54,48 @@ enum class WakeSensitivityLevel(
 }
 
 /**
+ * Distinct tactile vibration patterns for Hands-Free Radar status toggles,
+ * wake-word detections, and spoken voice command triggers.
+ */
+enum class HapticPatternType(
+    val displayName: String,
+    val timingsMs: LongArray,
+    val amplitudes: IntArray,
+    val fallbackDurationMs: Long
+) {
+    RADAR_TOGGLE_ON(
+        displayName = "Radar Activated (Rising Double Pulse)",
+        timingsMs = longArrayOf(0L, 35L, 45L, 65L),
+        amplitudes = intArrayOf(0, 140, 0, 230),
+        fallbackDurationMs = 65L
+    ),
+    RADAR_TOGGLE_OFF(
+        displayName = "Radar Standby (Soft Single Pulse)",
+        timingsMs = longArrayOf(0L, 45L),
+        amplitudes = intArrayOf(0, 120),
+        fallbackDurationMs = 45L
+    ),
+    WAKE_WORD_DETECTED(
+        displayName = "Wake Word Detected (Double Confirmation Pulse)",
+        timingsMs = longArrayOf(0L, 50L, 60L, 95L),
+        amplitudes = intArrayOf(0, 180, 0, 255),
+        fallbackDurationMs = 95L
+    ),
+    VOICE_COMMAND_TRIGGERED(
+        displayName = "Voice Command Triggered (Crisp Action Pulse)",
+        timingsMs = longArrayOf(0L, 110L),
+        amplitudes = intArrayOf(0, 220),
+        fallbackDurationMs = 110L
+    ),
+    HEARTBEAT_PING(
+        displayName = "Heartbeat Ping Confirmation",
+        timingsMs = longArrayOf(0L, 150L),
+        amplitudes = intArrayOf(0, 200),
+        fallbackDurationMs = 150L
+    )
+}
+
+/**
  * AudioCommandSanitizer detects custom and default trigger phrases (Dictate, Send, Heartbeat, Sleep, Wake Up)
  * and scrubs internal action commands from speech buffers so command words never bleed into
  * Room database entries or Gemini AI prompts.
@@ -64,6 +106,30 @@ object AudioCommandSanitizer {
     const val DEFAULT_HEARTBEAT_TRIGGER = "Heartbeat"
     const val DEFAULT_SLEEP_COMMAND = "Gemini, sleep"
     const val DEFAULT_WAKE_UP_COMMAND = "Gemini, wake up"
+    private const val VOICE_HAPTIC_DEBOUNCE_MS = 220L
+
+    @Volatile
+    var lastHapticPattern: HapticPatternType? = null
+        private set
+
+    @Volatile
+    var lastHapticTimestampMs: Long = 0L
+        private set
+
+    @Volatile
+    var hapticTriggerCount: Int = 0
+        private set
+
+    private val recentHapticEvents = java.util.concurrent.ConcurrentLinkedDeque<String>()
+
+    fun getRecentHapticEvents(): List<String> = recentHapticEvents.toList()
+
+    fun resetHapticDiagnosticsForTest() {
+        lastHapticPattern = null
+        lastHapticTimestampMs = 0L
+        hapticTriggerCount = 0
+        recentHapticEvents.clear()
+    }
 
     val DEFAULT_DICTATE_SYNONYMS = listOf("dictate", "take note", "start dictation")
     val DEFAULT_SEND_SYNONYMS = listOf("send", "over", "send message", "dispatch")
@@ -90,7 +156,99 @@ object AudioCommandSanitizer {
         "resume listening",
         "gemini resume"
     )
-    val DEFAULT_WAKE_WORDS = listOf("open", "gemini", "hey gemini", "ok gemini", "jimmy")
+    val DEFAULT_WAKE_WORDS = listOf(
+        "hey gemini",
+        "ok gemini",
+        "okay gemini",
+        "hi gemini",
+        "hey jimmy",
+        "ok jimmy",
+        "okay jimmy",
+        "hi jimmy",
+        "gemini",
+        "jimmy",
+        "open"
+    )
+
+    val DEFAULT_HISTORY_COMMAND_SYNONYMS = listOf(
+        "open history",
+        "show history",
+        "voice history",
+        "go to history",
+        "view history",
+        "open voice history",
+        "show voice history",
+        "history"
+    )
+
+    /**
+     * Checks if spoken text is a voice history navigation command ("open history", "show history", "voice history")
+     * either standalone or following a wake word prefix (e.g., "Hey Gemini, open history").
+     * Note: Because "open" is also a default wake trigger, "open history" stripped of "open" yields "history",
+     * which is explicitly handled here so "open history" routes to the History screen instead of a chat prompt.
+     */
+    fun isVoiceHistoryNavigationCommand(
+        text: String?,
+        customWakeWords: Collection<String> = emptyList()
+    ): Boolean {
+        if (text.isNullOrBlank()) return false
+        val rawClean = text.trim()
+            .lowercase(java.util.Locale.US)
+            .trimEnd('.', '!', '?', ',', ';', ':')
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        if (rawClean.isBlank()) return false
+
+        // Direct match on full phrase ("open history", "show history", "voice history", etc.)
+        if (rawClean == "open history" ||
+            rawClean == "show history" ||
+            rawClean == "voice history" ||
+            rawClean == "go to history" ||
+            rawClean == "view history" ||
+            rawClean == "open voice history" ||
+            rawClean == "show voice history"
+        ) {
+            return true
+        }
+
+        // Strip any non-"open" wake words first so "Hey Gemini, open history" -> "open history"
+        val nonOpenWakeWords = (customWakeWords.map { it.trim() } + DEFAULT_WAKE_WORDS)
+            .filter { it.isNotBlank() && !it.equals("open", ignoreCase = true) }
+            .distinctBy { it.lowercase(java.util.Locale.US) }
+            .sortedByDescending { it.length }
+
+        var strippedNonOpen = rawClean
+        var changed = true
+        while (changed && strippedNonOpen.isNotBlank()) {
+            changed = false
+            for (wake in nonOpenWakeWords) {
+                val escapedWake = Regex.escape(wake)
+                val leadingRegex = Regex("(?i)^[,\\s.!?-]*(?:(?:hey|ok|okay|hi)\\s+)?$escapedWake\\b[,:\\s.!?;-]*")
+                if (leadingRegex.containsMatchIn(strippedNonOpen)) {
+                    strippedNonOpen = strippedNonOpen.replaceFirst(leadingRegex, "").trim()
+                    changed = true
+                }
+            }
+        }
+        strippedNonOpen = strippedNonOpen
+            .lowercase(java.util.Locale.US)
+            .trimEnd('.', '!', '?', ',', ';', ':')
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+        if (strippedNonOpen == "open history" ||
+            strippedNonOpen == "show history" ||
+            strippedNonOpen == "voice history" ||
+            strippedNonOpen == "go to history" ||
+            strippedNonOpen == "view history" ||
+            strippedNonOpen == "open voice history" ||
+            strippedNonOpen == "show voice history"
+        ) {
+            return true
+        }
+
+        return false
+    }
 
     /**
      * Checks if spoken text is a sleep command (e.g., "Gemini, sleep") to temporarily disable the wake word listener.
@@ -148,8 +306,8 @@ object AudioCommandSanitizer {
 
     /**
      * Strips any leading or standalone wake word trigger (e.g. "open", custom chat wakeWord,
-     * "hey gemini") from spoken or buffered text so the wake word itself is never injected
-     * into the user prompt or Gemini chat message.
+     * "hey gemini", "hey jimmy") from spoken or buffered text so the wake word itself is never
+     * injected into the user prompt or Gemini chat message.
      */
     fun stripWakeWordTrigger(
         rawText: String,
@@ -161,18 +319,19 @@ object AudioCommandSanitizer {
         val wakeTargets = (customWakeWords.map { it.trim() } + DEFAULT_WAKE_WORDS)
             .filter { it.isNotBlank() }
             .distinctBy { it.lowercase() }
-            // Sort longest first so multi-word wake phrases ("hey gemini") match before single words ("gemini")
+            // Sort longest first so multi-word wake phrases ("hey gemini", "hey jimmy") match before single words ("gemini", "jimmy")
             .sortedByDescending { it.length }
 
         var changed = true
         while (changed && cleaned.isNotBlank()) {
             changed = false
             for (wake in wakeTargets) {
-                val standaloneRegex = Regex("(?i)^[,\\s.!?-]*${Regex.escape(wake)}[,\\s.!?-]*$")
+                val escapedWake = Regex.escape(wake)
+                val standaloneRegex = Regex("(?i)^[,\\s.!?-]*(?:(?:hey|ok|okay|hi)\\s+)?$escapedWake[,\\s.!?-]*$")
                 if (standaloneRegex.matches(cleaned)) {
                     return ""
                 }
-                val leadingRegex = Regex("(?i)^${Regex.escape(wake)}\\b[,:\\s.!?-]*")
+                val leadingRegex = Regex("(?i)^[,\\s.!?-]*(?:(?:hey|ok|okay|hi)\\s+)?$escapedWake\\b[,:\\s.!?;-]*")
                 if (leadingRegex.containsMatchIn(cleaned)) {
                     cleaned = cleaned.replaceFirst(leadingRegex, "").trim()
                     changed = true
@@ -333,9 +492,35 @@ object AudioCommandSanitizer {
     }
 
     /**
-     * Triggers silent haptic feedback pulse upon heartbeat trigger interception without synthesizing status audio.
+     * Executes a distinct hardware haptic feedback pattern using [VibratorManager] / [Vibrator].
+     * Applies a short debounce window for voice activation triggers so overlapping partial/final
+     * callbacks do not double-vibrate for the same spoken event.
      */
-    fun playHeartbeatConfirmation(context: Context) {
+    @Synchronized
+    fun triggerHapticFeedback(
+        context: Context,
+        pattern: HapticPatternType,
+        reason: String = pattern.displayName,
+        bypassDebounce: Boolean = false
+    ): Boolean {
+        val now = System.currentTimeMillis()
+        if (!bypassDebounce &&
+            lastHapticPattern == pattern &&
+            now - lastHapticTimestampMs in 0 until VOICE_HAPTIC_DEBOUNCE_MS
+        ) {
+            return false
+        }
+        lastHapticPattern = pattern
+        lastHapticTimestampMs = now
+        hapticTriggerCount += 1
+
+        val timeFormatted = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US)
+            .format(java.util.Date(now))
+        recentHapticEvents.addFirst("[$timeFormatted] ${pattern.name}: $reason")
+        while (recentHapticEvents.size > 30) {
+            recentHapticEvents.pollLast()
+        }
+
         try {
             val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
@@ -346,13 +531,76 @@ object AudioCommandSanitizer {
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                vibrator?.vibrate(VibrationEffect.createOneShot(150, VibrationEffect.DEFAULT_AMPLITUDE))
+                val effect = if (pattern.timingsMs.size > 2) {
+                    VibrationEffect.createWaveform(pattern.timingsMs, pattern.amplitudes, -1)
+                } else {
+                    VibrationEffect.createOneShot(
+                        pattern.fallbackDurationMs,
+                        VibrationEffect.DEFAULT_AMPLITUDE
+                    )
+                }
+                vibrator?.vibrate(effect)
             } else {
                 @Suppress("DEPRECATION")
-                vibrator?.vibrate(150)
+                vibrator?.vibrate(pattern.fallbackDurationMs)
             }
+            return true
         } catch (e: Exception) {
-            Log.w("AudioCommandSanitizer", "Could not trigger haptic: ${e.message}")
+            Log.w("AudioCommandSanitizer", "Could not trigger haptic (${pattern.name}): ${e.message}")
+            return false
         }
+    }
+
+    /**
+     * Triggers physical haptic confirmation for the Hands-Free Radar toggle (distinct rising double pulse
+     * when activating radar / exiting sleep mode, or soft single pulse when entering standby/sleep).
+     */
+    fun playRadarToggleHaptic(context: Context, isActivating: Boolean, reason: String? = null): Boolean {
+        val pattern = if (isActivating) {
+            HapticPatternType.RADAR_TOGGLE_ON
+        } else {
+            HapticPatternType.RADAR_TOGGLE_OFF
+        }
+        return triggerHapticFeedback(
+            context = context,
+            pattern = pattern,
+            reason = reason ?: pattern.displayName,
+            bypassDebounce = true
+        )
+    }
+
+    /**
+     * Triggers a distinct double-pulse haptic confirmation when a wake-word phrase is recognized.
+     */
+    fun playWakeWordHaptic(context: Context, matchedWakeWord: String = "Wake Word"): Boolean {
+        return triggerHapticFeedback(
+            context = context,
+            pattern = HapticPatternType.WAKE_WORD_DETECTED,
+            reason = "Wake word \"$matchedWakeWord\" matched"
+        )
+    }
+
+    /**
+     * Triggers a crisp single-pulse haptic confirmation when a voice activation command
+     * (Dictate, Send, Sleep, Wake Up, or Voice History Navigation) is triggered.
+     */
+    fun playVoiceCommandHaptic(context: Context, commandLabel: String = "Voice Command"): Boolean {
+        return triggerHapticFeedback(
+            context = context,
+            pattern = HapticPatternType.VOICE_COMMAND_TRIGGERED,
+            reason = "Voice command \"$commandLabel\" triggered"
+        )
+    }
+
+    /**
+     * Triggers silent haptic feedback pulse upon heartbeat trigger interception without synthesizing status audio.
+     */
+    fun playHeartbeatConfirmation(context: Context) {
+        triggerHapticFeedback(
+            context = context,
+            pattern = HapticPatternType.HEARTBEAT_PING,
+            reason = "Heartbeat ping confirmation",
+            bypassDebounce = true
+        )
     }
 }

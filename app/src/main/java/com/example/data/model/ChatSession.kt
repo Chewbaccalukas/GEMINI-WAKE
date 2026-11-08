@@ -64,6 +64,9 @@ data class ChatSession(
     @ColumnInfo(name = "totalTrackedSeconds")
     val totalTrackedSeconds: Long = 0L, // Accumulated tracked stopwatch/timer duration in seconds
 
+    @ColumnInfo(name = "totalVoiceCommands", defaultValue = "0")
+    val totalVoiceCommands: Int = 0, // Total wake-word-triggered voice command turns committed in this session
+
     @ColumnInfo(name = "remoteId")
     val remoteId: String? = null, // Cloud Firestore document ID (e.g. "chat_{id}")
 
@@ -77,7 +80,16 @@ data class ChatSession(
     val lastSyncedAt: Long = 0L, // Epoch ms when last synchronized with Cloud Firestore
 
     @ColumnInfo(name = "isDeleted", defaultValue = "0")
-    val isDeleted: Boolean = false // Soft-delete tombstone flag for hybrid cloud sync
+    val isDeleted: Boolean = false, // Soft-delete tombstone flag for hybrid cloud sync
+
+    @ColumnInfo(name = "isPinned", defaultValue = "0")
+    val isPinned: Boolean = false, // If true, pinned to the top of the chat list regardless of recency
+
+    @ColumnInfo(name = "colorPaletteId", defaultValue = "'OCEAN_CYAN'")
+    val colorPaletteId: String = "OCEAN_CYAN", // Predefined chat color palette identifier
+
+    @ColumnInfo(name = "backgroundStyle", defaultValue = "'DEFAULT'")
+    val backgroundStyle: String = "DEFAULT" // Predefined background preset ID or "custom:<uri>"
 ) {
     val resolvedRemoteId: String
         get() = remoteId?.takeIf { it.isNotBlank() } ?: "chat_$id"
@@ -91,3 +103,7 @@ data class ChatSession(
     val syncStateEnum: SyncState
         get() = SyncState.fromStatus(syncStatus)
 }
+
+val ChatSession.pinned: Boolean
+    get() = isPinned
+

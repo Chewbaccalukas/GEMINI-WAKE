@@ -120,6 +120,10 @@ fun CreateEditChatDialog(
     onSaveSample: (Long, Int, ShortArray) -> Unit = { _, _, _ -> },
     onDeleteSamples: (Long) -> Unit = {},
     getSamplesFlow: (Long) -> kotlinx.coroutines.flow.Flow<List<com.example.data.model.WakeWordSample>> = { kotlinx.coroutines.flow.flowOf(emptyList()) },
+    initialCategory: String = "Work",
+    initialTags: Set<String> = emptySet(),
+    availableCategories: List<String> = com.example.util.AppSettingsManager.DEFAULT_CHAT_CATEGORIES,
+    onSaveCategoryAndTags: (category: String, tags: Set<String>) -> Unit = { _, _ -> },
     onDismiss: () -> Unit,
     onSave: (ChatSession) -> Unit
 ) {
@@ -142,6 +146,14 @@ fun CreateEditChatDialog(
     var selectedIcon by remember { mutableStateOf(initialChat?.iconName ?: "Sparkles") }
     var selectedColor by remember { mutableStateOf(initialChat?.themeColorHex ?: "#38BDF8") }
     var selectedThemeMode by remember { mutableStateOf(initialChat?.themeMode ?: com.example.ui.theme.AppTheme.SYSTEM) }
+    var selectedCategory by remember(initialChat?.id, initialCategory) {
+        mutableStateOf(initialCategory.ifBlank { "Work" })
+    }
+    var customCategoryInput by remember { mutableStateOf("") }
+    var selectedTags by remember(initialChat?.id, initialTags) {
+        mutableStateOf(initialTags)
+    }
+    var customTagInput by remember { mutableStateOf("") }
 
     var titleError by remember { mutableStateOf(false) }
     var wakeWordError by remember { mutableStateOf(false) }
@@ -282,6 +294,152 @@ fun CreateEditChatDialog(
                         onCheckedChange = { isPersistent = it },
                         modifier = Modifier.testTag("persistence_switch")
                     )
+                }
+
+                // Category / Folder & Multi-Tag Organization Section
+                Text(
+                    text = "Category / Folder (for Wake Word & Browse Filtering)",
+                    style = MaterialTheme.typography.labelLarge
+                )
+                val allCategoryOptions = remember(availableCategories, selectedCategory) {
+                    (com.example.util.AppSettingsManager.DEFAULT_CHAT_CATEGORIES + availableCategories + listOfNotNull(selectedCategory.takeIf { it.isNotBlank() }))
+                        .map { it.trim() }
+                        .filter { it.isNotBlank() }
+                        .distinct()
+                }
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    allCategoryOptions.forEach { cat ->
+                        val isSelected = selectedCategory.equals(cat, ignoreCase = true)
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(
+                                    if (isSelected) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.surfaceVariant
+                                )
+                                .clickable { selectedCategory = cat }
+                                .padding(horizontal = 12.dp, vertical = 6.dp)
+                                .testTag("dialog_category_chip_${cat.lowercase()}"),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "📁 $cat",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                color = if (isSelected) MaterialTheme.colorScheme.onPrimary
+                                else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = customCategoryInput,
+                        onValueChange = { customCategoryInput = it },
+                        label = { Text("Custom Category / Folder") },
+                        placeholder = { Text("e.g. Finance, Travel") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("chat_custom_category_input")
+                    )
+                    FilledTonalButton(
+                        onClick = {
+                            val trimmed = customCategoryInput.trim()
+                            if (trimmed.isNotBlank()) {
+                                selectedCategory = trimmed
+                                customCategoryInput = ""
+                            }
+                        },
+                        modifier = Modifier.testTag("add_custom_category_button")
+                    ) {
+                        Text("Use")
+                    }
+                }
+
+                Text(
+                    text = "Tags (Multiple Allowed)",
+                    style = MaterialTheme.typography.labelLarge
+                )
+                val allTagOptions = remember(selectedTags) {
+                    (com.example.util.AppSettingsManager.DEFAULT_SUGGESTED_TAGS + selectedTags)
+                        .map { it.trim().removePrefix("#").lowercase() }
+                        .filter { it.isNotBlank() }
+                        .distinct()
+                }
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    allTagOptions.forEach { tag ->
+                        val isTagged = selectedTags.any { it.equals(tag, ignoreCase = true) }
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(
+                                    if (isTagged) MaterialTheme.colorScheme.secondaryContainer
+                                    else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f)
+                                )
+                                .border(
+                                    width = if (isTagged) 1.5.dp else 0.dp,
+                                    color = if (isTagged) MaterialTheme.colorScheme.secondary else Color.Transparent,
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                                .clickable {
+                                    selectedTags = if (isTagged) {
+                                        selectedTags.filterNot { it.equals(tag, ignoreCase = true) }.toSet()
+                                    } else {
+                                        selectedTags + tag
+                                    }
+                                }
+                                .padding(horizontal = 10.dp, vertical = 5.dp)
+                                .testTag("dialog_tag_chip_$tag"),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = "#$tag",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = if (isTagged) FontWeight.Bold else FontWeight.Normal,
+                                color = if (isTagged) MaterialTheme.colorScheme.onSecondaryContainer
+                                else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = customTagInput,
+                        onValueChange = { customTagInput = it },
+                        label = { Text("Add Custom Tag") },
+                        placeholder = { Text("e.g. sprint, important") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("chat_custom_tag_input")
+                    )
+                    FilledTonalButton(
+                        onClick = {
+                            val cleanTag = customTagInput.trim().removePrefix("#").lowercase()
+                            if (cleanTag.isNotBlank()) {
+                                selectedTags = selectedTags + cleanTag
+                                customTagInput = ""
+                            }
+                        },
+                        modifier = Modifier.testTag("add_custom_tag_button")
+                    ) {
+                        Text("+ Tag")
+                    }
                 }
 
                 Text(
@@ -879,6 +1037,7 @@ fun CreateEditChatDialog(
                         themeMode = selectedThemeMode
                     )
 
+                    onSaveCategoryAndTags(selectedCategory.trim().ifBlank { "Work" }, selectedTags)
                     onSave(chatToSave)
                 },
                 modifier = Modifier.testTag("save_chat_button")

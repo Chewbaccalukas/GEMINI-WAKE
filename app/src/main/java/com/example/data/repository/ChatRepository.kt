@@ -45,20 +45,21 @@ class ChatRepository(
     private fun sanitizeMessage(msg: ChatMessage, fallbackIndex: Int = 0): ChatMessage {
         val now = System.currentTimeMillis().coerceAtLeast(1L)
         val safeTs = if (msg.timestamp > 0L) msg.timestamp else (now + fallbackIndex)
-        val safeContent = if (ChatMessage.isLegacyAudioPlaceholder(msg.content)) {
-            if (!msg.attachmentName.isNullOrBlank() && !msg.isAudioPlaceholderAttachment) {
-                msg.content.trim()
-            } else {
-                ""
-            }
-        } else {
-            msg.content
-        }
-        return msg.copy(
-            sender = msg.sender.ifBlank { "gemini" },
-            content = safeContent,
+        val sanitized = msg.sanitizeForPersistence()
+        return sanitized.copy(
+            sender = sanitized.sender.ifBlank { "gemini" },
             timestamp = safeTs
         )
+    }
+
+    suspend fun pruneLegacyAudioPlaceholders(): Int = withContext(Dispatchers.IO) {
+        try {
+            val prunedMessages = chatDao.pruneLegacyAudioPlaceholderMessages()
+            val prunedCommands = chatDao.pruneLegacyVoiceCommands()
+            prunedMessages + prunedCommands
+        } catch (_: Throwable) {
+            0
+        }
     }
 
     val allChats: Flow<List<ChatSession>> = chatDao.getAllChats()
@@ -232,13 +233,20 @@ class ChatRepository(
     }
 
     fun getAllMessages(): Flow<List<ChatMessage>> = chatDao.getAllMessages()
-        .map { list -> list.take(100).mapIndexed { idx, msg -> sanitizeMessage(msg, idx) } }
+        .map { list ->
+            list.mapIndexed { idx, msg -> sanitizeMessage(msg, idx) }
+                .filter { it.hasPersistableContent }
+                .take(100)
+        }
         .flowOn(Dispatchers.IO)
         .catch { emit(emptyList()) }
 
     fun getRecentMessages(limit: Int = 100): Flow<List<ChatMessage>> =
         chatDao.getRecentMessages(limit.coerceIn(1, 100))
-            .map { list -> list.mapIndexed { idx, msg -> sanitizeMessage(msg, idx) } }
+            .map { list ->
+                list.mapIndexed { idx, msg -> sanitizeMessage(msg, idx) }
+                    .filter { it.hasPersistableContent }
+            }
             .flowOn(Dispatchers.IO)
             .catch { emit(emptyList()) }
 
@@ -271,6 +279,7 @@ class ChatRepository(
         chatDao.getMessagesForChat(chatId)
             .map { list ->
                 list.mapIndexed { idx, msg -> sanitizeMessage(msg, idx) }
+                    .filter { it.hasPersistableContent }
                     .sortedWith(compareBy<ChatMessage> { it.timestamp }.thenBy { it.id })
             }
             .flowOn(Dispatchers.IO)
@@ -280,6 +289,7 @@ class ChatRepository(
         try {
             chatDao.getMessagesForChatSync(chatId)
                 .mapIndexed { idx, msg -> sanitizeMessage(msg, idx) }
+                .filter { it.hasPersistableContent }
                 .sortedWith(compareBy<ChatMessage> { it.timestamp }.thenBy { it.id })
         } catch (_: Throwable) {
             emptyList()
@@ -313,13 +323,16 @@ class ChatRepository(
 
     fun getLastMessageForChat(chatId: Long): Flow<ChatMessage?> =
         chatDao.getLastMessageForChat(chatId)
-            .map { it?.let { msg -> sanitizeMessage(msg) } }
+            .map { it?.let { msg -> sanitizeMessage(msg).takeIf { m -> m.hasPersistableContent } } }
             .flowOn(Dispatchers.IO)
             .catch { emit(null) }
 
     suspend fun insertMessage(message: ChatMessage): Long = withContext(Dispatchers.IO) {
         try {
             val sanitized = sanitizeMessage(message)
+            if (!sanitized.hasPersistableContent) {
+                return@withContext -1L
+            }
             val id = chatDao.insertMessageSafely(sanitized)
             if (id > 0L && sanitized.remoteId.isNullOrBlank()) {
                 chatDao.updateMessageSyncState(
@@ -423,6 +436,28 @@ class ChatRepository(
         } catch (_: Throwable) {}
     }
 
+    suspend fun updateChatPinned(chatId: Long, isPinned: Boolean) = withContext(Dispatchers.IO) {
+        try {
+            chatDao.updateChatPinned(chatId, isPinned)
+        } catch (_: Throwable) {}
+    }
+
+    suspend fun updateChatAppearance(
+        chatId: Long,
+        colorPaletteId: String,
+        backgroundStyle: String,
+        themeColorHex: String
+    ) = withContext(Dispatchers.IO) {
+        try {
+            chatDao.updateChatAppearance(
+                chatId = chatId,
+                colorPaletteId = colorPaletteId.ifBlank { "OCEAN_CYAN" },
+                backgroundStyle = backgroundStyle.ifBlank { "DEFAULT" },
+                themeColorHex = themeColorHex.ifBlank { "#38BDF8" }
+            )
+        } catch (_: Throwable) {}
+    }
+
     suspend fun updateChatGreeting(chatId: Long, greetingMessage: String) = withContext(Dispatchers.IO) {
         try {
             chatDao.updateChatGreeting(chatId, greetingMessage.trim(), System.currentTimeMillis())
@@ -432,13 +467,95 @@ class ChatRepository(
     // Voice Command History (Room-persisted, capped at 100 items on Dispatchers.IO)
     fun getRecentVoiceCommands(): Flow<List<VoiceCommandHistoryEntry>> =
         chatDao.getRecentVoiceCommands()
-            .map { list -> list.take(100).map { it.toHistoryEntry() } }
+            .map { list ->
+                list.filter { it.hasValidTranscript || !ChatMessage.isLegacyAudioPlaceholder(it.triggerPhrase) }
+                    .take(100)
+                    .map { it.toHistoryEntry() }
+            }
             .flowOn(Dispatchers.IO)
             .catch { emit(emptyList()) }
 
+    suspend fun getRecentVoiceCommandsSync(limit: Int = 500): List<VoiceCommandHistoryEntry> =
+        withContext(Dispatchers.IO) {
+            try {
+                chatDao.getRecentVoiceCommandsSync(limit.coerceIn(1, 1000))
+                    .filter { it.hasValidTranscript || !ChatMessage.isLegacyAudioPlaceholder(it.triggerPhrase) }
+                    .map { it.toHistoryEntry() }
+            } catch (_: Throwable) {
+                emptyList()
+            }
+        }
+
+    suspend fun getAllMessagesChronologicalSync(): List<ChatMessage> = withContext(Dispatchers.IO) {
+        try {
+            chatDao.getAllActiveMessagesChronologicalSync()
+                .mapIndexed { idx, msg -> sanitizeMessage(msg, idx) }
+                .filter { it.hasPersistableContent }
+                .sortedWith(compareBy<ChatMessage> { it.timestamp }.thenBy { it.id })
+        } catch (_: Throwable) {
+            emptyList()
+        }
+    }
+
+    /**
+     * Exports chat interaction logs stored in the Room database as a formatted JSON string.
+     * If [chatId] is specified, exports only that chat session's logs; otherwise exports all active chats.
+     */
+    suspend fun exportChatInteractionLogsToJsonString(chatId: Long? = null): String =
+        withContext(Dispatchers.IO) {
+            val chats = if (chatId != null) {
+                listOfNotNull(getChatByIdSync(chatId))
+            } else {
+                getAllChatsSync()
+            }
+            val messages = if (chatId != null) {
+                getMessagesForChatSync(chatId)
+            } else {
+                getAllMessagesChronologicalSync()
+            }
+            val voiceCommands = getRecentVoiceCommandsSync(limit = 500)
+            com.example.util.ChatLogJsonExporter.buildInteractionLogsJson(
+                chats = chats,
+                messages = messages,
+                voiceCommands = voiceCommands,
+                filterChatId = chatId
+            )
+        }
+
+    /**
+     * Exports chat interaction logs stored in Room to a `.json` file inside [outputDir].
+     */
+    suspend fun exportChatInteractionLogsToJsonFile(
+        context: android.content.Context,
+        chatId: Long? = null,
+        outputDir: java.io.File = java.io.File(context.cacheDir, "exports")
+    ): java.io.File = com.example.util.ChatLogJsonExporter.exportLogsToJsonFile(
+        context = context,
+        chatRepository = this,
+        chatId = chatId,
+        outputDir = outputDir
+    )
+
+    /**
+     * Exports chat interaction logs stored in Room to a `.json` file and launches the standard
+     * Android `Intent.ACTION_SEND` share chooser via [androidx.core.content.FileProvider].
+     */
+    suspend fun exportAndShareChatInteractionLogs(
+        context: android.content.Context,
+        chatId: Long? = null
+    ): android.content.Intent = com.example.util.ChatLogJsonExporter.exportAndShareChatInteractionLogs(
+        context = context,
+        chatRepository = this,
+        chatId = chatId
+    )
+
     suspend fun insertVoiceCommand(entry: VoiceCommandHistoryEntry) = withContext(Dispatchers.IO) {
         try {
-            chatDao.insertVoiceCommand(VoiceCommandEntity.fromHistoryEntry(entry))
+            val entity = VoiceCommandEntity.fromHistoryEntry(entry)
+            if (!entity.hasValidTranscript && ChatMessage.isLegacyAudioPlaceholder(entity.triggerPhrase)) {
+                return@withContext
+            }
+            chatDao.insertVoiceCommand(entity)
         } catch (_: Throwable) {}
     }
 

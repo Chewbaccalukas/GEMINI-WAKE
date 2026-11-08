@@ -26,18 +26,9 @@ class MessageRepository(
         val now = System.currentTimeMillis().coerceAtLeast(1L)
         val safeTs = if (msg.timestamp > 0L) msg.timestamp else (now + fallbackIndex)
         val safeUpdatedAt = if (msg.updatedAt > 0L) msg.updatedAt else safeTs
-        val safeContent = if (ChatMessage.isLegacyAudioPlaceholder(msg.content)) {
-            if (!msg.attachmentName.isNullOrBlank() && !msg.isAudioPlaceholderAttachment) {
-                msg.content.trim()
-            } else {
-                ""
-            }
-        } else {
-            msg.content
-        }
-        return msg.copy(
-            sender = msg.sender.ifBlank { "gemini" },
-            content = safeContent,
+        val sanitized = msg.sanitizeForPersistence()
+        return sanitized.copy(
+            sender = sanitized.sender.ifBlank { "gemini" },
             timestamp = safeTs,
             updatedAt = safeUpdatedAt
         )
@@ -49,7 +40,11 @@ class MessageRepository(
 
     @get:JvmName("allMessagesFlow")
     val allMessages: Flow<List<Message>> = messageDao.getAllMessages()
-        .map { list -> list.take(100).mapIndexed { idx, msg -> sanitizeMessage(msg, idx) } }
+        .map { list ->
+            list.mapIndexed { idx, msg -> sanitizeMessage(msg, idx) }
+                .filter { it.hasPersistableContent }
+                .take(100)
+        }
         .flowOn(Dispatchers.IO)
         .catch { emit(emptyList()) }
 
@@ -63,7 +58,10 @@ class MessageRepository(
 
     fun getRecentMessages(limit: Int = 100): Flow<List<Message>> =
         messageDao.getRecentMessages(limit.coerceIn(1, 100))
-            .map { list -> list.mapIndexed { idx, msg -> sanitizeMessage(msg, idx) } }
+            .map { list ->
+                list.mapIndexed { idx, msg -> sanitizeMessage(msg, idx) }
+                    .filter { it.hasPersistableContent }
+            }
             .flowOn(Dispatchers.IO)
             .catch { emit(emptyList()) }
 
@@ -71,6 +69,7 @@ class MessageRepository(
         messageDao.getMessagesForChat(chatId)
             .map { list ->
                 list.mapIndexed { idx, msg -> sanitizeMessage(msg, idx) }
+                    .filter { it.hasPersistableContent }
                     .sortedWith(compareBy<Message> { it.timestamp }.thenBy { it.id })
             }
             .flowOn(Dispatchers.IO)
@@ -80,7 +79,7 @@ class MessageRepository(
 
     fun getLastMessageForChat(chatId: Long): Flow<Message?> =
         messageDao.getLastMessageForChat(chatId)
-            .map { it?.let { msg -> sanitizeMessage(msg) } }
+            .map { it?.let { msg -> sanitizeMessage(msg).takeIf { m -> m.hasPersistableContent } } }
             .flowOn(Dispatchers.IO)
             .catch { emit(null) }
 
@@ -92,6 +91,7 @@ class MessageRepository(
         try {
             messageDao.getMessagesForChatSync(chatId)
                 .mapIndexed { idx, msg -> sanitizeMessage(msg, idx) }
+                .filter { it.hasPersistableContent }
                 .sortedWith(compareBy<Message> { it.timestamp }.thenBy { it.id })
         } catch (_: Throwable) {
             emptyList()
@@ -121,6 +121,9 @@ class MessageRepository(
     suspend fun insertMessage(message: Message): Long = withContext(Dispatchers.IO) {
         try {
             val sanitized = sanitizeMessage(message)
+            if (!sanitized.hasPersistableContent) {
+                return@withContext -1L
+            }
             val id = messageDao.insertMessageSafely(sanitized)
             if (id > 0L && sanitized.remoteId.isNullOrBlank()) {
                 messageDao.updateMessageSyncState(

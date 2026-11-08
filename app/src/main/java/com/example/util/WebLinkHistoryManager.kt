@@ -88,7 +88,10 @@ class WebLinkHistoryManager(context: Context) {
                 }
                 db.chatDao().getRecentVoiceCommands().collect { roomEntities ->
                     if (roomEntities.isNotEmpty()) {
-                        val mapped = roomEntities.take(MAX_HISTORY_ITEMS).map { it.toHistoryEntry() }
+                        val mapped = roomEntities
+                            .filter { it.hasValidTranscript || !com.example.data.model.ChatMessage.isLegacyAudioPlaceholder(it.triggerPhrase) }
+                            .take(MAX_HISTORY_ITEMS)
+                            .map { it.toHistoryEntry() }
                         _voiceCommandEntries.value = mapped
                     }
                 }
@@ -175,7 +178,11 @@ class WebLinkHistoryManager(context: Context) {
     ): VoiceCommandHistoryEntry? {
         return try {
             val cleanTrigger = triggerPhrase.trim()
+                .takeUnless { com.example.data.model.ChatMessage.isLegacyAudioPlaceholder(it) }
+                .orEmpty()
             val cleanTranscript = recognizedTranscript.trim()
+                .takeUnless { com.example.data.model.ChatMessage.isLegacyAudioPlaceholder(it) }
+                .orEmpty()
             if (cleanTrigger.isBlank() && cleanTranscript.isBlank()) return null
 
             val resolvedTrigger = cleanTrigger.ifBlank { commandType.displayLabel }
@@ -322,13 +329,19 @@ class WebLinkHistoryManager(context: Context) {
                     } catch (_: Throwable) {
                         VoiceCommandType.WAKE_WORD
                     }
-                    val triggerPhrase = obj.optString("triggerPhrase", commandType.displayLabel)
-                        .ifBlank { commandType.displayLabel }
-                    val recognizedTranscript = obj.optString("recognizedTranscript", "").trim()
+                    val rawTrigger = obj.optString("triggerPhrase", commandType.displayLabel).trim()
+                    val triggerPhrase = rawTrigger
+                        .takeUnless { com.example.data.model.ChatMessage.isLegacyAudioPlaceholder(it) }
+                        ?.ifBlank { commandType.displayLabel }
+                        ?: commandType.displayLabel
+                    val rawTranscript = obj.optString("recognizedTranscript", "").trim()
+                    val recognizedTranscript = rawTranscript
+                        .takeUnless { com.example.data.model.ChatMessage.isLegacyAudioPlaceholder(it) }
+                        .orEmpty()
                     val chatTitle = obj.optString("chatTitle", "").trim().takeIf { it.isNotBlank() }
                     val rawTimestamp = obj.optLong("timestamp", fallbackNow)
                     val timestamp = if (rawTimestamp > 0L) rawTimestamp else fallbackNow
-                    if (triggerPhrase.isNotBlank() || recognizedTranscript.isNotBlank()) {
+                    if (recognizedTranscript.isNotBlank() || !com.example.data.model.ChatMessage.isLegacyAudioPlaceholder(rawTrigger)) {
                         list.add(
                             VoiceCommandHistoryEntry(
                                 id = id,

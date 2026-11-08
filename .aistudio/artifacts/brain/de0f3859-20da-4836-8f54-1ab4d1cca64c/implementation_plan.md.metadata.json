@@ -1,6 +1,6 @@
 {
-  "summary": "Updated implementation plan covering per-chat custom greeting messages (Room persistence, Create/Edit UI, pinned greeting banner, and TTS readout on wake), voice sleep mode (\"Gemini, sleep\" and \"Gemini, wake up\" with visual sleep banner and tap-to-wake controls), and Room/SharedFlow test & DAO syncStatus fixes.",
-  "updatedAt": "2026-11-05T22:14:49.227067179Z",
-  "requestFeedback": true,
-  "userFacing": true
+  "summary":  "Implementation plan for isolating Hands-Free Radar state from window focus loss, preventing Activity backgrounding on wake-word/voice command dispatch via a centralized VoiceCommandDispatcher, and automatically re-arming speech listening after command completion.",
+  "updatedAt":  "2026-11-08T03:01:38.310457899Z",
+  "requestFeedback":  true,
+  "userFacing":  true
 }

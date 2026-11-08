@@ -24,10 +24,10 @@ interface ChatDao {
     // Chat (`ChatSession`) Reactive Flow & Lookup Queries
     // =========================================================================
 
-    @Query("SELECT * FROM chat_sessions WHERE isDeleted = 0 ORDER BY isDefaultWakeChat DESC, lastUpdatedAt DESC")
+    @Query("SELECT * FROM chat_sessions WHERE isDeleted = 0 ORDER BY isPinned DESC, lastUpdatedAt DESC")
     fun getAllChats(): Flow<List<ChatSession>>
 
-    @Query("SELECT * FROM chat_sessions WHERE isDeleted = 0 ORDER BY isDefaultWakeChat DESC, lastUpdatedAt DESC")
+    @Query("SELECT * FROM chat_sessions WHERE isDeleted = 0 ORDER BY isPinned DESC, lastUpdatedAt DESC")
     fun observeAllChats(): Flow<List<ChatSession>>
 
     @Query("SELECT * FROM chat_sessions WHERE id = :id AND isDeleted = 0 LIMIT 1")
@@ -209,6 +209,21 @@ interface ChatDao {
     @Query("SELECT * FROM chat_messages WHERE chatId = :chatId AND isDeleted = 0 ORDER BY timestamp ASC, id ASC")
     suspend fun getMessagesForChatSync(chatId: Long): List<ChatMessage>
 
+    @Query("SELECT * FROM chat_messages WHERE chatId = :chatId AND isDeleted = 0 ORDER BY timestamp DESC, id DESC LIMIT :limit")
+    suspend fun getRecentMessages(chatId: Long, limit: Int = 30): List<ChatMessage>
+
+    @Query("SELECT * FROM chat_messages WHERE chatId = :chatId AND isDeleted = 0 AND timestamp < :beforeTimestamp ORDER BY timestamp DESC, id DESC LIMIT :limit")
+    suspend fun getMessagesBefore(chatId: Long, beforeTimestamp: Long, limit: Int = 30): List<ChatMessage>
+
+    @Query("SELECT COUNT(*) FROM chat_messages WHERE chatId = :chatId AND isDeleted = 0")
+    suspend fun getMessageCountForChatSync(chatId: Long): Int
+
+    @Query("SELECT COUNT(*) FROM chat_messages WHERE chatId = :chatId AND isDeleted = 0 AND timestamp < :beforeTimestamp")
+    suspend fun countMessagesBefore(chatId: Long, beforeTimestamp: Long): Int
+
+    @Query("SELECT * FROM chat_messages WHERE isDeleted = 0 ORDER BY timestamp ASC, id ASC")
+    suspend fun getAllActiveMessagesChronologicalSync(): List<ChatMessage>
+
     @Query("SELECT * FROM chat_messages WHERE id = :id LIMIT 1")
     suspend fun getMessageByIdSync(id: Long): ChatMessage?
 
@@ -239,21 +254,32 @@ interface ChatDao {
     @Query("SELECT * FROM chat_messages WHERE chatId = :chatId AND isDeleted = 0 ORDER BY timestamp DESC LIMIT 1")
     fun getLastMessageForChat(chatId: Long): Flow<ChatMessage?>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertMessage(message: ChatMessage): Long
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertMessages(messages: List<ChatMessage>): List<Long>
 
+    @Update
+    suspend fun updateMessage(message: ChatMessage)
+
     /**
-     * Atomically verifies the parent chat session exists before inserting a message turn.
-     * Prevents SQLiteConstraintException during background handoffs, quick switching, or deletions.
+     * Atomically verifies the parent chat session exists and the message has persistable text or
+     * a valid non-audio attachment before inserting a message turn.
+     * Increments [ChatSession.totalVoiceCommands] when [ChatMessage.triggeredByWakeWord] is true.
      */
     @Transaction
     suspend fun insertMessageSafely(message: ChatMessage): Long {
-        val parent = getChatByIdSync(message.chatId) ?: return -1L
-        val id = insertMessage(message)
-        updateChatTimestamp(message.chatId, message.timestamp)
+        val sanitized = message.sanitizeForPersistence()
+        if (!sanitized.hasPersistableContent) return -1L
+        val parent = getChatByIdSync(sanitized.chatId) ?: return -1L
+        val id = insertMessage(sanitized)
+        if (id <= 0L) return -1L
+        if (sanitized.triggeredByWakeWord) {
+            incrementChatVoiceCommands(parent.id, sanitized.timestamp)
+        } else {
+            updateChatTimestamp(parent.id, sanitized.timestamp)
+        }
         return id
     }
 
@@ -264,63 +290,82 @@ interface ChatDao {
      */
     @Transaction
     suspend fun upsertRemoteMessage(remoteMessage: ChatMessage): Long {
-        val parent = getChatByIdSync(remoteMessage.chatId) ?: return -1L
-        val resolvedRemoteId = remoteMessage.resolvedRemoteId
-        val existing = (if (remoteMessage.id > 0L) getMessageByIdSync(remoteMessage.id) else null)
+        val sanitizedRemote = remoteMessage.sanitizeForPersistence()
+        if (!sanitizedRemote.hasPersistableContent && !sanitizedRemote.isDeleted) return -1L
+        val parent = getChatByIdSync(sanitizedRemote.chatId) ?: return -1L
+        val resolvedRemoteId = sanitizedRemote.resolvedRemoteId
+        val existing = (if (sanitizedRemote.id > 0L) getMessageByIdSync(sanitizedRemote.id) else null)
             ?: getMessageByRemoteIdSync(resolvedRemoteId)
         val now = System.currentTimeMillis()
 
         if (existing == null) {
-            val toInsert = remoteMessage.copy(
+            val toInsert = sanitizedRemote.copy(
                 remoteId = resolvedRemoteId,
                 syncStatus = SyncStatus.SYNCED,
-                lastSyncedAt = if (remoteMessage.lastSyncedAt > 0L) remoteMessage.lastSyncedAt else now,
+                lastSyncedAt = if (sanitizedRemote.lastSyncedAt > 0L) sanitizedRemote.lastSyncedAt else now,
                 isDeleted = false
             )
             val id = insertMessage(toInsert)
-            if (remoteMessage.timestamp > parent.lastUpdatedAt) {
-                updateChatTimestamp(remoteMessage.chatId, remoteMessage.timestamp)
+            if (id > 0L && sanitizedRemote.timestamp > parent.lastUpdatedAt) {
+                updateChatTimestamp(sanitizedRemote.chatId, sanitizedRemote.timestamp)
             }
             return id
         }
 
-        if (remoteMessage.updatedAt >= existing.updatedAt || existing.syncStatus == SyncStatus.SYNCED) {
+        if (sanitizedRemote.updatedAt >= existing.updatedAt || existing.syncStatus == SyncStatus.SYNCED) {
             val merged = existing.copy(
-                sender = remoteMessage.sender,
-                content = remoteMessage.content,
-                timestamp = remoteMessage.timestamp,
-                triggeredByWakeWord = remoteMessage.triggeredByWakeWord,
-                updatedAt = maxOf(remoteMessage.updatedAt, existing.updatedAt),
+                sender = sanitizedRemote.sender,
+                content = sanitizedRemote.content,
+                timestamp = sanitizedRemote.timestamp,
+                triggeredByWakeWord = sanitizedRemote.triggeredByWakeWord,
+                updatedAt = maxOf(sanitizedRemote.updatedAt, existing.updatedAt),
                 remoteId = resolvedRemoteId,
-                userId = remoteMessage.userId ?: existing.userId,
+                userId = sanitizedRemote.userId ?: existing.userId,
                 syncStatus = SyncStatus.SYNCED,
-                lastSyncedAt = if (remoteMessage.lastSyncedAt > 0L) remoteMessage.lastSyncedAt else now,
-                isDeleted = remoteMessage.isDeleted
+                lastSyncedAt = if (sanitizedRemote.lastSyncedAt > 0L) sanitizedRemote.lastSyncedAt else now,
+                isDeleted = sanitizedRemote.isDeleted
             )
-            insertMessage(merged)
+            updateMessage(merged)
         }
         return existing.id
     }
 
     /**
      * Atomically verifies the parent chat session exists before inserting a batch of messages.
-     * Prevents SQLiteConstraintException during quick switching or Coupler batch imports.
+     * Filters out empty or legacy audio-placeholder-only messages and increments [ChatSession.totalVoiceCommands]
+     * for newly inserted wake-word-triggered turns.
      */
     @Transaction
     suspend fun insertMessagesSafely(messages: List<ChatMessage>): List<Long> {
         if (messages.isEmpty()) return emptyList()
         val chatId = messages.first().chatId
         val parent = getChatByIdSync(chatId) ?: return emptyList()
-        val validMessages = messages.filter { it.chatId == chatId }
+        val validMessages = messages
+            .map { it.sanitizeForPersistence() }
+            .filter { it.chatId == chatId && it.hasPersistableContent }
         if (validMessages.isEmpty()) return emptyList()
         val ids = insertMessages(validMessages)
-        val maxTimestamp = validMessages.maxOfOrNull { it.timestamp } ?: System.currentTimeMillis()
-        updateChatTimestamp(chatId, maxTimestamp)
+        val insertedMessages = validMessages.zip(ids).filter { (_, id) -> id > 0L }.map { it.first }
+        if (insertedMessages.isNotEmpty()) {
+            val maxTimestamp = insertedMessages.maxOfOrNull { it.timestamp } ?: System.currentTimeMillis()
+            val wakeCount = insertedMessages.count { it.triggeredByWakeWord }
+            if (wakeCount > 0) {
+                incrementChatVoiceCommandsBy(parent.id, wakeCount, maxTimestamp)
+            } else {
+                updateChatTimestamp(parent.id, maxTimestamp)
+            }
+        }
         return ids
     }
 
     @Query("UPDATE chat_sessions SET lastUpdatedAt = :timestamp, syncStatus = CASE WHEN syncStatus = 'SYNCED' THEN 'DIRTY' ELSE syncStatus END WHERE id = :chatId")
     suspend fun updateChatTimestamp(chatId: Long, timestamp: Long)
+
+    @Query("UPDATE chat_sessions SET totalVoiceCommands = totalVoiceCommands + 1, lastUpdatedAt = :timestamp, syncStatus = CASE WHEN syncStatus = 'SYNCED' THEN 'DIRTY' ELSE syncStatus END WHERE id = :chatId")
+    suspend fun incrementChatVoiceCommands(chatId: Long, timestamp: Long)
+
+    @Query("UPDATE chat_sessions SET totalVoiceCommands = totalVoiceCommands + :delta, lastUpdatedAt = :timestamp, syncStatus = CASE WHEN syncStatus = 'SYNCED' THEN 'DIRTY' ELSE syncStatus END WHERE id = :chatId")
+    suspend fun incrementChatVoiceCommandsBy(chatId: Long, delta: Int, timestamp: Long)
 
     @Query("UPDATE chat_sessions SET totalTrackedSeconds = :seconds WHERE id = :chatId")
     suspend fun updateTrackedSeconds(chatId: Long, seconds: Long)
@@ -328,11 +373,56 @@ interface ChatDao {
     @Query("UPDATE chat_sessions SET themeMode = :themeMode WHERE id = :chatId")
     suspend fun updateChatTheme(chatId: Long, themeMode: com.example.ui.theme.AppTheme)
 
+    @Query("UPDATE chat_sessions SET isPinned = :isPinned, syncStatus = CASE WHEN syncStatus = 'SYNCED' THEN 'DIRTY' ELSE syncStatus END WHERE id = :chatId")
+    suspend fun updateChatPinned(chatId: Long, isPinned: Boolean)
+
+    @Query("UPDATE chat_sessions SET colorPaletteId = :colorPaletteId, backgroundStyle = :backgroundStyle, themeColorHex = :themeColorHex, syncStatus = CASE WHEN syncStatus = 'SYNCED' THEN 'DIRTY' ELSE syncStatus END WHERE id = :chatId")
+    suspend fun updateChatAppearance(
+        chatId: Long,
+        colorPaletteId: String,
+        backgroundStyle: String,
+        themeColorHex: String
+    )
+
     @Query("UPDATE chat_sessions SET greetingMessage = :greetingMessage, lastUpdatedAt = :updatedAt, syncStatus = CASE WHEN syncStatus = 'SYNCED' THEN 'DIRTY' ELSE syncStatus END WHERE id = :chatId")
     suspend fun updateChatGreeting(chatId: Long, greetingMessage: String, updatedAt: Long = System.currentTimeMillis())
 
     @Query("DELETE FROM chat_messages WHERE id = :messageId")
     suspend fun deleteMessageById(messageId: Long)
+
+    /**
+     * Deletes any legacy audio placeholder or empty text rows in `chat_messages` that do not have
+     * a valid non-audio attachment.
+     */
+    @Query(
+        """
+        DELETE FROM chat_messages
+        WHERE (
+            TRIM(content) = ''
+            OR LOWER(TRIM(content)) IN (
+                '🎙️ [voice input audio turn]',
+                '[voice input audio turn]',
+                '[audio placeholder]',
+                '[voice message]',
+                '[audio turn]',
+                '[audio]',
+                '[voice turn]',
+                'audio message',
+                'voice message',
+                'voice input audio turn'
+            )
+        )
+        AND (
+            attachmentName IS NULL
+            OR TRIM(attachmentName) = ''
+            OR LOWER(attachmentMimeType) LIKE 'audio/%'
+            OR LOWER(attachmentName) LIKE '%.pcm'
+            OR LOWER(attachmentName) LIKE '%.wav'
+            OR LOWER(attachmentName) LIKE '%.m4a'
+        )
+        """
+    )
+    suspend fun pruneLegacyAudioPlaceholderMessages(): Int
 
     // =========================================================================
     // Voice Command History (bounded to most recent 100 items)
@@ -355,6 +445,26 @@ interface ChatDao {
 
     @Query("DELETE FROM voice_command_history")
     suspend fun clearAllVoiceCommands()
+
+    @Query(
+        """
+        DELETE FROM voice_command_history
+        WHERE TRIM(recognizedTranscript) = ''
+        OR LOWER(TRIM(recognizedTranscript)) IN (
+            '🎙️ [voice input audio turn]',
+            '[voice input audio turn]',
+            '[audio placeholder]',
+            '[voice message]',
+            '[audio turn]',
+            '[audio]',
+            '[voice turn]',
+            'audio message',
+            'voice message',
+            'voice input audio turn'
+        )
+        """
+    )
+    suspend fun pruneLegacyVoiceCommands(): Int
 
     // =========================================================================
     // Wake Word Samples

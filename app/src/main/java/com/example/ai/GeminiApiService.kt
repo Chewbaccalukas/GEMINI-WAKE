@@ -100,6 +100,47 @@ class GeminiApiService {
         }
     }
 
+    private data class ModelCacheKey(
+        val modelName: String,
+        val systemInstruction: String,
+        val includeSearchTool: Boolean
+    )
+
+    private val firebaseAi by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        Firebase.ai
+    }
+
+    private val modelCache = java.util.concurrent.ConcurrentHashMap<ModelCacheKey, com.google.firebase.ai.GenerativeModel>()
+
+    private fun getOrCreateGenerativeModel(
+        modelName: String,
+        systemInstruction: String = "",
+        includeSearchTool: Boolean = true
+    ): com.google.firebase.ai.GenerativeModel {
+        val key = ModelCacheKey(
+            modelName = modelName,
+            systemInstruction = systemInstruction,
+            includeSearchTool = includeSearchTool
+        )
+        return modelCache.getOrPut(key) {
+            if (modelCache.size >= 8) {
+                modelCache.clear()
+            }
+            if (systemInstruction.isNotBlank()) {
+                firebaseAi.generativeModel(
+                    modelName = modelName,
+                    tools = if (includeSearchTool) listOf(Tool.googleSearch()) else emptyList(),
+                    systemInstruction = content { text(systemInstruction) }
+                )
+            } else {
+                firebaseAi.generativeModel(
+                    modelName = modelName,
+                    tools = if (includeSearchTool) listOf(Tool.googleSearch()) else emptyList()
+                )
+            }
+        }
+    }
+
     /**
      * Streams responses requesting Orion neural voice and text chunks.
      * Catches HTTP 429, RESOURCE_EXHAUSTED, and spend cap errors, failovers to backup key, and retries turn.
@@ -141,10 +182,10 @@ class GeminiApiService {
             if (requestAudio) {
                 try {
                     val orionInstruction = "$systemInstruction (Voice model: Orion neural speech enabled)"
-                    val model = Firebase.ai.generativeModel(
+                    val model = getOrCreateGenerativeModel(
                         modelName = "gemini-3.8-flash",
-                        tools = listOf(Tool.googleSearch()),
-                        systemInstruction = content { text(orionInstruction) }
+                        systemInstruction = orionInstruction,
+                        includeSearchTool = true
                     )
 
                     val chronologicalHistory = history
@@ -207,10 +248,10 @@ class GeminiApiService {
             // If audio wasn't requested or threw an exception, fall back gracefully to text
             if (!voiceStreamSuccess) {
                 try {
-                    val fallbackModel = Firebase.ai.generativeModel(
+                    val fallbackModel = getOrCreateGenerativeModel(
                         modelName = "gemini-3.8-flash",
-                        tools = listOf(Tool.googleSearch()),
-                        systemInstruction = content { text(systemInstruction) }
+                        systemInstruction = systemInstruction,
+                        includeSearchTool = true
                     )
                     val chronologicalHistory = history
                         .filter { !it.isDeleted && it.content.isNotBlank() }
@@ -246,6 +287,7 @@ class GeminiApiService {
                     val failoverActivated = apiKeyManager.handleQuotaExhaustionAndFailover()
                     if (failoverActivated) {
                         retriedAfterFailover = true
+                        modelCache.clear()
                         Log.i(TAG, "HTTP 429 / RESOURCE_EXHAUSTED encountered. Retrying execution with Backup Key...")
                         continue // Retry loop with new active backup key!
                     }
@@ -263,7 +305,11 @@ class GeminiApiService {
      */
     suspend fun transcribeAudio(audioBytes: ByteArray, mimeType: String = "audio/wav"): String = withContext(Dispatchers.IO) {
         try {
-            val model = Firebase.ai.generativeModel(modelName = "gemini-3.5-transcribe")
+            val model = getOrCreateGenerativeModel(
+                modelName = "gemini-3.5-transcribe",
+                systemInstruction = "",
+                includeSearchTool = false
+            )
             val response = withTimeout(30_000L) {
                 model.generateContent(
                     content {

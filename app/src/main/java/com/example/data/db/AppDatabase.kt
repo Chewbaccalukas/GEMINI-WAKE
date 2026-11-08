@@ -43,7 +43,7 @@ import kotlinx.coroutines.launch
         WakeWord::class,
         VoiceCommandEntity::class
     ],
-    version = 16,
+    version = 18,
     exportSchema = false
 )
 @TypeConverters(AppDatabase.Converters::class)
@@ -265,6 +265,33 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_16_17 = object : Migration(16, 17) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `chat_sessions` ADD COLUMN `totalVoiceCommands` INTEGER NOT NULL DEFAULT 0")
+                db.execSQL(
+                    """
+                    DELETE FROM `chat_messages`
+                    WHERE `id` NOT IN (
+                        SELECT MIN(`id`)
+                        FROM `chat_messages`
+                        GROUP BY `chatId`, `timestamp`, `sender`
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_chat_messages_chatId_timestamp_sender` ON `chat_messages` (`chatId`, `timestamp`, `sender`)"
+                )
+            }
+        }
+
+        val MIGRATION_17_18 = object : Migration(17, 18) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `chat_sessions` ADD COLUMN `isPinned` INTEGER NOT NULL DEFAULT 0")
+                db.execSQL("ALTER TABLE `chat_sessions` ADD COLUMN `colorPaletteId` TEXT NOT NULL DEFAULT 'OCEAN_CYAN'")
+                db.execSQL("ALTER TABLE `chat_sessions` ADD COLUMN `backgroundStyle` TEXT NOT NULL DEFAULT 'DEFAULT'")
+            }
+        }
+
         val ALL_MIGRATIONS: Array<Migration> = arrayOf(
             MIGRATION_1_2,
             MIGRATION_2_3,
@@ -279,8 +306,22 @@ abstract class AppDatabase : RoomDatabase() {
             MIGRATION_12_13,
             MIGRATION_13_14,
             MIGRATION_14_15,
-            MIGRATION_15_16
+            MIGRATION_15_16,
+            MIGRATION_16_17,
+            MIGRATION_17_18
         )
+
+        private val queryExecutor by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+            java.util.concurrent.Executors.newFixedThreadPool(2) { runnable ->
+                Thread(runnable, "Room-Query-Worker").apply { isDaemon = true }
+            }
+        }
+
+        private val transactionExecutor by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+            java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+                Thread(runnable, "Room-Tx-Worker").apply { isDaemon = true }
+            }
+        }
 
         /**
          * Returns the thread-safe singleton [AppDatabase] instance for the application.
@@ -290,17 +331,18 @@ abstract class AppDatabase : RoomDatabase() {
             scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         ): AppDatabase {
             return INSTANCE ?: synchronized(this) {
-                val instance = Room.databaseBuilder(
+                INSTANCE ?: Room.databaseBuilder(
                     context.applicationContext,
                     AppDatabase::class.java,
                     DATABASE_NAME
                 )
+                    .setQueryExecutor(queryExecutor)
+                    .setTransactionExecutor(transactionExecutor)
                     .addMigrations(*ALL_MIGRATIONS)
                     .fallbackToDestructiveMigration(true)
                     .addCallback(DatabaseCallback(scope))
                     .build()
-                INSTANCE = instance
-                instance
+                    .also { INSTANCE = it }
             }
         }
 

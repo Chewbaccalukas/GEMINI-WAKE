@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
@@ -33,6 +34,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowForward
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Save
@@ -41,13 +43,17 @@ import androidx.compose.material.icons.filled.Hearing
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.Logout
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.PowerSettingsNew
+import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.StarOutline
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -63,6 +69,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -73,7 +80,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.material.icons.filled.KeyboardArrowDown
-import androidx.compose.material.icons.filled.Save
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -91,6 +97,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.model.ChatSession
 import com.example.ui.components.VoiceWaveformVisualizer
+import com.example.ui.components.WakeWordListeningStatusBanner
+import com.example.ui.components.WakeWordSessionBarChartCard
+import com.example.ui.components.WeeklyActivityHeatmapCard
+import com.example.ui.components.computeWeeklyActivityHeatmap
 import com.example.ui.components.getIconForName
 
 import android.os.Build
@@ -231,131 +241,478 @@ fun HomeScreen(
     onEnterSleepMode: () -> Unit = {},
     onExitSleepMode: () -> Unit = {},
     onDismissWakeReadyCue: () -> Unit = {},
+    onNavigateToSettings: () -> Unit = {},
     onNavigateToWakeWordStudio: () -> Unit = {},
+    onNavigateToDiagnostics: () -> Unit = {},
     userEmail: String? = null,
     userDisplayName: String? = null,
     cloudSyncStatus: String = "Synced with Cloud Firestore",
     onSyncNow: () -> Unit = {},
-    onSignOut: () -> Unit = {}
+    onSignOut: () -> Unit = {},
+    sessionStatisticsState: com.example.ui.SessionStatisticsUiState? = null,
+    onSelectStatisticsDateRange: (com.example.ui.components.StatisticsDateRange) -> Unit = {},
+    onQuickShareCsv: () -> Unit = {},
+    onCreateNewWakeTargetChat: (title: String, wakePhrase: String) -> Unit = { _, _ -> },
+    onOpenBackupExportDialog: () -> Unit = {},
+    favoriteChatIds: Set<Long> = emptySet(),
+    onToggleFavoriteChat: (Long) -> Unit = {},
+    onOpenWakeFavoritesPicker: () -> Unit = {},
+    pinnedChatIds: Set<Long> = emptySet(),
+    onTogglePinChat: (Long) -> Unit = {},
+    chatCategoryMap: Map<Long, String> = emptyMap(),
+    chatTagsMap: Map<Long, Set<String>> = emptyMap(),
+    availableCategories: List<String> = com.example.util.AppSettingsManager.DEFAULT_CHAT_CATEGORIES,
+    onOpenBufferBridgeDialog: () -> Unit = {},
+    onOpenSyncCompanionRelay: () -> Unit = {},
+    onClearChatThread: (Long) -> Unit = {}
 ) {
+    val context = LocalContext.current
+    var selectedCategoryFilter by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedTagFilter by rememberSaveable { mutableStateOf<String?>(null) }
+    var isSideCategoryBarCollapsed by rememberSaveable { mutableStateOf(true) }
+    // Cloud Sync & Summary drawer is collapsed by default behind the top-bar icon
+    var isCloudSummaryDrawerExpanded by rememberSaveable { mutableStateOf(false) }
+    var isAnalyticsSectionExpanded by rememberSaveable { mutableStateOf(false) }
+    var showOverflowMenu by remember { mutableStateOf(false) }
+    var showClearThreadPickerDialog by remember { mutableStateOf(false) }
+
+    val filteredChats = remember(chats, selectedCategoryFilter, selectedTagFilter, chatCategoryMap, chatTagsMap, pinnedChatIds) {
+        val matched = chats.filter { chat ->
+            val matchesCat = com.example.ui.components.matchesCategoryFilter(
+                chat = chat,
+                categoryFilter = selectedCategoryFilter,
+                assignedCategory = chatCategoryMap[chat.id],
+                tags = chatTagsMap[chat.id].orEmpty()
+            )
+            val matchesTag = selectedTagFilter.isNullOrBlank() ||
+                chatTagsMap[chat.id]?.any { it.equals(selectedTagFilter, ignoreCase = true) } == true
+            matchesCat && matchesTag
+        }
+        com.example.util.AppSettingsManager.sortChatsWithPinnedFirst(
+            chats = matched,
+            pinnedIds = pinnedChatIds
+        )
+    }
+
+    val allKnownTags = remember(chatTagsMap) {
+        (com.example.util.AppSettingsManager.DEFAULT_SUGGESTED_TAGS + chatTagsMap.values.flatten())
+            .map { it.trim().removePrefix("#").lowercase() }
+            .filter { it.isNotBlank() }
+            .distinct()
+    }
+
+    if (showClearThreadPickerDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showClearThreadPickerDialog = false },
+            modifier = Modifier.testTag("clear_thread_picker_dialog"),
+            title = {
+                Text(
+                    text = "Select Chat Thread to Clear",
+                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+                )
+            },
+            text = {
+                if (chats.isEmpty()) {
+                    Text(
+                        text = "No chat threads available to clear.",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(260.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(chats, key = { "clear_pick_${it.id}" }) { chatSession ->
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable {
+                                        onClearChatThread(chatSession.id)
+                                        showClearThreadPickerDialog = false
+                                        Toast.makeText(
+                                            context,
+                                            "Cleared messages in \"${chatSession.title}\"",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                    .testTag("clear_thread_option_${chatSession.id}")
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = chatSession.title,
+                                            style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold)
+                                        )
+                                        Text(
+                                            text = "Wake word: \"${chatSession.wakeWord}\"",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    Icon(
+                                        imageVector = Icons.Default.Delete,
+                                        contentDescription = "Clear messages in ${chatSession.title}",
+                                        tint = MaterialTheme.colorScheme.error,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = { showClearThreadPickerDialog = false },
+                    modifier = Modifier.testTag("clear_thread_cancel_button")
+                ) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
     Scaffold(
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
-            TopAppBar(
-                title = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier
-                                .size(34.dp)
-                                .clip(CircleShape)
-                                .background(
-                                    Brush.linearGradient(
-                                        listOf(Color(0xFF38BDF8), Color(0xFFA855F7))
-                                    )
-                                ),
-                            contentAlignment = Alignment.Center
+            Column(modifier = Modifier.fillMaxWidth()) {
+                TopAppBar(
+                    title = {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(32.dp)
+                                    .clip(CircleShape)
+                                    .background(
+                                        Brush.linearGradient(
+                                            listOf(Color(0xFF38BDF8), Color(0xFFA855F7))
+                                        )
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.AutoAwesome,
+                                    contentDescription = null,
+                                    tint = Color.White,
+                                    modifier = Modifier.size(17.dp)
+                                )
+                            }
+                            Column {
+                                Text(
+                                    text = "Gemini Wake",
+                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                    maxLines = 1
+                                )
+                                Text(
+                                    text = when {
+                                        isSleepMode -> "Sleep mode"
+                                        isListening || isHandsFreeActive -> "Hands-Free Active"
+                                        else -> "Standby"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if ((isListening || isHandsFreeActive) && !isSleepMode) {
+                                        Color(0xFF10B981)
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    },
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    },
+                    actions = {
+                        // Prominent Hands-Free Radar Toggle Pill bound directly to audioRmsDb
+                        com.example.ui.components.TopBarHandsFreeRadarPill(
+                            isActive = (isHandsFreeActive || isListening) && !isSleepMode,
+                            audioRmsDb = audioRmsDb,
+                            isSleepMode = isSleepMode,
+                            onToggle = {
+                                if (isSleepMode) {
+                                    onExitSleepMode()
+                                } else {
+                                    onToggleListening()
+                                }
+                            },
+                            testTagPrefix = "home"
+                        )
+
+                        // Collapsible Cloud Sync / Summary & Radar Drawer Toggle Icon
+                        IconButton(
+                            onClick = { isCloudSummaryDrawerExpanded = !isCloudSummaryDrawerExpanded },
+                            modifier = Modifier.testTag("home_cloud_summary_drawer_toggle")
+                        ) {
+                            Box(contentAlignment = Alignment.TopEnd) {
+                                Icon(
+                                    imageVector = Icons.Default.CloudDone,
+                                    contentDescription = if (isCloudSummaryDrawerExpanded) {
+                                        "Collapse Cloud Sync & Summary Drawer"
+                                    } else {
+                                        "Expand Cloud Sync & Summary Drawer"
+                                    },
+                                    tint = if (isCloudSummaryDrawerExpanded) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    }
+                                )
+                                Box(
+                                    modifier = Modifier
+                                        .size(7.dp)
+                                        .clip(CircleShape)
+                                        .background(
+                                            if (!userEmail.isNullOrBlank()) Color(0xFF10B981)
+                                            else MaterialTheme.colorScheme.primary
+                                        )
+                                )
+                            }
+                        }
+
+                        IconButton(
+                            onClick = onNavigateToSettings,
+                            modifier = Modifier.testTag("home_settings_button")
                         ) {
                             Icon(
-                                imageVector = Icons.Default.AutoAwesome,
-                                contentDescription = null,
-                                tint = Color.White,
-                                modifier = Modifier.size(18.dp)
+                                imageVector = Icons.Default.Settings,
+                                contentDescription = "Wake Word & Sensitivity Settings",
+                                tint = MaterialTheme.colorScheme.primary
                             )
                         }
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Column {
-                            Text(
-                                text = "Gemini Wake",
-                                style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold)
-                            )
-                            Text(
-                                text = when {
-                                    isSleepMode -> "Sleep mode • Say \"Gemini, wake up\""
-                                    isListening -> "Listening for wake word..."
-                                    else -> "Voice trigger standby"
-                                },
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (isListening && !isSleepMode) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+
+                        // Top-Bar 3-Dot Overflow Drop-Down Menu
+                        Box {
+                            IconButton(
+                                onClick = { showOverflowMenu = true },
+                                modifier = Modifier.testTag("home_overflow_menu_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.MoreVert,
+                                    contentDescription = "More Actions Menu",
+                                    tint = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                            DropdownMenu(
+                                expanded = showOverflowMenu,
+                                onDismissRequest = { showOverflowMenu = false }
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("Diagnostic Log") },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.BugReport,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
+                                    },
+                                    modifier = Modifier.testTag("home_menu_diagnostic_log"),
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onNavigateToDiagnostics()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Two-Tier Buffer Settings") },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.Storage,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
+                                    },
+                                    modifier = Modifier.testTag("home_menu_buffer_settings"),
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onOpenBufferBridgeDialog()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Sync Companion Relay") },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.Sync,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
+                                    },
+                                    modifier = Modifier.testTag("home_menu_sync_companion_relay"),
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onOpenSyncCompanionRelay()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = "Clear Thread",
+                                            color = MaterialTheme.colorScheme.error
+                                        )
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.Delete,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.error
+                                        )
+                                    },
+                                    modifier = Modifier.testTag("home_menu_clear_thread"),
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        showClearThreadPickerDialog = true
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Cloud Sync & Summary Drawer") },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.CloudDone,
+                                            contentDescription = null
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        isCloudSummaryDrawerExpanded = !isCloudSummaryDrawerExpanded
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Custom Wake Word Studio") },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.Mic,
+                                            contentDescription = null
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onNavigateToWakeWordStudio()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Import Chat or Context") },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.Download,
+                                            contentDescription = null
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onOpenImportDialog()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Gemini Coupler & Piggyback") },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.SwapHoriz,
+                                            contentDescription = null
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onOpenCouplerDialog()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Conversation & Voice History") },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.History,
+                                            contentDescription = null
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onNavigateToHistory()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Gemini Control Sheet") },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.Tune,
+                                            contentDescription = null
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onOpenControlSheet()
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = "Power Off / Exit App",
+                                            color = MaterialTheme.colorScheme.error
+                                        )
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.PowerSettingsNew,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.error
+                                        )
+                                    },
+                                    onClick = {
+                                        showOverflowMenu = false
+                                        onPowerExit()
+                                    }
+                                )
+                            }
                         }
-                    }
-                },
-                actions = {
-                    val context = LocalContext.current
-                    IconButton(
-                        onClick = onOpenImportDialog,
-                        modifier = Modifier.testTag("top_bar_import_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Add,
-                            contentDescription = "Import Chat or Context",
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                    IconButton(
-                        onClick = onOpenControlSheet,
-                        modifier = Modifier.testTag("top_bar_control_sheet_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Tune,
-                            contentDescription = "Gemini Control & Settings",
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                    IconButton(
-                        onClick = onPowerExit,
-                        modifier = Modifier.testTag("home_power_exit_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.PowerSettingsNew,
-                            contentDescription = "Power Off / Exit App",
-                            tint = MaterialTheme.colorScheme.error.copy(alpha = 0.85f)
-                        )
-                    }
-                    IconButton(
-                        onClick = onOpenCouplerDialog,
-                        modifier = Modifier.testTag("home_coupler_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.SwapHoriz,
-                            contentDescription = "Gemini Coupler & Piggyback",
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                    IconButton(
-                        onClick = onNavigateToHistory,
-                        modifier = Modifier.testTag("home_history_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.History,
-                            contentDescription = "Conversation History",
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                    IconButton(
-                        onClick = onOpenWakeSettings,
-                        modifier = Modifier.testTag("wake_hub_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Hearing,
-                            contentDescription = "Wake Word Hub",
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.background
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.background
+                    )
                 )
-            )
+
+                // Sticky Horizontal Category Filter Bar directly below TopAppBar
+                com.example.ui.components.StickyHorizontalCategoryFilterBar(
+                    selectedCategory = selectedCategoryFilter,
+                    onSelectCategory = { selectedCategoryFilter = it },
+                    chats = chats,
+                    chatCategoryMap = chatCategoryMap,
+                    chatTagsMap = chatTagsMap,
+                    availableCategories = availableCategories
+                )
+            }
         },
         floatingActionButton = {
-            FloatingActionButton(
-                onClick = onCreateChat,
-                containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = MaterialTheme.colorScheme.onPrimary,
-                modifier = Modifier.testTag("create_chat_fab")
+            Column(
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Icon(Icons.Default.Add, contentDescription = "New Chat")
+                FloatingActionButton(
+                    onClick = onQuickShareCsv,
+                    containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                    contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                    modifier = Modifier.testTag("fab_share_csv_statistics")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Share,
+                        contentDescription = "Share Session Statistics CSV via FileProvider"
+                    )
+                }
+                FloatingActionButton(
+                    onClick = onCreateChat,
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                    modifier = Modifier.testTag("create_chat_fab")
+                ) {
+                    Icon(Icons.Default.Add, contentDescription = "New Chat")
+                }
             }
         },
         bottomBar = {
@@ -380,7 +737,7 @@ fun HomeScreen(
                     Text(
                         text = when {
                             isSleepMode -> "Sleep Mode (Paused)"
-                            isListening -> "Wake Radar Active"
+                            isListening || isHandsFreeActive -> "Wake Radar Active (${audioRmsDb.toInt()} dB)"
                             else -> "Wake Radar Standby"
                         },
                         style = MaterialTheme.typography.labelSmall,
@@ -390,225 +747,405 @@ fun HomeScreen(
             }
         }
     ) { innerPadding ->
-        Column(
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
                 .consumeWindowInsets(innerPadding)
         ) {
-            ChatImportProgressBanner(
-                progressState = importProgressState,
-                onCancelImport = onCancelImport
-            )
-
-            SleepModeVisualBanner(
-                isSleepMode = isSleepMode,
-                sleepReason = sleepModeReason,
-                onWakeUpTap = onExitSleepMode
-            )
-
-            WakeReadyVisualCueBanner(
-                cueState = wakeReadyVisualCue,
-                onOpenChat = onSelectChat,
-                onDismiss = onDismissWakeReadyCue
-            )
-
-            // Home Screen Web Search Bar + Swipe-Down Link & Search + Voice Command History Dropdown Menu
-            Box(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-                WebSearchAndHistoryBar(
-                    historyEntries = webLinkHistory,
-                    onSubmitSearchOrUrl = onSubmitWebSearchOrUrl,
-                    onOpenHistoryEntry = onOpenWebHistoryEntry,
-                    onDeleteHistoryEntry = onDeleteWebHistoryEntry,
-                    onClearAllHistory = onClearAllWebHistory,
-                    voiceCommandEntries = voiceCommandHistory,
-                    onUseVoiceCommandTranscript = onUseVoiceCommandTranscript,
-                    onDeleteVoiceCommandEntry = onDeleteVoiceCommandEntry,
-                    onClearAllVoiceCommands = onClearAllVoiceCommands,
-                    onClearCorruptedHistory = onClearCorruptedHistory,
-                    onTextInputFocusChanged = onTextInputFocusChanged
-                )
-            }
-
-            // Compact Voice Listener / Wake Radar Visualizer (max height 52dp)
-            Box(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-                WakeWordRadarCard(
-                    isListening = isListening && !isSleepMode,
-                    audioRmsDb = audioRmsDb,
-                    statusMessage = statusMessage,
-                    lastHeardText = lastHeardText,
-                    onToggleListening = {
-                        if (isSleepMode) onExitSleepMode() else onToggleListening()
-                    },
-                    onOpenWakeSettings = onOpenWakeSettings
-                )
-            }
-
-            // Quick Bar: Custom Wake Word Recording Studio + Sleep Mode Toggle
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 2.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
+            Column(
+                modifier = Modifier.fillMaxSize()
             ) {
-                androidx.compose.material3.FilledTonalButton(
-                    onClick = onNavigateToWakeWordStudio,
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("open_wake_word_studio_button"),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                ChatImportProgressBanner(
+                    progressState = importProgressState,
+                    onCancelImport = onCancelImport
+                )
+
+                SleepModeVisualBanner(
+                    isSleepMode = isSleepMode,
+                    sleepReason = sleepModeReason,
+                    onWakeUpTap = onExitSleepMode
+                )
+
+                WakeReadyVisualCueBanner(
+                    cueState = wakeReadyVisualCue,
+                    onOpenChat = onSelectChat,
+                    onDismiss = onDismissWakeReadyCue
+                )
+
+                // Expandable Top Drawer for Cloud Sync, Wake Summary, Radar & Analytics (collapsed by default)
+                AnimatedVisibility(
+                    visible = isCloudSummaryDrawerExpanded,
+                    enter = fadeIn(),
+                    exit = fadeOut()
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Mic,
-                        contentDescription = null,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text("Custom Wake Word Studio", style = MaterialTheme.typography.labelMedium)
+                    Surface(
+                        color = MaterialTheme.colorScheme.surfaceContainerLow,
+                        tonalElevation = 4.dp,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("home_cloud_summary_drawer")
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 6.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                                    .padding(horizontal = 12.dp, vertical = 6.dp)
+                                    .testTag("cloud_sync_account_bar"),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Row(
+                                    modifier = Modifier.weight(1f),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.CloudDone,
+                                        contentDescription = "Cloud Firestore Sync",
+                                        tint = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Column {
+                                        Text(
+                                            text = userDisplayName?.takeIf { it.isNotBlank() }
+                                                ?: userEmail?.takeIf { it.isNotBlank() }
+                                                ?: "Cloud Firestore Sync",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                        Text(
+                                            text = cloudSyncStatus,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    IconButton(
+                                        onClick = onSyncNow,
+                                        modifier = Modifier.testTag("cloud_sync_now_button")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Sync,
+                                            contentDescription = "Sync Now with Cloud Firestore",
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                    if (!userEmail.isNullOrBlank() || !userDisplayName.isNullOrBlank()) {
+                                        IconButton(
+                                            onClick = onSignOut,
+                                            modifier = Modifier.testTag("google_sign_out_button")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Logout,
+                                                contentDescription = "Sign Out of Google Account",
+                                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            WakeWordListeningStatusBanner(
+                                isListening = isListening && !isSleepMode,
+                                audioRmsDb = audioRmsDb,
+                                activeWakePhrase = chats.firstOrNull { it.isDefaultWakeChat }?.wakeWord ?: "Hey Gemini",
+                                lastHeardText = lastHeardText,
+                                totalVoiceCommands = chats.sumOf { it.totalVoiceCommands }
+                            )
+
+                            Box(modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)) {
+                                WebSearchAndHistoryBar(
+                                    historyEntries = webLinkHistory,
+                                    onSubmitSearchOrUrl = onSubmitWebSearchOrUrl,
+                                    onOpenHistoryEntry = onOpenWebHistoryEntry,
+                                    onDeleteHistoryEntry = onDeleteWebHistoryEntry,
+                                    onClearAllHistory = onClearAllWebHistory,
+                                    voiceCommandEntries = voiceCommandHistory,
+                                    onUseVoiceCommandTranscript = onUseVoiceCommandTranscript,
+                                    onDeleteVoiceCommandEntry = onDeleteVoiceCommandEntry,
+                                    onClearAllVoiceCommands = onClearAllVoiceCommands,
+                                    onClearCorruptedHistory = onClearCorruptedHistory,
+                                    onTextInputFocusChanged = onTextInputFocusChanged
+                                )
+                            }
+
+                            Box(modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)) {
+                                WakeWordRadarCard(
+                                    isListening = (isHandsFreeActive || isListening) && !isSleepMode,
+                                    audioRmsDb = audioRmsDb,
+                                    statusMessage = statusMessage,
+                                    lastHeardText = lastHeardText,
+                                    onToggleListening = {
+                                        if (isSleepMode) onExitSleepMode() else onToggleListening()
+                                    },
+                                    onOpenWakeSettings = onOpenWakeSettings
+                                )
+                            }
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 2.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                androidx.compose.material3.FilledTonalButton(
+                                    onClick = onNavigateToWakeWordStudio,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("open_wake_word_studio_button"),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Mic,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Wake Studio", style = MaterialTheme.typography.labelMedium)
+                                }
+
+                                androidx.compose.material3.OutlinedButton(
+                                    onClick = { isAnalyticsSectionExpanded = !isAnalyticsSectionExpanded },
+                                    modifier = Modifier.testTag("home_toggle_analytics_charts_button"),
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp)
+                                ) {
+                                    Text(
+                                        text = if (isAnalyticsSectionExpanded) "Hide Charts" else "Show Charts",
+                                        style = MaterialTheme.typography.labelMedium
+                                    )
+                                }
+
+                                androidx.compose.material3.OutlinedButton(
+                                    onClick = { if (isSleepMode) onExitSleepMode() else onEnterSleepMode() },
+                                    modifier = Modifier.testTag("home_sleep_mode_toggle_button"),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = if (isSleepMode) Icons.Default.Mic else Icons.Default.MicOff,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = if (isSleepMode) "Wake Up" else "Sleep",
+                                        style = MaterialTheme.typography.labelMedium
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
 
-                androidx.compose.material3.OutlinedButton(
-                    onClick = { if (isSleepMode) onExitSleepMode() else onEnterSleepMode() },
-                    modifier = Modifier.testTag("home_sleep_mode_toggle_button"),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                ) {
-                    Icon(
-                        imageVector = if (isSleepMode) Icons.Default.Mic else Icons.Default.MicOff,
-                        contentDescription = null,
-                        modifier = Modifier.size(15.dp)
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(
-                        text = if (isSleepMode) "Wake Up" else "Sleep",
-                        style = MaterialTheme.typography.labelMedium
-                    )
-                }
-            }
-
-            if (!userEmail.isNullOrBlank() || !userDisplayName.isNullOrBlank()) {
-                Row(
+                // Maximized Conversation Threads Viewport
+                LazyColumn(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(MaterialTheme.colorScheme.surfaceContainerHigh)
-                        .padding(horizontal = 12.dp, vertical = 6.dp)
-                        .testTag("cloud_sync_account_bar"),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+                        .weight(1f)
+                        .imePadding(),
+                    contentPadding = PaddingValues(
+                        start = 16.dp,
+                        end = if (isSideCategoryBarCollapsed) 24.dp else 112.dp,
+                        top = 10.dp,
+                        bottom = 96.dp
+                    ),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    Row(
-                        modifier = Modifier.weight(1f),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.CloudDone,
-                            contentDescription = "Cloud Firestore Sync",
-                            tint = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Column {
-                            Text(
-                                text = userDisplayName?.takeIf { it.isNotBlank() } ?: userEmail.orEmpty(),
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = FontWeight.SemiBold
+                    if (isCloudSummaryDrawerExpanded && isAnalyticsSectionExpanded) {
+                        item(key = "wake_session_bar_chart_dashboard") {
+                            WakeWordSessionBarChartCard(
+                                chats = chats,
+                                voiceCommands = voiceCommandHistory,
+                                statisticsState = sessionStatisticsState,
+                                onSelectDateRange = onSelectStatisticsDateRange,
+                                onSelectDefaultWakeChat = onSetDefaultWakeChat,
+                                onCreateNewWakeTargetChat = onCreateNewWakeTargetChat,
+                                onOpenExportDialog = onOpenBackupExportDialog,
+                                onQuickShareCsv = onQuickShareCsv
                             )
-                            Text(
-                                text = cloudSyncStatus,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                        }
+
+                        item(key = "weekly_activity_heatmap_dashboard") {
+                            val heatmapCells = remember(sessionStatisticsState, chats, voiceCommandHistory) {
+                                sessionStatisticsState?.weeklyHeatmapCells?.takeIf { it.isNotEmpty() }
+                                    ?: computeWeeklyActivityHeatmap(
+                                        chats = chats,
+                                        messages = emptyList(),
+                                        voiceCommands = voiceCommandHistory
+                                    )
+                            }
+                            val peakLabel = sessionStatisticsState?.peakHeatmapSlotLabel ?: "Peak Activity Slot"
+                            WeeklyActivityHeatmapCard(
+                                heatmapCells = heatmapCells,
+                                peakSlotSummary = peakLabel,
+                                onShareCsvClick = onQuickShareCsv
                             )
                         }
                     }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(
-                            onClick = onSyncNow,
-                            modifier = Modifier.testTag("cloud_sync_now_button")
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Sync,
-                                contentDescription = "Sync Now with Cloud Firestore",
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(18.dp)
+
+                    // Compact header with tag filter chips + active count
+                    item(key = "chat_category_and_tag_filter_bar") {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = if (selectedCategoryFilter.isNullOrBlank()) {
+                                        "Your Chosen Chats"
+                                    } else {
+                                        "$selectedCategoryFilter Chats"
+                                    },
+                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    val pinnedCountInView = filteredChats.count { it.isPinned || pinnedChatIds.contains(it.id) }
+                                    Text(
+                                        text = if (pinnedCountInView > 0) {
+                                            "📌 $pinnedCountInView pinned • ${filteredChats.size}/${chats.size}"
+                                        } else {
+                                            "${filteredChats.size} of ${chats.size} shown"
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = if (pinnedCountInView > 0) {
+                                            MaterialTheme.colorScheme.primary
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        }
+                                    )
+                                    if (favoriteChatIds.isNotEmpty()) {
+                                        TextButton(
+                                            onClick = onOpenWakeFavoritesPicker,
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                            modifier = Modifier.testTag("home_open_favorites_picker_button")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Star,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(14.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(3.dp))
+                                            Text(
+                                                text = "Fav (${favoriteChatIds.size})",
+                                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (allKnownTags.isNotEmpty()) {
+                                LazyRow(
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("home_tag_filter_row")
+                                ) {
+                                    items(allKnownTags, key = { "tag_$it" }) { tag ->
+                                        val isTagSelected = selectedTagFilter?.equals(tag, ignoreCase = true) == true
+                                        Surface(
+                                            shape = RoundedCornerShape(8.dp),
+                                            color = if (isTagSelected) {
+                                                MaterialTheme.colorScheme.secondaryContainer
+                                            } else {
+                                                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+                                            },
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(8.dp))
+                                                .clickable {
+                                                    selectedTagFilter = if (isTagSelected) null else tag
+                                                }
+                                                .testTag("home_tag_chip_$tag")
+                                        ) {
+                                            Text(
+                                                text = "#$tag",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = if (isTagSelected) FontWeight.Bold else FontWeight.Normal,
+                                                color = if (isTagSelected) {
+                                                    MaterialTheme.colorScheme.onSecondaryContainer
+                                                } else {
+                                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                                },
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (chats.isEmpty()) {
+                        item {
+                            EmptyChatsPlaceholder(
+                                onCreateChat = onCreateChat,
+                                onOpenImportDialog = onOpenImportDialog
                             )
                         }
-                        IconButton(
-                            onClick = onSignOut,
-                            modifier = Modifier.testTag("google_sign_out_button")
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Logout,
-                                contentDescription = "Sign Out of Google Account",
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.size(18.dp)
+                    } else {
+                        itemsIndexed(
+                            items = filteredChats,
+                            key = { _, chat -> "chat_${chat.id}_${chat.isPinned || pinnedChatIds.contains(chat.id)}" }
+                        ) { _, chat ->
+                            val isRunning = activeTimerChatIds.contains(chat.id)
+                            val seconds = liveTrackedSeconds[chat.id] ?: chat.totalTrackedSeconds
+                            val isPinned = chat.isPinned || pinnedChatIds.contains(chat.id)
+                            ChatSessionCard(
+                                chat = chat,
+                                trackedSeconds = seconds,
+                                isTimerRunning = isRunning,
+                                isPinned = isPinned,
+                                category = chatCategoryMap[chat.id],
+                                tags = chatTagsMap[chat.id].orEmpty(),
+                                onClick = { onSelectChat(chat.id) },
+                                onTogglePin = { onTogglePinChat(chat.id) },
+                                onEdit = { onEditChat(chat) },
+                                onDelete = { onDeleteChat(chat.id) },
+                                onSetDefault = { onSetDefaultWakeChat(chat.id) },
+                                onToggleTimer = { onToggleChatTimer(chat.id) },
+                                onResetTimer = { onResetChatTimer(chat.id) }
                             )
                         }
+                    }
+
+                    item {
+                        Spacer(modifier = Modifier.height(72.dp))
                     }
                 }
             }
 
-            LazyColumn(
+            // Right-edge Collapsible Category Filter Chip Bar ('All', 'Work', 'Personal', 'Projects')
+            com.example.ui.components.CollapsibleSideCategoryFilterBar(
+                selectedCategory = selectedCategoryFilter,
+                onSelectCategory = { selectedCategoryFilter = it },
+                isCollapsed = isSideCategoryBarCollapsed,
+                onToggleCollapsed = { isSideCategoryBarCollapsed = !isSideCategoryBarCollapsed },
+                chats = chats,
+                chatCategoryMap = chatCategoryMap,
+                isInChatInterface = false,
+                testTagPrefix = "home",
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 96.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
-            ) {
-            // Chat List Header & Items (Full Height Focus)
-            item {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "Your Chosen Chats",
-                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
-                    )
-                    Text(
-                        text = "${chats.size} chats configured",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-
-            if (chats.isEmpty()) {
-                item {
-                    EmptyChatsPlaceholder(
-                        onCreateChat = onCreateChat,
-                        onOpenImportDialog = onOpenImportDialog
-                    )
-                }
-            } else {
-                itemsIndexed(
-                    items = chats,
-                    key = { index, chat -> "${chat.id}_$index" }
-                ) { _, chat ->
-                    val isRunning = activeTimerChatIds.contains(chat.id)
-                    val seconds = liveTrackedSeconds[chat.id] ?: chat.totalTrackedSeconds
-                    ChatSessionCard(
-                        chat = chat,
-                        trackedSeconds = seconds,
-                        isTimerRunning = isRunning,
-                        onClick = { onSelectChat(chat.id) },
-                        onEdit = { onEditChat(chat) },
-                        onDelete = { onDeleteChat(chat.id) },
-                        onSetDefault = { onSetDefaultWakeChat(chat.id) },
-                        onToggleTimer = { onToggleChatTimer(chat.id) },
-                        onResetTimer = { onResetChatTimer(chat.id) }
-                    )
-                }
-            }
-
-            item {
-                Spacer(modifier = Modifier.height(72.dp))
-            }
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 2.dp)
+            )
         }
     }
-}
 }
 
 
@@ -691,9 +1228,18 @@ fun WakeWordRadarCard(
                 barCount = 18
             )
 
-            // 3. Toggle Button Section
+            // 3. Toggle Button Section (with 400ms click debounce)
+            var lastHudClickAtMs by remember { androidx.compose.runtime.mutableLongStateOf(0L) }
+            val currentOnToggleListening by androidx.compose.runtime.rememberUpdatedState(onToggleListening)
             IconButton(
-                onClick = onToggleListening,
+                onClick = {
+                    val now = System.currentTimeMillis()
+                    if (lastHudClickAtMs > 0L && (now - lastHudClickAtMs) < com.example.ui.components.MIN_RADAR_PILL_CLICK_DEBOUNCE_MS) {
+                        return@IconButton
+                    }
+                    lastHudClickAtMs = now
+                    currentOnToggleListening()
+                },
                 modifier = Modifier
                     .size(36.dp)
                     .clip(CircleShape)
@@ -719,7 +1265,11 @@ fun ChatSessionCard(
     chat: ChatSession,
     trackedSeconds: Long = 0L,
     isTimerRunning: Boolean = false,
+    isPinned: Boolean = false,
+    category: String? = null,
+    tags: Set<String> = emptySet(),
     onClick: () -> Unit,
+    onTogglePin: () -> Unit = {},
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onSetDefault: () -> Unit,
@@ -741,12 +1291,16 @@ fun ChatSessionCard(
             .testTag("chat_card_${chat.id}"),
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surface
+            containerColor = if (isPinned) {
+                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.22f)
+            } else {
+                MaterialTheme.colorScheme.surface
+            }
         ),
-        border = if (chat.isDefaultWakeChat) {
-            androidx.compose.foundation.BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary)
-        } else {
-            androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.2f))
+        border = when {
+            isPinned -> androidx.compose.foundation.BorderStroke(1.5.dp, accentColor.copy(alpha = 0.8f))
+            chat.isDefaultWakeChat -> androidx.compose.foundation.BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary)
+            else -> androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.2f))
         },
         onClick = onClick
     ) {
@@ -778,6 +1332,35 @@ fun ChatSessionCard(
                             text = chat.title,
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold)
                         )
+                        if (isPinned) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = accentColor.copy(alpha = 0.18f),
+                                modifier = Modifier.testTag("chat_pinned_badge_${chat.id}")
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.PushPin,
+                                        contentDescription = "Pinned to Top",
+                                        tint = accentColor,
+                                        modifier = Modifier.size(11.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(3.dp))
+                                    Text(
+                                        text = "Pinned",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 10.sp
+                                        ),
+                                        color = accentColor
+                                    )
+                                }
+                            }
+                        }
                         if (chat.isDefaultWakeChat) {
                             Spacer(modifier = Modifier.width(6.dp))
                             Icon(
@@ -831,6 +1414,22 @@ fun ChatSessionCard(
                             )
                         }
 
+                        if (!category.isNullOrBlank()) {
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f))
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            ) {
+                                Text(
+                                    text = "📁 $category",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer
+                                )
+                            }
+                        }
+
                         if (chat.isDefaultWakeChat) {
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
@@ -838,6 +1437,22 @@ fun ChatSessionCard(
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.primary
                             )
+                        }
+                    }
+
+                    if (tags.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            tags.take(4).forEach { tag ->
+                                Text(
+                                    text = "#$tag",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.85f)
+                                )
+                            }
                         }
                     }
 
@@ -852,6 +1467,18 @@ fun ChatSessionCard(
                             modifier = Modifier.testTag("home_chat_greeting_preview_${chat.id}")
                         )
                     }
+                }
+
+                IconButton(
+                    onClick = onTogglePin,
+                    modifier = Modifier.testTag("chat_pin_button_${chat.id}")
+                ) {
+                    Icon(
+                        imageVector = if (isPinned) Icons.Default.PushPin else Icons.Outlined.PushPin,
+                        contentDescription = if (isPinned) "Unpin Chat from Top" else "Pin Chat to Top",
+                        tint = if (isPinned) accentColor else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(20.dp)
+                    )
                 }
 
                 Box {
@@ -872,6 +1499,21 @@ fun ChatSessionCard(
                             onClick = {
                                 menuExpanded = false
                                 onClick()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (isPinned) "Unpin from Top" else "Pin to Top of List") },
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = if (isPinned) Icons.Default.PushPin else Icons.Outlined.PushPin,
+                                    contentDescription = null,
+                                    tint = if (isPinned) accentColor else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            },
+                            modifier = Modifier.testTag("chat_menu_toggle_pin_${chat.id}"),
+                            onClick = {
+                                menuExpanded = false
+                                onTogglePin()
                             }
                         )
                         if (!chat.isDefaultWakeChat) {

@@ -22,9 +22,9 @@ import android.os.IBinder
 import android.os.Process
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.example.data.db.AppDatabase
-import com.example.data.model.TriggerType
 import com.example.data.model.WakeWord
 import com.example.data.repository.WakeWordRepository
 import kotlinx.coroutines.CoroutineScope
@@ -32,13 +32,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.consumeAsFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
@@ -60,11 +64,14 @@ data class WakeWordDetectionResult(
 )
 
 /**
- * Foreground service declared with android:foregroundServiceType="microphone"
- * so Android does not mute background or live voice microphone capture.
+ * Foreground service declared with `android:foregroundServiceType="microphone"`
+ * (`FOREGROUND_SERVICE_MICROPHONE` permission) that immediately invokes `startForeground()`
+ * with a persistent notification so Samsung One UI and Android 14+ keep the microphone
+ * out of deep-sleep buckets.
  *
- * Initializes microphone capture and runs a keyword detection loop integrated with
- * [WakeWordRepository] to check spoken input against active user-defined wake words in the Room database.
+ * Uses a thread-safe `Channel<ByteArray>(capacity = 32, onBufferOverflow = BufferOverflow.DROP_OLDEST)`
+ * as its [audioPipelineBuffer] and exposes [audioPipelineFlow] via `consumeAsFlow()`.
+ * Strictly releases [AudioRecord] hardware whenever [isIntentionallyPaused] is `true`.
  */
 class WakeWordVoiceService : Service() {
 
@@ -77,6 +84,22 @@ class WakeWordVoiceService : Service() {
     private var repositoryObserverJob: Job? = null
     private var keywordLoopJob: Job? = null
     private var serviceAudioRecord: AudioRecord? = null
+
+    /**
+     * Thread-safe ring buffer (`capacity = 32`, `BufferOverflow.DROP_OLDEST`) acting as
+     * the service's `AudioPipelineBuffer` for raw PCM byte chunks read from [AudioRecord].
+     */
+    var audioPipelineBuffer: Channel<ByteArray> = Channel(
+        capacity = AUDIO_PIPELINE_BUFFER_CAPACITY,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+        private set
+
+    /**
+     * Exposes [audioPipelineBuffer] as a [Flow] via [consumeAsFlow] for downstream processing.
+     */
+    var audioPipelineFlow: Flow<ByteArray> = audioPipelineBuffer.consumeAsFlow()
+        private set
 
     private var customRepository: WakeWordRepository? = null
     private val transcriptQueue = ConcurrentLinkedQueue<String>()
@@ -152,6 +175,9 @@ class WakeWordVoiceService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // Immediately promote to foreground with persistent notification so Samsung One UI
+        // recognizes active microphone usage and does not put the service into a deep sleep bucket.
+        promoteToMicrophoneForeground()
         audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         try {
             audioManager?.registerAudioRecordingCallback(recordingCallback, null)
@@ -164,16 +190,23 @@ class WakeWordVoiceService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP_VOICE_SERVICE) {
+            setIntentionallyPaused(true)
+            stopKeywordDetectionLoop()
+            abandonExclusiveAudioFocus()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelfResult(startId)
+            return START_NOT_STICKY
+        }
+
+        // Immediately call startForeground() with persistent notification on every start command
+        promoteToMicrophoneForeground()
+
         when (intent?.action) {
-            ACTION_STOP_VOICE_SERVICE -> {
-                stopKeywordDetectionLoop()
-                abandonExclusiveAudioFocus()
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelfResult(startId)
-                return START_NOT_STICKY
-            }
             ACTION_ENTER_SLEEP_MODE -> {
                 setSleepMode(true)
+                setIntentionallyPaused(true)
+                releaseServiceMicrophoneRecord()
                 abandonExclusiveAudioFocus()
                 promoteToMicrophoneForeground()
                 onSleepModeChangedCallback?.invoke(true)
@@ -181,6 +214,8 @@ class WakeWordVoiceService : Service() {
             }
             ACTION_WAKE_FROM_SLEEP -> {
                 setSleepMode(false)
+                setBatterySaverPaused(false)
+                setIntentionallyPaused(false)
                 if (!_hasExclusiveAudioFocus.value && !isAppRecordingActive) {
                     requestExclusiveAudioFocus()
                 }
@@ -191,27 +226,65 @@ class WakeWordVoiceService : Service() {
                 onSleepModeChangedCallback?.invoke(false)
                 return START_STICKY
             }
-            ACTION_PAUSE_FOR_INPUT_FOCUS -> {
-                _isInputFocusPaused.value = true
+            ACTION_BATTERY_SAVER_PAUSE -> {
+                setBatterySaverPaused(true)
+                setIntentionallyPaused(true)
+                releaseServiceMicrophoneRecord()
                 abandonExclusiveAudioFocus()
-                onInputFocusPauseRequested?.invoke(true)
+                promoteToMicrophoneForeground()
                 return START_STICKY
             }
-            ACTION_RESUME_AFTER_INPUT_FOCUS -> {
+            ACTION_BATTERY_SAVER_RESUME -> {
+                setBatterySaverPaused(false)
+                if (!_isSleepModeGlobal.value) {
+                    setIntentionallyPaused(false)
+                    if (!_hasExclusiveAudioFocus.value && !isAppRecordingActive) {
+                        requestExclusiveAudioFocus()
+                    }
+                    if (!_isKeywordLoopRunning.value) {
+                        startKeywordDetectionLoop()
+                    }
+                }
+                promoteToMicrophoneForeground()
+                onBatterySaverResumeRequestedCallback?.invoke()
+                return START_STICKY
+            }
+            ACTION_PAUSE_FOR_INPUT_FOCUS,
+            ACTION_PAUSE_FOR_COMMAND_DISPATCH -> {
+                _isInputFocusPaused.value = true
+                setIntentionallyPaused(true)
+                releaseServiceMicrophoneRecord()
+                abandonExclusiveAudioFocus()
+                promoteToMicrophoneForeground()
+                if (intent.action == ACTION_PAUSE_FOR_INPUT_FOCUS) {
+                    onInputFocusPauseRequested?.invoke(true)
+                }
+                return START_STICKY
+            }
+            ACTION_RESUME_AFTER_INPUT_FOCUS,
+            ACTION_RESUME_AFTER_COMMAND_DISPATCH -> {
                 _isInputFocusPaused.value = false
-                if (!_hasExclusiveAudioFocus.value) {
+                if (!_isSleepModeGlobal.value && !_isBatterySaverPausedGlobal.value) {
+                    setIntentionallyPaused(false)
+                }
+                if (!_hasExclusiveAudioFocus.value && !isAppRecordingActive) {
                     requestExclusiveAudioFocus()
                 }
-                onInputFocusPauseRequested?.invoke(false)
+                promoteToMicrophoneForeground()
+                if (intent.action == ACTION_RESUME_AFTER_INPUT_FOCUS) {
+                    onInputFocusPauseRequested?.invoke(false)
+                }
                 if (!_isKeywordLoopRunning.value) {
                     startKeywordDetectionLoop()
                 }
                 return START_STICKY
             }
             else -> {
-                promoteToMicrophoneForeground()
+                if (!_isSleepModeGlobal.value && !_isBatterySaverPausedGlobal.value && !_isInputFocusPaused.value) {
+                    setIntentionallyPaused(false)
+                }
                 // Do not re-request audio focus with a competing listener if WakeWordManager already holds it
-                if (!_hasExclusiveAudioFocus.value && !isAppRecordingActive && !_isSleepModeGlobal.value) {
+                if (!_hasExclusiveAudioFocus.value && !isAppRecordingActive && !isIntentionallyPaused) {
                     requestExclusiveAudioFocus()
                 }
                 val candidateTranscript = intent?.getStringExtra(EXTRA_CANDIDATE_TRANSCRIPT)
@@ -225,6 +298,7 @@ class WakeWordVoiceService : Service() {
     }
 
     override fun onDestroy() {
+        setIntentionallyPaused(true)
         stopKeywordDetectionLoop()
         repositoryObserverJob?.cancel()
         serviceScope.cancel()
@@ -233,6 +307,21 @@ class WakeWordVoiceService : Service() {
         } catch (_: Exception) {}
         abandonExclusiveAudioFocus()
         super.onDestroy()
+    }
+
+    /**
+     * Resets and recreates [audioPipelineBuffer] and [audioPipelineFlow] if a downstream consumer
+     * previously cancelled the flow.
+     */
+    @Synchronized
+    fun resetAudioPipelineBuffer(): Flow<ByteArray> {
+        audioPipelineBuffer.close()
+        audioPipelineBuffer = Channel(
+            capacity = AUDIO_PIPELINE_BUFFER_CAPACITY,
+            onBufferOverflow = BufferOverflow.DROP_OLDEST
+        )
+        audioPipelineFlow = audioPipelineBuffer.consumeAsFlow()
+        return audioPipelineFlow
     }
 
     /**
@@ -286,6 +375,9 @@ class WakeWordVoiceService : Service() {
     /**
      * Initializes the microphone (when not already held by the in-process speech/wake engine)
      * and runs the continuous keyword detection loop checking against [WakeWordRepository].
+     *
+     * Pushes raw PCM byte chunks into [audioPipelineBuffer] via `trySend()` and strictly releases
+     * [AudioRecord] hardware when [isIntentionallyPaused] is `true`.
      */
     fun startKeywordDetectionLoop() {
         if (keywordLoopJob?.isActive == true) return
@@ -301,18 +393,17 @@ class WakeWordVoiceService : Service() {
                     _activeDatabaseWakeWords.value = initial
                 }
 
-                // Initialize standalone microphone AudioRecord if permission is granted and no external recognizer holds mic
                 val hasRecordAudioPerm = ContextCompat.checkSelfPermission(
                     applicationContext,
                     Manifest.permission.RECORD_AUDIO
                 ) == PackageManager.PERMISSION_GRANTED
 
-                var pcmBuffer: ShortArray? = null
-                if (hasRecordAudioPerm && !isAppRecordingActive && !_isSleepModeGlobal.value) {
+                var pcmByteBuffer: ByteArray? = null
+                if (hasRecordAudioPerm && !isAppRecordingActive && !isIntentionallyPaused && !_isSleepModeGlobal.value) {
                     val record = initializeMicrophoneRecord()
                     if (record != null) {
                         serviceAudioRecord = record
-                        pcmBuffer = ShortArray(1024)
+                        pcmByteBuffer = ByteArray(2048)
                     }
                 }
 
@@ -324,33 +415,56 @@ class WakeWordVoiceService : Service() {
                         candidate = transcriptQueue.poll()
                     }
 
-                    if (_isInputFocusPaused.value || _isExternalRecordingActive.value || _isSleepModeGlobal.value) {
-                        if (_isSleepModeGlobal.value && serviceAudioRecord != null) {
+                    // Strictly release microphone hardware when isIntentionallyPaused is true
+                    if (isIntentionallyPaused ||
+                        _isInputFocusPaused.value ||
+                        _isExternalRecordingActive.value ||
+                        _isSleepModeGlobal.value ||
+                        _isBatterySaverPausedGlobal.value
+                    ) {
+                        if (serviceAudioRecord != null) {
                             releaseServiceMicrophoneRecord()
                         }
                         delay(120L)
                         continue
                     }
 
-                    // 1. If a standalone AudioRecord is active and the main app engine isn't holding the mic, read PCM audio
+                    // Read raw PCM bytes and push non-blockingly into audioPipelineBuffer via trySend()
                     val activeRecord = serviceAudioRecord
-                    if (activeRecord != null && pcmBuffer != null && !isAppRecordingActive) {
+                    if (activeRecord != null && pcmByteBuffer != null && !isAppRecordingActive && !isIntentionallyPaused) {
                         try {
                             if (activeRecord.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                                val read = activeRecord.read(pcmBuffer, 0, pcmBuffer.size)
-                                if (read > 0) {
-                                    var sumSq = 0.0
-                                    for (i in 0 until read) {
-                                        val s = pcmBuffer[i].toDouble()
-                                        sumSq += s * s
+                                val bytesRead = activeRecord.read(pcmByteBuffer, 0, pcmByteBuffer.size)
+                                if (bytesRead > 0) {
+                                    val pcmChunk = if (bytesRead == pcmByteBuffer.size) {
+                                        pcmByteBuffer.copyOf()
+                                    } else {
+                                        pcmByteBuffer.copyOf(bytesRead)
                                     }
-                                    val rms = sqrt(sumSq / read)
-                                    _serviceMicRms.value = rms.toFloat()
+                                    // Immediately push PCM chunk into Channel<ByteArray> ring buffer
+                                    audioPipelineBuffer.trySend(pcmChunk)
+
+                                    // Compute RMS amplitude from 16-bit Little-Endian PCM samples
+                                    var sumSq = 0.0
+                                    var sampleCount = 0
+                                    var i = 0
+                                    while (i + 1 < bytesRead) {
+                                        val low = pcmChunk[i].toInt() and 0xFF
+                                        val high = pcmChunk[i + 1].toInt()
+                                        val sample = ((high shl 8) or low).toShort().toDouble()
+                                        sumSq += sample * sample
+                                        sampleCount++
+                                        i += 2
+                                    }
+                                    if (sampleCount > 0) {
+                                        val rms = sqrt(sumSq / sampleCount)
+                                        _serviceMicRms.value = rms.toFloat()
+                                    }
                                 }
                             }
                         } catch (_: Throwable) {}
-                    } else if (isAppRecordingActive && serviceAudioRecord != null) {
-                        // Yield standalone service AudioRecord immediately when SpeechRecognizer or WakeWordManager owns the mic
+                    } else if ((isAppRecordingActive || isIntentionallyPaused) && serviceAudioRecord != null) {
+                        // Yield standalone service AudioRecord immediately when SpeechRecognizer/WakeWordManager owns mic or paused
                         releaseServiceMicrophoneRecord()
                     }
 
@@ -359,6 +473,7 @@ class WakeWordVoiceService : Service() {
             } catch (e: Exception) {
                 Log.w(TAG, "Keyword detection loop terminated: ${e.message}")
             } finally {
+                // Strictly release hardware when loop exits or isIntentionallyPaused is true
                 releaseServiceMicrophoneRecord()
                 _isKeywordLoopRunning.value = false
                 _isKeywordLoopActiveGlobal.value = false
@@ -397,8 +512,11 @@ class WakeWordVoiceService : Service() {
 
         // Check for "Gemini, wake up" command to exit sleep mode
         if (AudioCommandSanitizer.containsWakeUpCommand(cleanTranscript)) {
-            if (_isSleepModeGlobal.value) {
+            if (_isSleepModeGlobal.value || _isBatterySaverPausedGlobal.value || isIntentionallyPaused) {
+                AudioCommandSanitizer.playVoiceCommandHaptic(applicationContext, "Wake Up (\"$cleanTranscript\")")
                 setSleepMode(false)
+                setBatterySaverPaused(false)
+                setIntentionallyPaused(false)
                 promoteToMicrophoneForeground()
                 onSleepModeChangedCallback?.invoke(false)
             }
@@ -407,14 +525,17 @@ class WakeWordVoiceService : Service() {
 
         // Check for "Gemini, sleep" command to enter sleep mode
         if (AudioCommandSanitizer.containsSleepCommand(cleanTranscript)) {
+            AudioCommandSanitizer.playVoiceCommandHaptic(applicationContext, "Sleep (\"$cleanTranscript\")")
             setSleepMode(true)
+            setIntentionallyPaused(true)
+            releaseServiceMicrophoneRecord()
             promoteToMicrophoneForeground()
             onSleepModeChangedCallback?.invoke(true)
             return null
         }
 
-        // If in sleep mode, ignore normal wake word triggers until woken up
-        if (_isSleepModeGlobal.value) return null
+        // If in sleep mode or intentionally paused, ignore normal wake word triggers until woken up
+        if (_isSleepModeGlobal.value || isIntentionallyPaused) return null
 
         val currentActive = _serviceActiveWakeWords.value.ifEmpty {
             val loaded = resolveWakeWordRepository().getAllWakeWordsSync()
@@ -424,8 +545,24 @@ class WakeWordVoiceService : Service() {
             loaded
         }
 
+        // Check for voice history navigation command ("open history", "show history", "voice history")
+        // and immediately release service AudioRecord + audio focus before dispatching in-memory callback
+        if (AudioCommandSanitizer.isVoiceHistoryNavigationCommand(
+                cleanTranscript,
+                currentActive.map { it.phrase }
+            )
+        ) {
+            AudioCommandSanitizer.playVoiceCommandHaptic(applicationContext, "Voice History Navigation (\"$cleanTranscript\")")
+            setIntentionallyPaused(true)
+            releaseServiceMicrophoneRecord()
+            abandonExclusiveAudioFocus()
+            onVoiceHistoryNavigationRequestedCallback?.invoke(cleanTranscript)
+            return null
+        }
+
         val match = matchWakeWordFromList(cleanTranscript, currentActive)
         if (match != null) {
+            AudioCommandSanitizer.playWakeWordHaptic(applicationContext, match.matchedPhrase)
             _lastDetectedWakeWord.value = match
             _detectedWakeWordsFlow.tryEmit(match)
             postWakeWordReadyCueNotification(applicationContext, match)
@@ -435,6 +572,7 @@ class WakeWordVoiceService : Service() {
     }
 
     private fun initializeMicrophoneRecord(): AudioRecord? {
+        if (isIntentionallyPaused) return null
         return try {
             val sampleRate = 16000
             val minBuf = AudioRecord.getMinBufferSize(
@@ -468,7 +606,7 @@ class WakeWordVoiceService : Service() {
         }
     }
 
-    private fun releaseServiceMicrophoneRecord() {
+    internal fun releaseServiceMicrophoneRecord() {
         val record = serviceAudioRecord ?: return
         serviceAudioRecord = null
         _isMicrophoneInitialized.value = false
@@ -532,7 +670,12 @@ class WakeWordVoiceService : Service() {
         }
     }
 
-    private fun promoteToMicrophoneForeground() {
+    /**
+     * Immediately calls `startForeground()` with `FOREGROUND_SERVICE_TYPE_MICROPHONE` and a
+     * persistent notification so Samsung One UI knows the microphone is actively in use
+     * and does not place the app in a deep-sleep bucket.
+     */
+    internal fun promoteToMicrophoneForeground() {
         try {
             ensureNotificationChannel()
             val notification = buildNotification()
@@ -541,7 +684,7 @@ class WakeWordVoiceService : Service() {
             } else {
                 0
             }
-            androidx.core.app.ServiceCompat.startForeground(
+            ServiceCompat.startForeground(
                 this,
                 NOTIFICATION_ID,
                 notification,
@@ -589,13 +732,17 @@ class WakeWordVoiceService : Service() {
 
     private fun buildNotification(): Notification {
         val isSleeping = _isSleepModeGlobal.value
-        val title = if (isSleeping) {
-            "Gemini Wake • Sleep Mode"
-        } else {
-            "Gemini Wake Active"
+        val isBatterySaverPaused = _isBatterySaverPausedGlobal.value
+        val title = when {
+            isBatterySaverPaused -> "Gemini Wake • Battery Saver Paused"
+            isSleeping -> "Gemini Wake • Sleep Mode"
+            else -> "Gemini Wake Active"
         }
         val subtitle = when {
-            isSleeping -> "Wake word listener paused — tap Wake Up or say \"Gemini, wake up\""
+            isBatterySaverPaused ->
+                "Microphone released to save battery — tap Resume or disable Battery Saver"
+            isSleeping ->
+                "Wake word listener paused — tap Wake Up or say \"Gemini, wake up\""
             _isInputFocusPaused.value || _isExternalRecordingActive.value ->
                 "Microphone yielded to keyboard / external input"
             else ->
@@ -609,8 +756,24 @@ class WakeWordVoiceService : Service() {
             .setSilent(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
 
-        if (isSleeping) {
+        if (isBatterySaverPaused) {
+            val resumeIntent = Intent(this, WakeWordVoiceService::class.java).apply {
+                action = ACTION_BATTERY_SAVER_RESUME
+            }
+            val resumePendingIntent = android.app.PendingIntent.getService(
+                this,
+                4106,
+                resumeIntent,
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+            )
+            builder.addAction(
+                android.R.drawable.ic_btn_speak_now,
+                "Resume",
+                resumePendingIntent
+            )
+        } else if (isSleeping) {
             val wakeIntent = Intent(this, WakeWordVoiceService::class.java).apply {
                 action = ACTION_WAKE_FROM_SLEEP
             }
@@ -630,6 +793,7 @@ class WakeWordVoiceService : Service() {
     }
 
     companion object {
+        const val AUDIO_PIPELINE_BUFFER_CAPACITY = 32
         const val CHANNEL_ID = "gemini_wake_mic_channel"
         const val CHANNEL_WAKE_CUE_ID = "gemini_wake_ready_cue_channel"
         const val NOTIFICATION_ID = 4102
@@ -638,14 +802,63 @@ class WakeWordVoiceService : Service() {
         const val ACTION_STOP_VOICE_SERVICE = "com.example.voice.action.STOP_VOICE_SERVICE"
         const val ACTION_ENTER_SLEEP_MODE = "com.example.voice.action.ENTER_SLEEP_MODE"
         const val ACTION_WAKE_FROM_SLEEP = "com.example.voice.action.WAKE_FROM_SLEEP"
+        const val ACTION_BATTERY_SAVER_PAUSE = "com.example.voice.action.BATTERY_SAVER_PAUSE"
+        const val ACTION_BATTERY_SAVER_RESUME = "com.example.voice.action.BATTERY_SAVER_RESUME"
         const val ACTION_PAUSE_FOR_INPUT_FOCUS = "com.example.voice.action.PAUSE_FOR_INPUT_FOCUS"
         const val ACTION_RESUME_AFTER_INPUT_FOCUS = "com.example.voice.action.RESUME_AFTER_INPUT_FOCUS"
+        const val ACTION_PAUSE_FOR_COMMAND_DISPATCH = "com.example.voice.action.PAUSE_FOR_COMMAND_DISPATCH"
+        const val ACTION_RESUME_AFTER_COMMAND_DISPATCH = "com.example.voice.action.RESUME_AFTER_COMMAND_DISPATCH"
         const val EXTRA_CANDIDATE_TRANSCRIPT = "com.example.voice.extra.CANDIDATE_TRANSCRIPT"
         const val EXTRA_WAKE_TARGET_CHAT_ID = "com.example.voice.extra.WAKE_TARGET_CHAT_ID"
         const val EXTRA_WAKE_MATCHED_PHRASE = "com.example.voice.extra.WAKE_MATCHED_PHRASE"
 
         @Volatile
         var injectedRepositoryForTesting: WakeWordRepository? = null
+
+        /**
+         * Global guard flag indicating whether the foreground service microphone loop is
+         * intentionally paused (due to Sleep Mode, Battery Saver, or Input Focus).
+         * When `true`, the service's [AudioRecord] hardware is strictly released.
+         */
+        @Volatile
+        var isIntentionallyPaused: Boolean = false
+            private set
+
+        fun setIntentionallyPaused(paused: Boolean) {
+            isIntentionallyPaused = paused
+        }
+
+        /**
+         * Immediately pauses the service's active microphone loop and releases its [AudioRecord]
+         * and audio focus before an in-app voice navigation command is dispatched.
+         */
+        fun pauseMicrophoneForCommandDispatch(context: Context) {
+            isIntentionallyPaused = true
+            _isInputFocusPaused.value = true
+            startServiceSafely(context, ACTION_PAUSE_FOR_COMMAND_DISPATCH)
+        }
+
+        /**
+         * Resumes the service's passive microphone state after an in-app voice navigation transition
+         * settles (unless Sleep Mode or Battery Saver pause is active).
+         */
+        fun resumeMicrophoneAfterCommandNavigation(context: Context) {
+            _isInputFocusPaused.value = false
+            if (!_isSleepModeGlobal.value && !_isBatterySaverPausedGlobal.value) {
+                isIntentionallyPaused = false
+                startServiceSafely(context, ACTION_RESUME_AFTER_COMMAND_DISPATCH)
+            }
+        }
+
+        private val _isBatterySaverPausedGlobal = MutableStateFlow(false)
+        val isBatterySaverPausedGlobal: StateFlow<Boolean> = _isBatterySaverPausedGlobal.asStateFlow()
+
+        fun setBatterySaverPaused(paused: Boolean) {
+            _isBatterySaverPausedGlobal.value = paused
+            if (paused) {
+                isIntentionallyPaused = true
+            }
+        }
 
         private val _activeDatabaseWakeWords = MutableStateFlow<List<WakeWord>>(emptyList())
         val activeDatabaseWakeWords: StateFlow<List<WakeWord>> = _activeDatabaseWakeWords.asStateFlow()
@@ -658,6 +871,11 @@ class WakeWordVoiceService : Service() {
 
         fun setSleepMode(sleeping: Boolean) {
             _isSleepModeGlobal.value = sleeping
+            if (sleeping) {
+                isIntentionallyPaused = true
+            } else if (!_isBatterySaverPausedGlobal.value) {
+                isIntentionallyPaused = false
+            }
         }
 
         private val _isKeywordLoopActiveGlobal = MutableStateFlow(false)
@@ -677,6 +895,8 @@ class WakeWordVoiceService : Service() {
 
         var onWakeWordDetectedCallback: ((WakeWordDetectionResult) -> Unit)? = null
         var onSleepModeChangedCallback: ((Boolean) -> Unit)? = null
+        var onBatterySaverResumeRequestedCallback: (() -> Unit)? = null
+        var onVoiceHistoryNavigationRequestedCallback: ((String) -> Unit)? = null
 
         /**
          * Posts a non-intrusive notification cue confirming the wake word was detected and the app

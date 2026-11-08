@@ -6,9 +6,18 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.consumeAsFlow
+import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 import java.io.File
 import kotlin.concurrent.thread
@@ -18,11 +27,19 @@ private const val TAG = "AudioRecorder"
 
 /**
  * Lifecycle-safe audio recorder that captures 16 kHz 16-bit mono PCM audio from
- * MediaRecorder.AudioSource.MIC (with fallback to UNPROCESSED / VOICE_RECOGNITION)
- * into a local PCM test buffer and writes a standard RIFF/WAVE (.wav) or .m4a file
- * for wake word training and snippet playback.
+ * MediaRecorder.AudioSource.MIC (with fallback to UNPROCESSED / VOICE_RECOGNITION).
+ *
+ * Uses a non-blocking, thread-safe ring buffer ([audioPipelineBuffer]) backed by a
+ * `Channel<ByteArray>(capacity = 32, onBufferOverflow = BufferOverflow.DROP_OLDEST)`
+ * exposed via `consumeAsFlow()` ([audioPipelineFlow]) so the real-time `AudioRecord.read()`
+ * thread immediately pushes raw PCM chunks via `trySend` without blocking or dropping frames.
  */
 class AudioRecorder(private val context: Context) {
+
+    companion object {
+        /** Ring buffer capacity (32 PCM chunks) with DROP_OLDEST overflow policy. */
+        const val AUDIO_PIPELINE_BUFFER_CAPACITY = 32
+    }
 
     sealed class State {
         object Idle : State()
@@ -35,8 +52,43 @@ class AudioRecorder(private val context: Context) {
     private var mediaRecorder: MediaRecorder? = null
     private var currentOutputFile: File? = null
 
+    private val recorderScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var accumulatorJob: Job? = null
+
+    /**
+     * Thread-safe ring buffer channel (`capacity = 32`, `BufferOverflow.DROP_OLDEST`) acting as
+     * the primary `AudioPipelineBuffer` for raw PCM byte chunks read from [AudioRecord].
+     */
+    var audioPipelineBuffer: Channel<ByteArray> = createPipelineBufferChannel()
+        private set
+
+    /**
+     * Exposes [audioPipelineBuffer] as a cold/consumable [Flow] via [consumeAsFlow] for
+     * downstream audio pipeline components.
+     */
+    var audioPipelineFlow: Flow<ByteArray> = audioPipelineBuffer.consumeAsFlow()
+        private set
+
+    /**
+     * Secondary non-blocking internal channel used to drain PCM chunks into [pcmByteStream]
+     * on a background I/O coroutine without competing with downstream consumers of [audioPipelineFlow].
+     */
+    private val internalSnippetChannel: Channel<ByteArray> = Channel(
+        capacity = AUDIO_PIPELINE_BUFFER_CAPACITY,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+
     private val pcmBufferLock = Any()
     private val pcmByteStream = ByteArrayOutputStream()
+
+    /**
+     * Guard flag indicating whether microphone capture is intentionally paused (e.g., when the app
+     * enters Sleep Mode). When `true`, the [AudioRecord.read] loop exits immediately and releases
+     * the hardware microphone cleanly.
+     */
+    @Volatile
+    var isIntentionallyPaused: Boolean = false
+        private set
 
     @Volatile
     private var isCapturingPcm = false
@@ -54,21 +106,66 @@ class AudioRecorder(private val context: Context) {
     val isRecording: Boolean
         get() = _state.value is State.Recording
 
+    init {
+        startInternalSnippetDrainer()
+    }
+
+    private fun createPipelineBufferChannel(): Channel<ByteArray> = Channel(
+        capacity = AUDIO_PIPELINE_BUFFER_CAPACITY,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+
     /**
-     * Appends incoming 16-bit Little-Endian PCM bytes directly into the active snippet buffer.
+     * Resets and recreates [audioPipelineBuffer] and [audioPipelineFlow] if a previous downstream
+     * collector cancelled the channel.
      */
-    fun appendPcmBytes(pcmBytes: ByteArray, bytesRead: Int = pcmBytes.size) {
-        if (bytesRead <= 0 || pcmBytes.isEmpty()) return
-        val limit = bytesRead.coerceAtMost(pcmBytes.size)
-        synchronized(pcmBufferLock) {
-            pcmByteStream.write(pcmBytes, 0, limit)
-            lastRecordedPcmBytes = pcmByteStream.toByteArray()
+    @Synchronized
+    fun resetAudioPipelineBuffer(): Flow<ByteArray> {
+        audioPipelineBuffer.close()
+        audioPipelineBuffer = createPipelineBufferChannel()
+        audioPipelineFlow = audioPipelineBuffer.consumeAsFlow()
+        return audioPipelineFlow
+    }
+
+    /**
+     * Updates [isIntentionallyPaused]. When `paused == true`, immediately stops the recording
+     * loop and releases the microphone hardware cleanly.
+     */
+    fun setIntentionallyPaused(paused: Boolean) {
+        isIntentionallyPaused = paused
+        if (paused) {
+            Log.d(TAG, "isIntentionallyPaused=true -> releasing microphone hardware cleanly")
+            stopAndReleaseHardware()
         }
+    }
+
+    private fun startInternalSnippetDrainer() {
+        accumulatorJob?.cancel()
+        accumulatorJob = recorderScope.launch {
+            for (chunk in internalSnippetChannel) {
+                synchronized(pcmBufferLock) {
+                    pcmByteStream.write(chunk, 0, chunk.size)
+                    lastRecordedPcmBytes = pcmByteStream.toByteArray()
+                }
+            }
+        }
+    }
+
+    /**
+     * Non-blockingly pushes a raw 16-bit Little-Endian PCM chunk into [audioPipelineBuffer]
+     * via `trySend` (ring buffer with `capacity = 32`, `DROP_OLDEST`).
+     */
+    fun pushPcmChunkToPipeline(pcmChunk: ByteArray, bytesRead: Int = pcmChunk.size): Boolean {
+        if (isIntentionallyPaused || bytesRead <= 0 || pcmChunk.isEmpty()) return false
+        val limit = bytesRead.coerceAtMost(pcmChunk.size)
+        val exactChunk = if (limit == pcmChunk.size) pcmChunk else pcmChunk.copyOf(limit)
+
+        // Update peak amplitude metric without blocking
         var maxSample = 0
         var i = 0
-        while (i + 1 < limit) {
-            val low = pcmBytes[i].toInt() and 0xFF
-            val high = pcmBytes[i + 1].toInt()
+        while (i + 1 < exactChunk.size) {
+            val low = exactChunk[i].toInt() and 0xFF
+            val high = exactChunk[i + 1].toInt()
             val sample = abs(((high shl 8) or low).toShort().toInt())
             if (sample > maxSample) maxSample = sample
             i += 2
@@ -76,6 +173,29 @@ class AudioRecorder(private val context: Context) {
         if (maxSample > lastMaxAmplitude) {
             lastMaxAmplitude = maxSample
         }
+
+        // 1. Immediately push into the primary AudioPipelineBuffer (Channel<ByteArray>, capacity=32, DROP_OLDEST)
+        val sendResult = audioPipelineBuffer.trySend(exactChunk)
+
+        // 2. Also offer to internal snippet writer channel
+        internalSnippetChannel.trySend(exactChunk)
+
+        return sendResult.isSuccess
+    }
+
+    /**
+     * Appends incoming 16-bit Little-Endian PCM bytes into both the ring buffer pipeline
+     * and the active snippet buffer.
+     */
+    fun appendPcmBytes(pcmBytes: ByteArray, bytesRead: Int = pcmBytes.size) {
+        if (bytesRead <= 0 || pcmBytes.isEmpty()) return
+        val limit = bytesRead.coerceAtMost(pcmBytes.size)
+        val exactChunk = if (limit == pcmBytes.size) pcmBytes else pcmBytes.copyOf(limit)
+        synchronized(pcmBufferLock) {
+            pcmByteStream.write(exactChunk, 0, exactChunk.size)
+            lastRecordedPcmBytes = pcmByteStream.toByteArray()
+        }
+        pushPcmChunkToPipeline(exactChunk, exactChunk.size)
     }
 
     /**
@@ -84,6 +204,13 @@ class AudioRecorder(private val context: Context) {
      */
     @Synchronized
     fun start(outputFile: File): Result<Unit> {
+        if (isIntentionallyPaused) {
+            val pausedErr = IllegalStateException("AudioRecorder is intentionally paused (sleep mode)")
+            Log.d(TAG, "Aborting start(): isIntentionallyPaused=true")
+            stopAndReleaseHardware()
+            return Result.failure(pausedErr)
+        }
+
         return try {
             val hasPermission = androidx.core.content.ContextCompat.checkSelfPermission(
                 context,
@@ -140,49 +267,47 @@ class AudioRecorder(private val context: Context) {
                     _state.value = State.Recording(outputFile, System.currentTimeMillis())
 
                     captureThread = thread(start = true, name = "Snippet-PCM-Recorder") {
-                        val shortBuf = ShortArray(bufferSize / 2)
-                        while (isCapturingPcm) {
-                            if (!hasRecordAudioPermission()) {
-                                Log.w(TAG, "RECORD_AUDIO permission revoked during snippet capture — stopping")
-                                break
-                            }
-                            val rec = audioRecord ?: break
-                            if (rec.state != AudioRecord.STATE_INITIALIZED ||
-                                rec.recordingState != AudioRecord.RECORDSTATE_RECORDING
-                            ) {
-                                break
-                            }
-                            val readCount = try {
-                                if (rec.state == AudioRecord.STATE_INITIALIZED) {
-                                    rec.read(shortBuf, 0, shortBuf.size)
-                                } else {
-                                    AudioRecord.ERROR_INVALID_OPERATION
+                        val byteBuf = ByteArray(bufferSize)
+                        try {
+                            while (isCapturingPcm && !isIntentionallyPaused) {
+                                if (!hasRecordAudioPermission()) {
+                                    Log.w(TAG, "RECORD_AUDIO permission revoked during capture — stopping")
+                                    break
                                 }
-                            } catch (e: IllegalStateException) {
-                                Log.w(TAG, "IllegalStateException reading AudioRecord: ${e.message}")
-                                break
-                            } catch (_: Throwable) {
-                                break
-                            }
-                            if (readCount < 0) {
-                                // Abort on native read error (-20 / NO_INIT / ERROR_BAD_VALUE / ERROR_DEAD_OBJECT)
-                                Log.w(TAG, "AudioRecorder read returned error code $readCount — aborting loop")
-                                break
-                            }
-                            if (readCount > 0) {
-                                val chunk = ByteArray(readCount * 2)
-                                var peak = 0
-                                for (i in 0 until readCount) {
-                                    val s = shortBuf[i].toInt()
-                                    val absVal = abs(s)
-                                    if (absVal > peak) peak = absVal
-                                    chunk[i * 2] = (s and 0xFF).toByte()
-                                    chunk[i * 2 + 1] = ((s shr 8) and 0xFF).toByte()
+                                val rec = audioRecord ?: break
+                                if (rec.state != AudioRecord.STATE_INITIALIZED ||
+                                    rec.recordingState != AudioRecord.RECORDSTATE_RECORDING
+                                ) {
+                                    break
                                 }
-                                lastMaxAmplitude = peak
-                                synchronized(pcmBufferLock) {
-                                    pcmByteStream.write(chunk)
-                                    lastRecordedPcmBytes = pcmByteStream.toByteArray()
+                                val bytesRead = try {
+                                    if (rec.state == AudioRecord.STATE_INITIALIZED) {
+                                        rec.read(byteBuf, 0, byteBuf.size)
+                                    } else {
+                                        AudioRecord.ERROR_INVALID_OPERATION
+                                    }
+                                } catch (e: IllegalStateException) {
+                                    Log.w(TAG, "IllegalStateException reading AudioRecord: ${e.message}")
+                                    break
+                                } catch (_: Throwable) {
+                                    break
+                                }
+                                if (bytesRead < 0) {
+                                    // Abort on native read error (-20 / NO_INIT / ERROR_BAD_VALUE / ERROR_DEAD_OBJECT)
+                                    Log.w(TAG, "AudioRecorder read returned error code $bytesRead — aborting loop")
+                                    break
+                                }
+                                if (bytesRead > 0) {
+                                    val chunk = byteBuf.copyOf(bytesRead)
+                                    // Immediately push raw PCM byte chunk into the non-blocking ring buffer channel
+                                    pushPcmChunkToPipeline(chunk, bytesRead)
+                                }
+                            }
+                        } finally {
+                            if (isIntentionallyPaused) {
+                                releaseRecorder()
+                                if (_state.value is State.Recording) {
+                                    _state.value = State.Idle
                                 }
                             }
                         }
@@ -240,7 +365,7 @@ class AudioRecorder(private val context: Context) {
     }
 
     private fun createMicAudioRecord(bufferSize: Int): AudioRecord? {
-        if (!hasRecordAudioPermission() || bufferSize <= 0) return null
+        if (!hasRecordAudioPermission() || bufferSize <= 0 || isIntentionallyPaused) return null
 
         try {
             val rec = AudioRecord(
@@ -269,6 +394,20 @@ class AudioRecorder(private val context: Context) {
     }
 
     /**
+     * Drains any remaining chunks queued in [internalSnippetChannel] into [pcmByteStream]
+     * before finalizing the output file.
+     */
+    private fun drainPendingSnippetChunks() {
+        while (true) {
+            val next = internalSnippetChannel.tryReceive().getOrNull() ?: break
+            synchronized(pcmBufferLock) {
+                pcmByteStream.write(next, 0, next.size)
+                lastRecordedPcmBytes = pcmByteStream.toByteArray()
+            }
+        }
+    }
+
+    /**
      * Stops the active recording session, writes captured PCM/WAV bytes to [currentOutputFile],
      * and returns the recorded [File].
      */
@@ -286,6 +425,8 @@ class AudioRecorder(private val context: Context) {
                 }
             }
             captureThread = null
+
+            drainPendingSnippetChunks()
 
             val capturedPcm = synchronized(pcmBufferLock) {
                 pcmByteStream.toByteArray()
