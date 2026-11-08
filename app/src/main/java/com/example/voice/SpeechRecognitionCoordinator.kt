@@ -1126,6 +1126,21 @@ class SpeechRecognitionCoordinator(
 
             when (error) {
                 SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
+                    if (hasRecordAudioPermission()) {
+                        recordTrace(
+                            "CB_ON_ERROR_FALSE_POSITIVE_INSUFFICIENT_PERMISSIONS_IGNORED",
+                            "OS RECORD_AUDIO permission is granted; treating ERROR_INSUFFICIENT_PERMISSIONS(9) as transient audio/TTS contention"
+                        )
+                        onPrepareHardwareBeforeStart()
+                        if (!isTransientAudioFocusLoss &&
+                            !isTransientFocusLoss &&
+                            !shouldAbortListening() &&
+                            isContinuousModeEnabled()
+                        ) {
+                            scheduleDebouncedRestart(delayMs = DEFAULT_RESTART_DEBOUNCE_MS)
+                        }
+                        return
+                    }
                     isIntentionallyPaused = true
                     restartJob?.cancel()
                     restartJob = null

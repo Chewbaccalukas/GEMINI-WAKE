@@ -502,6 +502,143 @@ class SpeechRecognitionCoordinatorTest {
 
         viewModel.cleanShutdown(null)
     }
+
+    @Test
+    fun ttsSpeak_synchronouslyReleasesWakeWordVoiceServiceAndRearmsAfter500msDebounce() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        assertEquals(500L, TextToSpeechManager.ACOUSTIC_SETTLING_DELAY_MS)
+
+        var settledCount = 0
+        val ttsManager = TextToSpeechManager(
+            context = app,
+            scope = this,
+            mainDispatcher = dispatcher,
+            onPlaybackStarted = {
+                WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("tts_speaking")
+            },
+            onPlaybackSettledAndReadyToListen = {
+                settledCount++
+            }
+        )
+
+        WakeWordVoiceService.setIntentionallyPaused(false)
+        val releaseCountBefore = WakeWordVoiceService.synchronousDictationHandoffReleaseCount
+
+        // 1. Yield Before Speech: speak() synchronously calls stopAndReleaseServiceAudioRecordSynchronously("tts_speaking")
+        ttsManager.speak("Hello from Gemini chat greeting")
+        assertTrue(
+            "speak() must synchronously call stopAndReleaseServiceAudioRecordSynchronously(\"tts_speaking\")",
+            WakeWordVoiceService.synchronousDictationHandoffReleaseCount > releaseCountBefore
+        )
+        assertEquals("tts_speaking", WakeWordVoiceService.lastSynchronousReleaseReason)
+        assertTrue(WakeWordVoiceService.isIntentionallyPaused)
+        assertFalse(WakeWordVoiceService.isMicrophoneInitialized.value)
+
+        // 2. Simulate UtteranceProgressListener.onStart -> onDone and verify 500ms debounced delay
+        ttsManager.utteranceProgressListener.onStart("utt_1")
+        assertTrue(ttsManager.isSpeaking.value)
+        WakeWordVoiceService.setIntentionallyPaused(true)
+
+        ttsManager.utteranceProgressListener.onDone("utt_1")
+        // At 300ms (< 500ms), must NOT have re-armed yet
+        advanceTimeBy(300L)
+        runCurrent()
+        assertEquals(0, settledCount)
+        assertTrue(WakeWordVoiceService.isIntentionallyPaused)
+
+        // After 500ms total, WakeWordVoiceService is re-armed and onPlaybackSettledAndReadyToListen fires
+        advanceTimeBy(250L)
+        runCurrent()
+        assertTrue(settledCount >= 1)
+        assertFalse(
+            "After 500ms onDone debounce, WakeWordVoiceService must be unpaused",
+            WakeWordVoiceService.isIntentionallyPaused
+        )
+
+        // 3. Verify onStop also enforces the 500ms debounced re-arming
+        val settledBeforeStop = settledCount
+        ttsManager.utteranceProgressListener.onStart("utt_2")
+        WakeWordVoiceService.setIntentionallyPaused(true)
+        ttsManager.utteranceProgressListener.onStop("utt_2", true)
+        advanceTimeBy(300L)
+        runCurrent()
+        assertEquals(settledBeforeStop, settledCount)
+        advanceTimeBy(250L)
+        runCurrent()
+        assertEquals(settledBeforeStop + 1, settledCount)
+        assertFalse(WakeWordVoiceService.isIntentionallyPaused)
+
+        ttsManager.shutdown()
+    }
+
+    @Test
+    fun wakeWordDetected_synchronouslyReleasesWakeWordVoiceServiceBeforeChatNavigationAndGuardsInit() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val viewModel = com.example.ui.MainViewModel(app)
+        viewModel.setPermissionGrantedOverrideForTest(true)
+
+        try {
+            WakeWordVoiceService.setIntentionallyPaused(false)
+            val releaseCountBefore = WakeWordVoiceService.synchronousDictationHandoffReleaseCount
+
+            // Detect wake word ("Hey Gemini") via SpeechRecognizer results
+            val matched = viewModel.processSpeechRecognizerResults(
+                candidates = listOf("Hey Gemini"),
+                isFinal = true
+            )
+            assertTrue(matched)
+            assertTrue(
+                "Wake word detection must immediately invoke stopAndReleaseServiceAudioRecordSynchronously(\"wake_word_detected\")",
+                WakeWordVoiceService.synchronousDictationHandoffReleaseCount > releaseCountBefore
+            )
+            assertEquals("wake_word_detected", WakeWordVoiceService.lastSynchronousReleaseReason)
+            assertFalse(WakeWordVoiceService.isMicrophoneInitialized.value)
+
+            // Verify that while TTS / processing mutex is active on ChatScreen load, non-user-initiated
+            // startContinuousWakeWordListening(userInitiated = false) and onAppForegrounded() do not grab the mic
+            viewModel.speechRecognitionCoordinator.setProcessingState(true)
+            WakeWordVoiceService.setIntentionallyPaused(true)
+            viewModel.startContinuousWakeWordListening(userInitiated = false)
+            viewModel.onAppForegrounded()
+            assertTrue(
+                "Chat screen init/onResume must not unpause WakeWordVoiceService while handoff/processing mutex is active",
+                WakeWordVoiceService.isIntentionallyPaused
+            )
+        } finally {
+            viewModel.cleanShutdown(null)
+        }
+    }
+
+    @Test
+    fun errorInsufficientPermissions_whenOsRecordAudioPermissionGranted_isIgnoredAsFalsePositive() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        var currentTime = 10_000L
+        var permissionDeniedCallbackCount = 0
+
+        val coordinator = SpeechRecognitionCoordinator(
+            context = ApplicationProvider.getApplicationContext(),
+            scope = this,
+            mainDispatcher = dispatcher,
+            clockMs = { currentTime },
+            muteSystemChimeOnStart = false,
+            hasRecordAudioPermission = { true },
+            isContinuousModeEnabled = { true },
+            onInsufficientPermissions = { permissionDeniedCallbackCount++ }
+        )
+
+        coordinator.recognitionListener.onError(SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS)
+        assertEquals(
+            "When OS RECORD_AUDIO permission is granted, false-positive ERROR_INSUFFICIENT_PERMISSIONS(9) must be ignored",
+            0,
+            permissionDeniedCallbackCount
+        )
+        assertFalse(
+            "False-positive ERROR_INSUFFICIENT_PERMISSIONS(9) must not set isIntentionallyPaused = true",
+            coordinator.isIntentionallyPaused
+        )
+    }
 }
+
 
 

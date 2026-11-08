@@ -581,6 +581,7 @@ class WakeWordVoiceService : Service() {
 
         val match = matchWakeWordFromList(cleanTranscript, currentActive)
         if (match != null) {
+            stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
             AudioCommandSanitizer.playWakeWordHaptic(applicationContext, match.matchedPhrase)
             _lastDetectedWakeWord.value = match
             _detectedWakeWordsFlow.tryEmit(match)
@@ -845,6 +846,10 @@ class WakeWordVoiceService : Service() {
             private set
 
         @Volatile
+        var lastSynchronousReleaseReason: String = ""
+            private set
+
+        @Volatile
         var isIntentionallyPaused: Boolean = false
             private set
 
@@ -861,11 +866,12 @@ class WakeWordVoiceService : Service() {
 
         /**
          * Synchronously stops and releases the active [WakeWordVoiceService]'s [AudioRecord] instance
-         * under an exclusive mutex lock and abandons its audio focus before the UI dictation button
-         * invokes `SpeechRecognizer.startListening()`.
+         * under an exclusive mutex lock and abandons its audio focus before UI dictation, wake-word
+         * navigation handoff (`"wake_word_detected"`), or TTS playback (`"tts_speaking"`).
          */
         fun stopAndReleaseServiceAudioRecordSynchronously(reason: String = "ui_dictation_mutex_handoff") {
             synchronousDictationHandoffReleaseCount++
+            lastSynchronousReleaseReason = reason
             isProcessingCommand = true
             isIntentionallyPaused = true
             _isInputFocusPaused.value = true

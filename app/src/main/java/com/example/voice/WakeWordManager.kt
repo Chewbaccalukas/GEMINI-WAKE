@@ -1417,6 +1417,10 @@ class WakeWordManager(
         _lastHeardText.value = sanitizedQuery ?: ""
         _isUserVoiceTurn.value = true
 
+        // 0. Synchronously stop and release WakeWordVoiceService's AudioRecord ("wake_word_detected")
+        //    the exact moment the wake word is detected, BEFORE any navigation state or callback fires.
+        WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
+
         // Synchronously stop SpeechRecognitionCoordinator and release microphone hardware BEFORE routing to chat / TTS
         onStopSpeechRecognizerForWakeHandoff?.invoke()
 
@@ -1431,6 +1435,7 @@ class WakeWordManager(
         isTransitioningAudioState = true
         WakeWordVoiceService.isTransitioningAudioState = true
         try {
+            WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
             releaseAudioRecordHardware(stopForegroundService = false)
             abandonExclusiveAudioFocus()
             _wakeHandoffCount.incrementAndGet()

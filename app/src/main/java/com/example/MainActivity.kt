@@ -203,6 +203,9 @@ class MainActivity : ComponentActivity() {
             else -> -1L
         }
         if (resolvedTargetChatId != -1L) {
+            if (wakeTargetChatId != -1L) {
+                WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
+            }
             viewModel.selectChat(resolvedTargetChatId)
             currentScreen = Screen.Chat(resolvedTargetChatId)
         }
@@ -552,6 +555,7 @@ fun MainApp(
     val webLinkHistory by viewModel.webLinkHistory.collectAsStateWithLifecycle()
     val voiceCommandHistory by viewModel.voiceCommandHistory.collectAsStateWithLifecycle()
     val requiresAudioPermission by viewModel.requiresAudioPermission.collectAsStateWithLifecycle()
+    val isWakeHandoffInProgress by viewModel.isWakeHandoffInProgress.collectAsStateWithLifecycle()
 
     var showCreateEditDialog by remember { mutableStateOf(false) }
     var showSelectCategoryDialog by remember { mutableStateOf(false) }
@@ -910,14 +914,18 @@ fun MainApp(
     }
 
     // Root-level continuous voice radar lifecycle across ALL screens (Home, ChatDetail, Settings, History, Studio).
-    //Note: Do NOT key on transient hasWindowFocus changes here so notification shade pull-downs or dialogs
+    // Note: Do NOT key on transient hasWindowFocus changes here so notification shade pull-downs or dialogs
     // never bypass the strict 1500ms windowFocus debounce in SpeechRecognitionCoordinator and WakeWordManager.
+    // Also guard against isWakeHandoffInProgress, isTtsSpeaking, and speechRecognitionCoordinator.isProcessing
+    // so transitioning to ChatScreen never aggressively grabs the mic before the wake-word or TTS handoff finishes.
     LaunchedEffect(
         hasAudioPermission,
         isHandsFreeActive,
         isUserVoiceTurn,
         isSleepMode,
         isNavigatingViaVoiceCommand,
+        isWakeHandoffInProgress,
+        isTtsSpeaking,
         currentScreen
     ) {
         if (hasWindowFocus &&
@@ -928,8 +936,12 @@ fun MainApp(
             !isSpeechRecognizerListening &&
             !viewModel.speechRecognitionCoordinator.hasPendingRestart &&
             !viewModel.speechRecognitionCoordinator.hasPendingWindowFocusDebounce &&
+            !viewModel.speechRecognitionCoordinator.isProcessing &&
             !isUserVoiceTurn &&
             !isNavigatingViaVoiceCommand &&
+            !isWakeHandoffInProgress &&
+            !isTtsSpeaking &&
+            !viewModel.textToSpeechManager.hasPendingSettlingDelay &&
             !viewModel.wakeWordManager.isTransitioningAudioState
         ) {
             WakeWordVoiceService.startServiceSafely(
@@ -949,6 +961,7 @@ fun MainApp(
             targetId != null &&
             targetId > 0L
         ) {
+            WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
             showControlSheet = false
             if (currentScreen != Screen.Chat(targetId)) {
                 navigateInApp(Screen.Chat(targetId))

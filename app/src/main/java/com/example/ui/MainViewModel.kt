@@ -148,12 +148,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             context = application,
             scope = viewModelScope,
             onPlaybackStarted = {
-                releaseMicAndAudioFocusForWakeHandoffAndTts("tts_playback_started")
+                com.example.voice.WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("tts_speaking")
+                releaseMicAndAudioFocusForWakeHandoffAndTts("tts_speaking")
             },
             onPlaybackSettledAndReadyToListen = {
+                _isWakeHandoffInProgress.value = false
                 speechRecognitionCoordinator.setProcessingState(false)
                 if (_isHandsFreeActive.value && !_isSleepMode.value && !_isGenerating.value) {
                     com.example.voice.WakeWordVoiceService.resumeAfterInternalDictationInMemory()
+                    com.example.voice.WakeWordVoiceService.setIntentionallyPaused(false)
+                    if (isAppInForeground) {
+                        com.example.voice.WakeWordVoiceService.startServiceSafely(
+                            context = application,
+                            action = com.example.voice.WakeWordVoiceService.ACTION_START_VOICE_SERVICE
+                        )
+                    }
                     speechRecognitionCoordinator.setIntentionallyPaused(false)
                     speechRecognitionCoordinator.scheduleDebouncedRestart(
                         delayMs = com.example.voice.SpeechRecognitionCoordinator.DEFAULT_RESTART_DEBOUNCE_MS
@@ -844,7 +853,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         hasActiveWindowFocus = { _hasWindowFocus.value },
         isContinuousModeEnabled = { _isHandsFreeActive.value },
         isExternalGuardBlocked = {
-            _isGenerating.value || isOrionVoicePlaying.value || textToSpeechManager.isSpeaking.value
+            _isGenerating.value ||
+                isOrionVoicePlaying.value ||
+                textToSpeechManager.isSpeaking.value ||
+                textToSpeechManager.hasPendingSettlingDelay
         },
         onPrepareHardwareBeforeStart = {
             wakeWordManager.isExternalSpeechRecognizerActive = true
@@ -1149,8 +1161,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return false
         }
         lastPartialWakeMatchMs = now
+        _isWakeHandoffInProgress.value = true
+        com.example.voice.WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
         com.example.voice.AudioCommandSanitizer.playWakeWordHaptic(getApplication(), matchedWake)
         stopSpeechRecognizerInternal(markIntentionallyPaused = false)
+        audioRecorder.stopAndReleaseHardware()
+        wakeWordManager.stopAndReleaseAudioRecordSynchronously()
+        wakeWordManager.abandonExclusiveAudioFocus()
         _lastDispatchedVoicePrompt.value = cleanPrompt
         _pendingWakeQuery.value = cleanPrompt
         // Do NOT assign recognized speech to _currentDraftText—keep draft state and bottom input field blank.
@@ -1179,6 +1196,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 callbacks = voiceCommandCallbacks
             )
             if (handled) {
+                _isWakeHandoffInProgress.value = false
                 wakeWordManager.setUserVoiceTurn(false)
                 _currentDraftText.value = ""
                 return true
@@ -1206,6 +1224,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val queryToDispatch = sanitizeValidWakeQuery(_pendingWakeQuery.value ?: cleanPrompt)
         _pendingWakeQuery.value = null
         if (queryToDispatch == null) {
+            _isWakeHandoffInProgress.value = false
             return false
         }
 
@@ -1214,12 +1233,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         lastDirectVoiceDispatchAtMs = System.currentTimeMillis()
         val handledAsActionCommand = executeInChatVoiceActionCommand(queryToDispatch, resolvedTargetId)
         if (handledAsActionCommand) {
+            _isWakeHandoffInProgress.value = false
             wakeWordManager.setUserVoiceTurn(false)
             _currentDraftText.value = ""
             return true
         }
 
-        releaseMicAndAudioFocusForWakeHandoffAndTts("one_breath_wake_query")
+        releaseMicAndAudioFocusForWakeHandoffAndTts("wake_word_detected")
         sendMessage(text = queryToDispatch, triggeredByWakeWord = true)
 
         wakeWordManager.onKeywordHit(
@@ -1236,6 +1256,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _isNavigatingViaVoiceCommand = MutableStateFlow(false)
     val isNavigatingViaVoiceCommand: StateFlow<Boolean> = _isNavigatingViaVoiceCommand.asStateFlow()
+
+    private val _isWakeHandoffInProgress = MutableStateFlow(false)
+    val isWakeHandoffInProgress: StateFlow<Boolean> = _isWakeHandoffInProgress.asStateFlow()
 
     @Volatile
     var awaitingVoiceNavigationCommitRoute: String? = null
@@ -1285,7 +1308,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             details = "route=$cleanRoute transcript=\"${cleanedTranscript.take(50)}\" locking audio mutex before navigation"
         )
 
-        // If navigating to "chat" or "chat/{id}", ensure a target chat session is selected and passively staged
+        // 1. Synchronously stop and release WakeWordVoiceService's AudioRecord and pause active
+        //    utterance recognition BEFORE selecting the chat or emitting the navigation route.
+        awaitingVoiceNavigationCommitRoute = cleanRoute
+        _isNavigatingViaVoiceCommand.value = true
+        _isWakeHandoffInProgress.value = true
+        _isInChatDictationActive.value = false
+        speechRecognitionCoordinator.setInChatDictationMode(false)
+        speechRecognitionCoordinator.pauseForCommandDispatch(reason = "route:$cleanRoute")
+        wakeWordManager.isExternalSpeechRecognizerActive = false
+        wakeWordManager.setUserVoiceTurn(false)
+        com.example.voice.WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
+        audioRecorder.stopAndReleaseHardware()
+        wakeWordManager.stopAndReleaseAudioRecordSynchronously()
+        com.example.voice.WakeWordVoiceService.pauseMicrophoneForCommandDispatch(getApplication())
+
+        // 1b. Only AFTER synchronous release has completed, select and stage the target chat session
         if (cleanRoute.equals("chat", ignoreCase = true) || cleanRoute.startsWith("chat/", ignoreCase = true)) {
             val explicitId = cleanRoute.removePrefix("chat/").toLongOrNull()
             val resolvedChatId = explicitId
@@ -1299,19 +1337,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 stageChatAndUrlPassively()
             }
         }
-
-        // 1. Pause active utterance recognition transiently while retaining foreground audio focus
-        //    so handsFreeMode and the SpeechRecognizer listening loop stay active across internal screens.
-        awaitingVoiceNavigationCommitRoute = cleanRoute
-        _isNavigatingViaVoiceCommand.value = true
-        _isInChatDictationActive.value = false
-        speechRecognitionCoordinator.setInChatDictationMode(false)
-        speechRecognitionCoordinator.pauseForCommandDispatch(reason = "route:$cleanRoute")
-        wakeWordManager.isExternalSpeechRecognizerActive = false
-        wakeWordManager.setUserVoiceTurn(false)
-        audioRecorder.stopAndReleaseHardware()
-        wakeWordManager.stopAndReleaseAudioRecordSynchronously()
-        com.example.voice.WakeWordVoiceService.pauseMicrophoneForCommandDispatch(getApplication())
 
         // 2. Clear any stale draft or pending wake query so it cannot auto-send
         _currentDraftText.value = ""
@@ -1371,6 +1396,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun completeVoiceNavigationMutexResume(committedRoute: String, triggerSource: String) {
         awaitingVoiceNavigationCommitRoute = null
         _isNavigatingViaVoiceCommand.value = false
+        _isWakeHandoffInProgress.value = false
         com.example.voice.WakeWordVoiceService.resumeMicrophoneAfterCommandNavigation(getApplication())
         val shouldResumeListening = _isHandsFreeActive.value && !_isSleepMode.value
         wakeWordManager.appendDiagnosticTraceLog(
@@ -1983,11 +2009,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     return false
                 }
                 lastPartialWakeMatchMs = now
+                // 1. The exact moment the wake word is detected, immediately invoke synchronous release
+                //    BEFORE firing any navigation intent, chat selection, or state update.
+                _isWakeHandoffInProgress.value = true
+                com.example.voice.WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
                 com.example.voice.AudioCommandSanitizer.playWakeWordHaptic(
                     getApplication(),
                     wakeMatch.matchedWakeWord
                 )
                 stopSpeechRecognizerInternal(markIntentionallyPaused = false)
+                audioRecorder.stopAndReleaseHardware()
+                wakeWordManager.stopAndReleaseAudioRecordSynchronously()
+                wakeWordManager.abandonExclusiveAudioFocus()
                 _currentDraftText.value = ""
                 if (strippedFollowUp != null) {
                     _lastDispatchedVoicePrompt.value = strippedFollowUp
@@ -2002,11 +2035,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             wakeMatch.matchedChat?.id ?: _currentChatId.value
                         )
                         if (handledAsAction) {
+                            _isWakeHandoffInProgress.value = false
                             wakeWordManager.setUserVoiceTurn(false)
                             _currentDraftText.value = ""
                             return true
                         }
-                        releaseMicAndAudioFocusForWakeHandoffAndTts("wake_results_query")
+                        releaseMicAndAudioFocusForWakeHandoffAndTts("wake_word_detected")
                         sendMessage(text = validatedPending, triggeredByWakeWord = true)
                     }
                 } else {
@@ -2118,6 +2152,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if ((isUserVoiceTurn.value && !_isInChatDictationActive.value) || _isSleepMode.value) {
             return
         }
+        if (!userInitiated && (
+                _isWakeHandoffInProgress.value ||
+                    textToSpeechManager.isSpeaking.value ||
+                    textToSpeechManager.hasPendingSettlingDelay ||
+                    speechRecognitionCoordinator.isProcessing ||
+                    _isNavigatingViaVoiceCommand.value ||
+                    _isGenerating.value
+                )
+        ) {
+            return
+        }
         speechRecognitionCoordinator.setIntentionallyPaused(false)
         com.example.voice.WakeWordVoiceService.setIntentionallyPaused(false)
         viewModelScope.launch(Dispatchers.Main.immediate) {
@@ -2168,11 +2213,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         speechRecognitionCoordinator.setInChatDictationMode(false)
         speechRecognitionCoordinator.setProcessingState(true)
         stopSpeechRecognizerInternal(markIntentionallyPaused = false)
+        com.example.voice.WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously(reason)
         audioRecorder.stopAndReleaseHardware()
         wakeWordManager.completeChatTurnAndReleaseMic()
         wakeWordManager.stopAndReleaseAudioRecordSynchronously()
         wakeWordManager.abandonExclusiveAudioFocus()
-        com.example.voice.WakeWordVoiceService.pauseForInternalDictationInMemory()
     }
 
     /**
@@ -2785,6 +2830,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         // Listen for wake word detections
         viewModelScope.launch {
             wakeWordManager.triggerEvents.collect { event ->
+                // 1. The exact moment the wake word is detected, immediately invoke synchronous release
+                //    BEFORE firing any navigation intent or state update to open the Chat screen.
+                _isWakeHandoffInProgress.value = true
+                com.example.voice.WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
+                stopSpeechRecognizerInternal(markIntentionallyPaused = false)
+                audioRecorder.stopAndReleaseHardware()
+                wakeWordManager.stopAndReleaseAudioRecordSynchronously()
+                wakeWordManager.abandonExclusiveAudioFocus()
+
                 if (event.capturedAudioBytes.isNotEmpty() &&
                     !WakeWordManager.isPcmByteBufferSilent(event.capturedAudioBytes, event.capturedAudioBytes.size)
                 ) {
@@ -2888,7 +2942,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     recognizedTranscript = transcriptText,
                     chatTitle = resolvedChatTitle
                 )
-                // Pre-warm memory buffer immediately and select the corresponding chat
+                // 2. Only AFTER WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
+                //    has completed, select the corresponding chat to open the Chat screen.
                 selectChat(resolvedChatId)
 
                 // Check pendingWakeQuery / sanitizedQuery before dispatching to the chat session:
@@ -2906,30 +2961,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             voicePcmOutputStream.reset()
                             bytes
                         }.takeIf { WakeWordManager.shouldTransmitAudioPacket(it.size, it) }
-                        releaseMicAndAudioFocusForWakeHandoffAndTts("wake_trigger_event_query")
+                        releaseMicAndAudioFocusForWakeHandoffAndTts("wake_word_detected")
                         sendMessage(
                             chatId = resolvedChatId,
                             text = verifiedPending,
                             audioBytes = handoffAudio,
                             triggeredByWakeWord = true
                         )
+                    } else {
+                        _isWakeHandoffInProgress.value = false
                     }
                 } else if (sanitizedQuery == null) {
                     _pendingWakeQuery.value = null
                     val customGreeting = resolvedChatSession?.greetingMessage?.trim().orEmpty()
                     if (customGreeting.isNotBlank() && _isAutoSpeakEnabled.value) {
-                        releaseMicAndAudioFocusForWakeHandoffAndTts("wake_trigger_event_greeting_tts")
+                        com.example.voice.WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("tts_speaking")
+                        releaseMicAndAudioFocusForWakeHandoffAndTts("tts_speaking")
                         speakMessage(customGreeting)
                     } else if (_isHandsFreeActive.value && !_isSleepMode.value) {
+                        _isWakeHandoffInProgress.value = false
                         val context = getApplication<Application>()
                         if (android.speech.SpeechRecognizer.isRecognitionAvailable(context) && checkRecordAudioPermission()) {
                             wakeWordManager.isExternalSpeechRecognizerActive = true
                             releaseAllNativeAudioRecordTracksForSpeechRecognizer()
-                            scheduleSpeechRecognizerRestart(delayMs = 250L, allowDuringUserVoiceTurn = true)
+                            scheduleSpeechRecognizerRestart(delayMs = 500L, allowDuringUserVoiceTurn = true)
                         }
+                    } else {
+                        _isWakeHandoffInProgress.value = false
                     }
                 } else {
                     _pendingWakeQuery.value = null
+                    _isWakeHandoffInProgress.value = false
                 }
             }
         }
@@ -2955,6 +3017,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 wakeWordManager.enterSleepMode(_sleepModeReason.value)
             }
+        }
+
+        com.example.voice.WakeWordVoiceService.onWakeWordDetectedCallback = { match ->
+            _isWakeHandoffInProgress.value = true
+            com.example.voice.WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
+            stopSpeechRecognizerInternal(markIntentionallyPaused = false)
+            audioRecorder.stopAndReleaseHardware()
+            wakeWordManager.stopAndReleaseAudioRecordSynchronously()
+            wakeWordManager.abandonExclusiveAudioFocus()
+            wakeWordManager.onKeywordHit(
+                keyword = match.matchedPhrase,
+                initialQuery = match.followUpQuery,
+                targetChatIdOverride = match.wakeWord.chatId
+            )
         }
 
         com.example.voice.WakeWordVoiceService.onVoiceHistoryNavigationRequestedCallback = { transcript ->
@@ -4116,7 +4192,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         _voiceEngineMode.value != com.example.voice.VoiceEngineMode.MUTED &&
                         !streamingVoicePlayer.isPlaying.value
                     ) {
-                        releaseMicAndAudioFocusForWakeHandoffAndTts("before_tts_speak")
+                        com.example.voice.WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("tts_speaking")
+                        releaseMicAndAudioFocusForWakeHandoffAndTts("tts_speaking")
                         textToSpeechManager.speak(finalAnswer)
                     }
                     ReplyNotificationHelper.notifyModelReplyIfBackgroundedOrScreenOff(
@@ -4157,15 +4234,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 // Post-turn mic behavior:
                 // - Hands-Free ON: Re-initialize and restart wake-word listening once audio playback has finished
                 // - Hands-Free OFF (Walkie-Talkie mode): Stay stopped until manually triggered
-                if (!streamingVoicePlayer.isPlaying.value && !textToSpeechManager.isSpeaking.value) {
+                if (!streamingVoicePlayer.isPlaying.value &&
+                    !textToSpeechManager.isSpeaking.value &&
+                    !textToSpeechManager.hasPendingSettlingDelay
+                ) {
+                    _isWakeHandoffInProgress.value = false
                     speechRecognitionCoordinator.setProcessingState(false)
                 }
                 if (_isHandsFreeActive.value &&
                     !_isSleepMode.value &&
                     !streamingVoicePlayer.isPlaying.value &&
-                    !textToSpeechManager.isSpeaking.value
+                    !textToSpeechManager.isSpeaking.value &&
+                    !textToSpeechManager.hasPendingSettlingDelay
                 ) {
                     com.example.voice.WakeWordVoiceService.resumeAfterInternalDictationInMemory()
+                    com.example.voice.WakeWordVoiceService.setIntentionallyPaused(false)
                     speechRecognitionCoordinator.setIntentionallyPaused(false)
                     scheduleSpeechRecognizerRestart(
                         delayMs = com.example.voice.SpeechRecognitionCoordinator.DEFAULT_RESTART_DEBOUNCE_MS,
@@ -4554,7 +4637,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _isGenerating.value ||
             isOrionVoicePlaying.value ||
             textToSpeechManager.isSpeaking.value ||
-            _isNavigatingViaVoiceCommand.value
+            textToSpeechManager.hasPendingSettlingDelay ||
+            _isNavigatingViaVoiceCommand.value ||
+            _isWakeHandoffInProgress.value
 
         if (isHandsFreeModeEnabled && !isProcessingCommand) {
             audioRecorder.setIntentionallyPaused(false)
@@ -4573,7 +4658,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun onAppPaused() {
         _isInChatDictationActive.value = false
         speechRecognitionCoordinator.setInChatDictationMode(false)
-        if (_isHandsFreeActive.value && !_isSleepMode.value && !speechRecognitionCoordinator.isProcessing) {
+        if (_isHandsFreeActive.value &&
+            !_isSleepMode.value &&
+            !speechRecognitionCoordinator.isProcessing &&
+            !_isWakeHandoffInProgress.value &&
+            !textToSpeechManager.isSpeaking.value &&
+            !textToSpeechManager.hasPendingSettlingDelay
+        ) {
             com.example.voice.WakeWordVoiceService.startServiceSafely(
                 context = getApplication(),
                 action = com.example.voice.WakeWordVoiceService.ACTION_START_VOICE_SERVICE
@@ -4600,7 +4691,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         speechRecognitionCoordinator.setWindowFocused(true)
         wakeWordManager.setWindowFocused(true)
         networkStatusTracker.refresh()
-        if (_isHandsFreeActive.value && !_isSleepMode.value && checkRecordAudioPermission()) {
+        val isHandoffOrTtsBusy = _isWakeHandoffInProgress.value ||
+            textToSpeechManager.isSpeaking.value ||
+            textToSpeechManager.hasPendingSettlingDelay ||
+            speechRecognitionCoordinator.isProcessing ||
+            _isNavigatingViaVoiceCommand.value ||
+            _isGenerating.value
+        if (_isHandsFreeActive.value && !_isSleepMode.value && !isHandoffOrTtsBusy && checkRecordAudioPermission()) {
             com.example.voice.WakeWordVoiceService.startServiceSafely(
                 context = getApplication(),
                 action = com.example.voice.WakeWordVoiceService.ACTION_START_VOICE_SERVICE
@@ -5186,7 +5283,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         if (_voiceEngineMode.value == com.example.voice.VoiceEngineMode.MUTED) return
-        releaseMicAndAudioFocusForWakeHandoffAndTts("speak_message")
+        com.example.voice.WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("tts_speaking")
+        releaseMicAndAudioFocusForWakeHandoffAndTts("tts_speaking")
         textToSpeechManager.speak(text)
     }
 

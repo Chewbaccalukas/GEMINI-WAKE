@@ -48,10 +48,10 @@ class TextToSpeechManager(
         private const val TAG = "TextToSpeechManager"
 
         /**
-         * Explicit 300ms acoustic settling delay after TTS playback completes before
-         * restarting `SpeechRecognitionCoordinator.startListening()`.
+         * Explicit 500ms debounced acoustic settling delay after TTS playback completes before
+         * re-initializing `WakeWordVoiceService` and restarting `SpeechRecognitionCoordinator.startListening()`.
          */
-        const val ACOUSTIC_SETTLING_DELAY_MS = 300L
+        const val ACOUSTIC_SETTLING_DELAY_MS = 500L
 
         /**
          * Maximum character length per single `TextToSpeech.speak()` utterance chunk.
@@ -80,6 +80,7 @@ class TextToSpeechManager(
     private var settlingJob: Job? = null
     private var pendingTextBeforeInit: String? = null
     private var currentVolume: Float = 1.0f
+    private val activeUtterances: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
     @Volatile
     private var activeFinalUtteranceId: String? = null
@@ -92,6 +93,9 @@ class TextToSpeechManager(
 
     private val _lastSpokenText = MutableStateFlow("")
     val lastSpokenText: StateFlow<String> = _lastSpokenText.asStateFlow()
+
+    val hasPendingSettlingDelay: Boolean
+        get() = settlingJob?.isActive == true
 
     init {
         initializeEngine()
@@ -144,10 +148,13 @@ class TextToSpeechManager(
         }
     }
 
-    private val utteranceProgressListener = object : UtteranceProgressListener() {
+    internal val utteranceProgressListener = object : UtteranceProgressListener() {
         override fun onStart(utteranceId: String?) {
             settlingJob?.cancel()
             settlingJob = null
+            if (!utteranceId.isNullOrBlank()) {
+                activeUtterances.add(utteranceId)
+            }
             _isSpeaking.value = true
             scope.launch(mainDispatcher) {
                 onPlaybackStarted()
@@ -155,62 +162,93 @@ class TextToSpeechManager(
         }
 
         override fun onDone(utteranceId: String?) {
-            if (utteranceId == null || utteranceId == activeFinalUtteranceId) {
-                scheduleAcousticSettlingBeforeListening()
+            if (!utteranceId.isNullOrBlank()) {
+                activeUtterances.remove(utteranceId)
+            }
+            if (activeUtterances.isEmpty() || utteranceId == null || utteranceId == activeFinalUtteranceId) {
+                activeUtterances.clear()
+                scheduleAcousticSettlingBeforeListening(ACOUSTIC_SETTLING_DELAY_MS)
             }
         }
 
         @Deprecated("Deprecated in Java")
         override fun onError(utteranceId: String?) {
-            scheduleAcousticSettlingBeforeListening()
+            if (!utteranceId.isNullOrBlank()) {
+                activeUtterances.remove(utteranceId)
+            }
+            if (activeUtterances.isEmpty() || utteranceId == null || utteranceId == activeFinalUtteranceId) {
+                activeUtterances.clear()
+                scheduleAcousticSettlingBeforeListening(ACOUSTIC_SETTLING_DELAY_MS)
+            }
         }
 
         override fun onError(utteranceId: String?, errorCode: Int) {
-            scheduleAcousticSettlingBeforeListening()
+            if (!utteranceId.isNullOrBlank()) {
+                activeUtterances.remove(utteranceId)
+            }
+            if (activeUtterances.isEmpty() || utteranceId == null || utteranceId == activeFinalUtteranceId) {
+                activeUtterances.clear()
+                scheduleAcousticSettlingBeforeListening(ACOUSTIC_SETTLING_DELAY_MS)
+            }
         }
 
         override fun onStop(utteranceId: String?, interrupted: Boolean) {
+            if (!utteranceId.isNullOrBlank()) {
+                activeUtterances.remove(utteranceId)
+            }
             _isSpeaking.value = false
-            if (!interrupted) {
-                scheduleAcousticSettlingBeforeListening()
+            if (activeUtterances.isEmpty() || utteranceId == null || utteranceId == activeFinalUtteranceId) {
+                activeUtterances.clear()
+                scheduleAcousticSettlingBeforeListening(ACOUSTIC_SETTLING_DELAY_MS)
             }
         }
     }
 
     /**
-     * Enforces an explicit 300ms acoustic settling delay after `UtteranceProgressListener.onDone`
-     * before invoking [onPlaybackSettledAndReadyToListen] (`SpeechRecognitionCoordinator.startListening()`).
+     * Enforces an explicit 500ms debounced delay after `UtteranceProgressListener.onDone`
+     * (as well as `onError` and `onStop`) before re-initializing [WakeWordVoiceService]
+     * and invoking [onPlaybackSettledAndReadyToListen].
      */
-    private fun scheduleAcousticSettlingBeforeListening() {
+    private fun scheduleAcousticSettlingBeforeListening(delayMs: Long = ACOUSTIC_SETTLING_DELAY_MS) {
         settlingJob?.cancel()
         settlingJob = scope.launch(mainDispatcher) {
             _isSpeaking.value = false
-            delay(ACOUSTIC_SETTLING_DELAY_MS)
-            onPlaybackSettledAndReadyToListen()
+            delay(delayMs.coerceAtLeast(ACOUSTIC_SETTLING_DELAY_MS))
+            if (!_isSpeaking.value && activeUtterances.isEmpty()) {
+                WakeWordVoiceService.resumeAfterInternalDictationInMemory()
+                onPlaybackSettledAndReadyToListen()
+            }
         }
     }
 
     /**
      * Speaks [text] aloud using Android [TextToSpeech].
-     * When playback completes, waits [ACOUSTIC_SETTLING_DELAY_MS] (300ms) before notifying
-     * [onPlaybackSettledAndReadyToListen].
+     * Synchronously releases [WakeWordVoiceService]'s [android.media.AudioRecord] (`"tts_speaking"`)
+     * before opening the TTS audio stream, and waits [ACOUSTIC_SETTLING_DELAY_MS] (`500ms`) after
+     * `onDone` / `onError` / `onStop` before re-initializing [WakeWordVoiceService].
      */
     fun speak(text: String) {
         val cleanText = sanitizeMarkdownForSpeech(text)
         if (cleanText.isBlank()) {
-            scheduleAcousticSettlingBeforeListening()
+            scheduleAcousticSettlingBeforeListening(ACOUSTIC_SETTLING_DELAY_MS)
             return
         }
         _lastSpokenText.value = cleanText
         settlingJob?.cancel()
         settlingJob = null
 
+        // 1. Yield Before Speech: Synchronously stop and release WakeWordVoiceService's AudioRecord
+        //    BEFORE invoking tts.speak() so the microphone is cleanly released prior to opening the TTS stream.
+        WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("tts_speaking")
+        _isSpeaking.value = true
+        onPlaybackStarted()
+
         val engine = tts
         if (engine == null || !_isInitialized.value) {
             pendingTextBeforeInit = cleanText
-            // If TTS is unavailable in headless/test container, still fire the 300ms settling hook
+            // If TTS is unavailable in headless/test container, still fire the 500ms settling hook
             if (engine == null) {
-                scheduleAcousticSettlingBeforeListening()
+                scheduleAcousticSettlingBeforeListening(ACOUSTIC_SETTLING_DELAY_MS)
             }
             return
         }
@@ -218,14 +256,15 @@ class TextToSpeechManager(
         try {
             val chunks = chunkTextForUtterances(cleanText)
             if (chunks.isEmpty()) {
-                scheduleAcousticSettlingBeforeListening()
+                scheduleAcousticSettlingBeforeListening(ACOUSTIC_SETTLING_DELAY_MS)
                 return
             }
-            _isSpeaking.value = true
-            onPlaybackStarted()
+            engine.setOnUtteranceProgressListener(utteranceProgressListener)
+            activeUtterances.clear()
 
             chunks.forEachIndexed { index, chunk ->
                 val utteranceId = "gemini_tts_${UUID.randomUUID()}"
+                activeUtterances.add(utteranceId)
                 if (index == chunks.lastIndex) {
                     activeFinalUtteranceId = utteranceId
                 }
@@ -234,13 +273,17 @@ class TextToSpeechManager(
                     putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, currentVolume.coerceIn(0f, 1f))
                 }
                 val result = engine.speak(chunk, queueMode, params, utteranceId)
-                if (result == TextToSpeech.ERROR && index == chunks.lastIndex) {
-                    scheduleAcousticSettlingBeforeListening()
+                if (result == TextToSpeech.ERROR) {
+                    activeUtterances.remove(utteranceId)
+                    if (index == chunks.lastIndex && activeUtterances.isEmpty()) {
+                        scheduleAcousticSettlingBeforeListening(ACOUSTIC_SETTLING_DELAY_MS)
+                    }
                 }
             }
         } catch (e: Exception) {
             Log.w(TAG, "Error during TextToSpeech.speak: ${e.message}")
-            scheduleAcousticSettlingBeforeListening()
+            activeUtterances.clear()
+            scheduleAcousticSettlingBeforeListening(ACOUSTIC_SETTLING_DELAY_MS)
         }
     }
 
@@ -254,6 +297,7 @@ class TextToSpeechManager(
         settlingJob = null
         pendingTextBeforeInit = null
         activeFinalUtteranceId = null
+        activeUtterances.clear()
         val wasSpeaking = _isSpeaking.value
         _isSpeaking.value = false
         try {
@@ -276,6 +320,7 @@ class TextToSpeechManager(
         settlingJob = null
         pendingTextBeforeInit = null
         activeFinalUtteranceId = null
+        activeUtterances.clear()
         _isSpeaking.value = false
         try {
             tts?.stop()
