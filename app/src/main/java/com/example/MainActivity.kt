@@ -544,6 +544,8 @@ fun MainApp(
     val hasExclusiveAudioFocus by viewModel.hasExclusiveAudioFocus.collectAsStateWithLifecycle()
     val importProgressState by viewModel.importProgressState.collectAsStateWithLifecycle()
     val activeKeyType by viewModel.activeKeyType.collectAsStateWithLifecycle()
+    val primaryApiKey by viewModel.primaryApiKey.collectAsStateWithLifecycle()
+    val backupApiKey by viewModel.backupApiKey.collectAsStateWithLifecycle()
     val isTtsSpeaking by viewModel.isTtsSpeaking.collectAsStateWithLifecycle()
     val isAudioSpeaking = isOrionVoicePlaying || isTtsSpeaking
     val masterVolume by viewModel.masterVolume.collectAsStateWithLifecycle()
@@ -922,6 +924,7 @@ fun MainApp(
         hasAudioPermission,
         isHandsFreeActive,
         isUserVoiceTurn,
+        isInChatDictationActive,
         isSleepMode,
         isNavigatingViaVoiceCommand,
         isWakeHandoffInProgress,
@@ -934,6 +937,8 @@ fun MainApp(
             !isSleepMode &&
             !isListening &&
             !isSpeechRecognizerListening &&
+            !isInChatDictationActive &&
+            !viewModel.speechRecognitionCoordinator.isInChatDictationMode &&
             !viewModel.speechRecognitionCoordinator.hasPendingRestart &&
             !viewModel.speechRecognitionCoordinator.hasPendingWindowFocusDebounce &&
             !viewModel.speechRecognitionCoordinator.isProcessing &&
@@ -944,10 +949,12 @@ fun MainApp(
             !viewModel.textToSpeechManager.hasPendingSettlingDelay &&
             !viewModel.wakeWordManager.isTransitioningAudioState
         ) {
-            WakeWordVoiceService.startServiceSafely(
-                context = context,
-                action = WakeWordVoiceService.ACTION_START_VOICE_SERVICE
-            )
+            if (currentScreen !is Screen.Chat) {
+                WakeWordVoiceService.startServiceSafely(
+                    context = context,
+                    action = WakeWordVoiceService.ACTION_START_VOICE_SERVICE
+                )
+            }
             viewModel.startContinuousWakeWordListening(userInitiated = false)
         }
     }
@@ -1000,6 +1007,11 @@ fun MainApp(
 
     val activeChatForScreen = currentChat ?: (currentScreen as? Screen.Chat)?.let { screen ->
         chats.firstOrNull { it.id == screen.chatId }
+            ?: ChatSession(
+                id = screen.chatId,
+                title = "Gemini Chat",
+                wakeWord = "Hey Gemini"
+            )
     }
 
     if (currentScreen is Screen.Chat && activeChatForScreen != null) {
@@ -2003,6 +2015,17 @@ fun MainApp(
                 },
                 onResetPermissions = { handleResetPermissions() },
                 onRequestRequiredPermissions = { launchRequiredPermissionsRequest() },
+                primaryApiKey = primaryApiKey,
+                backupApiKey = backupApiKey,
+                activeKeyType = activeKeyType,
+                onSavePrimaryApiKey = { key ->
+                    viewModel.setPrimaryApiKey(key)
+                    Toast.makeText(context, "Saved Primary Gemini API Key", Toast.LENGTH_SHORT).show()
+                },
+                onSaveBackupApiKey = { key ->
+                    viewModel.setBackupApiKey(key)
+                },
+                onToggleActiveKey = { viewModel.toggleActiveKey() },
                 onDismiss = { showControlSheet = false }
             )
         }

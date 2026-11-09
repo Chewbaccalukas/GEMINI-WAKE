@@ -116,26 +116,40 @@ class WakeWordVoiceService : Service() {
     private var audioFocusRequest: AudioFocusRequest? = null
 
     private val focusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        val focusLabel = formatAudioFocusChange(focusChange)
         if (isTransitioningAudioState) {
-            Log.d(TAG, "Ignoring AudioFocus change ($focusChange) during audio state transition")
+            val details = "response=$focusLabel ignored=true (isTransitioningAudioState=true)"
+            Log.d(TAG, "[SR-Trace] stage=SERVICE_AUDIOFOCUS_CALLBACK | $details")
+            dispatchDiagnosticTrace("SERVICE_AUDIOFOCUS_CALLBACK", details)
             return@OnAudioFocusChangeListener
         }
         when (focusChange) {
             AudioManager.AUDIOFOCUS_LOSS,
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                Log.d(TAG, "AudioFocus lost ($focusChange) — pausing background AudioRecord")
+                val details = "response=$focusLabel action=PAUSE_BACKGROUND_AUDIORECORD"
+                Log.d(TAG, "[SR-Trace] stage=SERVICE_AUDIOFOCUS_CALLBACK | $details")
+                dispatchDiagnosticTrace("SERVICE_AUDIOFOCUS_CALLBACK", details)
                 _hasExclusiveAudioFocus.value = false
                 onAudioFocusLostCallback?.invoke(focusChange)
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                Log.d(TAG, "Ignoring AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK in WakeWordVoiceService")
+                val details = "response=$focusLabel action=IGNORE_CAN_DUCK"
+                Log.d(TAG, "[SR-Trace] stage=SERVICE_AUDIOFOCUS_CALLBACK | $details")
+                dispatchDiagnosticTrace("SERVICE_AUDIOFOCUS_CALLBACK", details)
             }
             AudioManager.AUDIOFOCUS_GAIN,
             AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
             AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE -> {
-                Log.d(TAG, "AudioFocus gained ($focusChange) — restoring background AudioRecord if eligible")
+                val details = "response=$focusLabel action=RESTORE_ELIGIBLE_AUDIORECORD"
+                Log.d(TAG, "[SR-Trace] stage=SERVICE_AUDIOFOCUS_CALLBACK | $details")
+                dispatchDiagnosticTrace("SERVICE_AUDIOFOCUS_CALLBACK", details)
                 _hasExclusiveAudioFocus.value = true
                 onAudioFocusGainedCallback?.invoke()
+            }
+            else -> {
+                val details = "response=$focusLabel action=UNHANDLED"
+                Log.d(TAG, "[SR-Trace] stage=SERVICE_AUDIOFOCUS_CALLBACK | $details")
+                dispatchDiagnosticTrace("SERVICE_AUDIOFOCUS_CALLBACK", details)
             }
         }
     }
@@ -357,6 +371,11 @@ class WakeWordVoiceService : Service() {
     fun setWakeWordRepository(repository: WakeWordRepository) {
         customRepository = repository
         startObservingWakeWordRepository()
+    }
+
+    internal fun setActiveWakeWordsForTesting(words: List<WakeWord>) {
+        _serviceActiveWakeWords.value = words
+        _activeDatabaseWakeWords.value = words
     }
 
     private fun startObservingWakeWordRepository() {
@@ -586,6 +605,9 @@ class WakeWordVoiceService : Service() {
             _lastDetectedWakeWord.value = match
             _detectedWakeWordsFlow.tryEmit(match)
             postWakeWordReadyCueNotification(applicationContext, match)
+            if (!isMainActivityInForeground) {
+                launchChatActivityFromBackgroundService(applicationContext, match)
+            }
             onWakeWordDetectedCallback?.invoke(match)
         }
         return match
@@ -627,10 +649,12 @@ class WakeWordVoiceService : Service() {
         }
     }
 
-    internal fun releaseServiceMicrophoneRecord() {
+    internal fun releaseServiceMicrophoneRecord(repromotePassiveNotification: Boolean = false) {
         val record = synchronized(serviceAudioRecordMutex) {
             val current = serviceAudioRecord
             serviceAudioRecord = null
+            val nullifiedAtEpochMs = System.currentTimeMillis()
+            lastAudioRecordNullifiedAtEpochMs = nullifiedAtEpochMs
             _isMicrophoneInitialized.value = false
             _serviceMicRms.value = 0f
             if (current != null) {
@@ -643,9 +667,16 @@ class WakeWordVoiceService : Service() {
                     current.release()
                 } catch (_: Throwable) {}
             }
+            val releaseCompletedEpochMs = System.currentTimeMillis()
+            val traceDetails =
+                "serviceAudioRecord=null atEpochMs=$nullifiedAtEpochMs releaseCompletedEpochMs=$releaseCompletedEpochMs hadActiveRecord=${current != null} repromote=$repromotePassiveNotification"
+            Log.d(TAG, "[SR-Trace] stage=SERVICE_AUDIORECORD_NULLIFIED | $traceDetails")
+            dispatchDiagnosticTrace("SERVICE_AUDIORECORD_NULLIFIED", traceDetails)
             current
         } ?: return
-        promoteToMicrophoneForeground(false)
+        if (repromotePassiveNotification && !isMainActivityInForeground) {
+            promoteToMicrophoneForeground(false)
+        }
     }
 
     fun requestExclusiveAudioFocus(): Boolean {
@@ -674,10 +705,16 @@ class WakeWordVoiceService : Service() {
                 )
             }
             val granted = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            val responseLabel = formatAudioFocusRequestResult(result)
+            val traceDetails = "response=$responseLabel granted=$granted epochMs=${System.currentTimeMillis()}"
+            Log.d(TAG, "[SR-Trace] stage=SERVICE_AUDIOFOCUS_REQUEST | $traceDetails")
+            dispatchDiagnosticTrace("SERVICE_AUDIOFOCUS_REQUEST", traceDetails)
             _hasExclusiveAudioFocus.value = granted
             granted
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to request AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE: ${e.message}")
+            val errDetails = "response=AUDIOFOCUS_REQUEST_EXCEPTION error=${e.message}"
+            Log.w(TAG, "[SR-Trace] stage=SERVICE_AUDIOFOCUS_REQUEST | $errDetails")
+            dispatchDiagnosticTrace("SERVICE_AUDIOFOCUS_REQUEST", errDetails)
             false
         }
     }
@@ -685,14 +722,21 @@ class WakeWordVoiceService : Service() {
     fun abandonExclusiveAudioFocus() {
         val manager = audioManager ?: return
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 audioFocusRequest?.let { manager.abandonAudioFocusRequest(it) }
+                    ?: AudioManager.AUDIOFOCUS_REQUEST_GRANTED
             } else {
                 @Suppress("DEPRECATION")
                 manager.abandonAudioFocus(focusChangeListener)
             }
+            val responseLabel = formatAudioFocusRequestResult(result)
+            val traceDetails = "response=$responseLabel epochMs=${System.currentTimeMillis()}"
+            Log.d(TAG, "[SR-Trace] stage=SERVICE_AUDIOFOCUS_ABANDON | $traceDetails")
+            dispatchDiagnosticTrace("SERVICE_AUDIOFOCUS_ABANDON", traceDetails)
         } catch (e: Exception) {
-            Log.w(TAG, "Error abandoning audio focus: ${e.message}")
+            val errDetails = "response=AUDIOFOCUS_ABANDON_EXCEPTION error=${e.message}"
+            Log.w(TAG, "[SR-Trace] stage=SERVICE_AUDIOFOCUS_ABANDON | $errDetails")
+            dispatchDiagnosticTrace("SERVICE_AUDIOFOCUS_ABANDON", errDetails)
         } finally {
             _hasExclusiveAudioFocus.value = false
         }
@@ -707,21 +751,28 @@ class WakeWordVoiceService : Service() {
         try {
             ensureNotificationChannel()
             val notification = buildNotification(isActivelyListening)
-            val fgType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                )
             } else {
-                0
+                startForeground(NOTIFICATION_ID, notification)
             }
-            ServiceCompat.startForeground(
-                this,
-                NOTIFICATION_ID,
-                notification,
-                fgType
-            )
         } catch (e: Throwable) {
             try {
                 val notification = buildNotification(isActivelyListening)
-                startForeground(NOTIFICATION_ID, notification)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    ServiceCompat.startForeground(
+                        this,
+                        NOTIFICATION_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                    )
+                } else {
+                    startForeground(NOTIFICATION_ID, notification)
+                }
             } catch (inner: Throwable) {
                 Log.w(TAG, "Unable to promote WakeWordVoiceService to foreground: ${inner.message}")
             }
@@ -850,6 +901,38 @@ class WakeWordVoiceService : Service() {
             private set
 
         @Volatile
+        var lastAudioRecordNullifiedAtEpochMs: Long = 0L
+            private set
+
+        @Volatile
+        var onDiagnosticTraceCallback: ((stage: String, details: String) -> Unit)? = null
+
+        fun dispatchDiagnosticTrace(stage: String, details: String) {
+            onDiagnosticTraceCallback?.invoke(stage, details)
+        }
+
+        fun formatAudioFocusRequestResult(result: Int): String = when (result) {
+            AudioManager.AUDIOFOCUS_REQUEST_GRANTED -> "AUDIOFOCUS_REQUEST_GRANTED(1)"
+            AudioManager.AUDIOFOCUS_REQUEST_FAILED -> "AUDIOFOCUS_REQUEST_FAILED(0)"
+            AudioManager.AUDIOFOCUS_REQUEST_DELAYED -> "AUDIOFOCUS_REQUEST_DELAYED(2)"
+            else -> "AUDIOFOCUS_REQUEST_UNKNOWN($result)"
+        }
+
+        fun formatAudioFocusChange(focusChange: Int): String = when (focusChange) {
+            AudioManager.AUDIOFOCUS_GAIN -> "AUDIOFOCUS_GAIN(1)"
+            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT -> "AUDIOFOCUS_GAIN_TRANSIENT(2)"
+            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK -> "AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK(3)"
+            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE -> "AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE(4)"
+            AudioManager.AUDIOFOCUS_LOSS -> "AUDIOFOCUS_LOSS(-1)"
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> "AUDIOFOCUS_LOSS_TRANSIENT(-2)"
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> "AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK(-3)"
+            else -> "AUDIOFOCUS_CHANGE_UNKNOWN($focusChange)"
+        }
+
+        @Volatile
+        var isMainActivityInForeground: Boolean = true
+
+        @Volatile
         var isIntentionallyPaused: Boolean = false
             private set
 
@@ -860,7 +943,7 @@ class WakeWordVoiceService : Service() {
         fun setIntentionallyPaused(paused: Boolean) {
             isIntentionallyPaused = paused
             if (paused) {
-                activeInstance?.releaseServiceMicrophoneRecord()
+                activeInstance?.releaseServiceMicrophoneRecord(repromotePassiveNotification = false)
             }
         }
 
@@ -879,8 +962,15 @@ class WakeWordVoiceService : Service() {
             _serviceMicRms.value = 0f
             val instance = activeInstance
             if (instance != null) {
-                instance.releaseServiceMicrophoneRecord()
+                instance.releaseServiceMicrophoneRecord(repromotePassiveNotification = false)
                 instance.abandonExclusiveAudioFocus()
+            } else {
+                val nullifiedAtEpochMs = System.currentTimeMillis()
+                lastAudioRecordNullifiedAtEpochMs = nullifiedAtEpochMs
+                val traceDetails =
+                    "serviceAudioRecord=null atEpochMs=$nullifiedAtEpochMs releaseCompletedEpochMs=$nullifiedAtEpochMs hadActiveRecord=false activeInstance=null reason=$reason"
+                Log.d(TAG, "[SR-Trace] stage=SERVICE_AUDIORECORD_NULLIFIED | $traceDetails")
+                dispatchDiagnosticTrace("SERVICE_AUDIORECORD_NULLIFIED", traceDetails)
             }
         }
 
@@ -980,9 +1070,43 @@ class WakeWordVoiceService : Service() {
         var onVoiceHistoryNavigationRequestedCallback: ((String) -> Unit)? = null
 
         /**
+         * Builds the task-safe [Intent] to launch or bring [com.example.MainActivity] to the front
+         * from the background service using `Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT`.
+         */
+        fun createChatLaunchIntent(
+            context: Context,
+            result: WakeWordDetectionResult
+        ): Intent {
+            val chatId = result.wakeWord.chatId ?: -1L
+            val intent = Intent(context, com.example.MainActivity::class.java)
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+            if (chatId > 0L) {
+                intent.putExtra(EXTRA_WAKE_TARGET_CHAT_ID, chatId)
+            }
+            intent.putExtra(EXTRA_WAKE_MATCHED_PHRASE, result.matchedPhrase)
+            return intent
+        }
+
+        /**
+         * Safely launches or reorders the `singleTop` Chat Activity ([com.example.MainActivity])
+         * from the background service after wake-word detection.
+         */
+        fun launchChatActivityFromBackgroundService(
+            context: Context,
+            result: WakeWordDetectionResult
+        ): Intent {
+            val intent = createChatLaunchIntent(context, result)
+            try {
+                context.startActivity(intent)
+            } catch (e: Throwable) {
+                Log.w(TAG, "Unable to launch Chat Activity from background service: ${e.message}")
+            }
+            return intent
+        }
+
+        /**
          * Posts a non-intrusive notification cue confirming the wake word was detected and the app
-         * is ready to receive commands, without forcibly opening the full app UI over other apps.
-         * Tapping the notification opens directly to the associated chat conversation.
+         * is ready to receive commands. Tapping the notification opens directly to the associated chat conversation.
          */
         fun postWakeWordReadyCueNotification(
             context: Context,
@@ -1003,15 +1127,8 @@ class WakeWordVoiceService : Service() {
                         manager.createNotificationChannel(cueChannel)
                     }
                 }
-                val chatId = result.wakeWord.chatId ?: -1L
                 val chatTitle = result.wakeWord.chatTitle.ifBlank { "Gemini Chat" }
-                val openIntent = Intent(context, com.example.MainActivity::class.java).apply {
-                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-                    if (chatId > 0L) {
-                        putExtra(EXTRA_WAKE_TARGET_CHAT_ID, chatId)
-                    }
-                    putExtra(EXTRA_WAKE_MATCHED_PHRASE, result.matchedPhrase)
-                }
+                val openIntent = createChatLaunchIntent(context, result)
                 val pendingIntent = android.app.PendingIntent.getActivity(
                     context,
                     NOTIFICATION_ID_WAKE_READY,

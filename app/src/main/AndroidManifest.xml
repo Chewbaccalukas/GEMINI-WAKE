@@ -17,6 +17,12 @@
             <action android:name="android.speech.RecognitionService" />
         </intent>
         <intent>
+            <action android:name="android.speech.action.RECOGNIZE_SPEECH" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+        <intent>
             <action android:name="android.intent.action.VIEW" />
             <category android:name="android.intent.category.BROWSABLE" />
             <data android:scheme="https" />
@@ -26,6 +32,10 @@
             <category android:name="android.intent.category.BROWSABLE" />
             <data android:scheme="http" />
         </intent>
+        <package android:name="com.google.android.tts" />
+        <package android:name="com.google.android.googlequicksearchbox" />
+        <package android:name="com.samsung.android.bixby.agent" />
+        <package android:name="com.samsung.android.honeyboard" />
         <package android:name="com.google.android.apps.bard" />
         <package android:name="com.android.chrome" />
     </queries>
@@ -43,6 +53,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:label="@string/app_name"
+            android:launchMode="singleTop"
             android:theme="@style/Theme.MyApplication"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
@@ -54,6 +65,7 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
+                <category android:name="android.intent.category.LAUNCHER" tools:node="remove" />
                 <data android:scheme="http" />
                 <data android:scheme="https" />
             </intent-filter>
@@ -87,6 +99,14 @@
             android:name=".importer.FileProcessingService"
             android:exported="false"
             android:foregroundServiceType="microphone" />
+
+        <activity
+            android:name="androidx.activity.ComponentActivity"
+            tools:node="remove" />
+
+        <activity
+            android:name="androidx.compose.ui.tooling.PreviewActivity"
+            tools:node="remove" />
     </application>
 
 </manifest>

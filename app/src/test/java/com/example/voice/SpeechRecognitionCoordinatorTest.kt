@@ -638,7 +638,240 @@ class SpeechRecognitionCoordinatorTest {
             coordinator.isIntentionallyPaused
         )
     }
+
+    @Test
+    fun v10_3_foregroundMicrophoneServiceType_singleTopManifest_andChatLaunchIntentFlags() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+
+        // 1. Verify AndroidManifest.xml declarations
+        val manifestFile = listOf(
+            java.io.File("src/main/AndroidManifest.xml"),
+            java.io.File("app/src/main/AndroidManifest.xml")
+        ).firstOrNull { it.exists() }
+        org.junit.Assert.assertNotNull("AndroidManifest.xml must exist", manifestFile)
+        val manifestXml = manifestFile!!.readText()
+        assertTrue(
+            "AndroidManifest.xml must declare FOREGROUND_SERVICE_MICROPHONE permission",
+            manifestXml.contains("android.permission.FOREGROUND_SERVICE_MICROPHONE")
+        )
+        assertTrue(
+            "WakeWordVoiceService must declare android:foregroundServiceType=\"microphone\"",
+            manifestXml.contains("android:foregroundServiceType=\"microphone\"")
+        )
+        assertTrue(
+            "MainActivity must declare android:launchMode=\"singleTop\"",
+            manifestXml.contains("android:launchMode=\"singleTop\"")
+        )
+
+        // 2. Verify WakeWordVoiceService startForeground() passes ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        val serviceController = org.robolectric.Robolectric.buildService(
+            WakeWordVoiceService::class.java,
+            android.content.Intent(app, WakeWordVoiceService::class.java).apply {
+                action = WakeWordVoiceService.ACTION_START_VOICE_SERVICE
+            }
+        )
+        val service = serviceController.create().startCommand(0, 1).get()
+        try {
+            val shadowService = org.robolectric.Shadows.shadowOf(service)
+            assertEquals(WakeWordVoiceService.NOTIFICATION_ID, shadowService.lastForegroundNotificationId)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                assertEquals(
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
+                    service.foregroundServiceType
+                )
+            }
+
+            // 3. Verify Chat launch Intent includes FLAG_ACTIVITY_NEW_TASK or FLAG_ACTIVITY_REORDER_TO_FRONT
+            val detection = com.example.voice.WakeWordDetectionResult(
+                wakeWord = com.example.data.model.WakeWord(
+                    phrase = "Hey Gemini",
+                    triggerType = com.example.data.model.TriggerType.CHAT,
+                    chatId = 42L,
+                    chatTitle = "Samsung Voice Chat"
+                ),
+                matchedPhrase = "Hey Gemini",
+                followUpQuery = null,
+                rawTranscript = "Hey Gemini"
+            )
+            val launchIntent = WakeWordVoiceService.createChatLaunchIntent(app, detection)
+            val expectedFlags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+            assertEquals(
+                "Chat launch intent must include FLAG_ACTIVITY_NEW_TASK or FLAG_ACTIVITY_REORDER_TO_FRONT",
+                expectedFlags,
+                launchIntent.flags and expectedFlags
+            )
+            assertEquals(42L, launchIntent.getLongExtra(WakeWordVoiceService.EXTRA_WAKE_TARGET_CHAT_ID, -1L))
+        } finally {
+            serviceController.destroy()
+        }
+    }
+
+    @Test
+    fun v10_4_samsungAndroid14_noSilentMinimizeOnForegroundSpeechRecognizerActivation() = runTest {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val shadowApp = org.robolectric.Shadows.shadowOf(app)
+
+        // 1. Verify AndroidManifest.xml <queries> visibility for Android 14 / Samsung One UI speech services
+        val manifestFile = listOf(
+            java.io.File("src/main/AndroidManifest.xml"),
+            java.io.File("app/src/main/AndroidManifest.xml")
+        ).firstOrNull { it.exists() }
+        org.junit.Assert.assertNotNull("AndroidManifest.xml must exist", manifestFile)
+        val manifestXml = manifestFile!!.readText()
+        assertTrue(manifestXml.contains("android.speech.RecognitionService"))
+        assertTrue(manifestXml.contains("android.speech.action.RECOGNIZE_SPEECH"))
+        assertTrue(manifestXml.contains("com.google.android.tts"))
+        assertTrue(manifestXml.contains("com.samsung.android.bixby.agent"))
+
+        // 2. Verify foreground SpeechRecognizer intent strips FLAG_ACTIVITY_NEW_TASK and task flags
+        val dirtyIntent = android.content.Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            addFlags(
+                android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                    android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
+            )
+        }
+        val sanitizedRecognizerIntent = WakeWordManager.configureRecognizerIntent(dirtyIntent, app.packageName)
+        assertEquals(
+            "Foreground RecognizerIntent must NEVER carry FLAG_ACTIVITY_NEW_TASK",
+            0,
+            sanitizedRecognizerIntent.flags and android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+        )
+
+        // 3. Verify WakeWordVoiceService does NOT fire startActivity(FLAG_ACTIVITY_NEW_TASK) when MainActivity is already in foreground
+        val serviceController = org.robolectric.Robolectric.buildService(WakeWordVoiceService::class.java)
+        val service = serviceController.create().get()
+        try {
+            service.setActiveWakeWordsForTesting(
+                listOf(
+                    com.example.data.model.WakeWord(
+                        phrase = "Hey Gemini",
+                        triggerType = com.example.data.model.TriggerType.CHAT,
+                        chatId = 77L,
+                        chatTitle = "Note 20 Chat"
+                    )
+                )
+            )
+            while (shadowApp.nextStartedActivity != null) {
+                // drain any prior test intents
+            }
+            WakeWordVoiceService.setIntentionallyPaused(false)
+            WakeWordVoiceService.setSleepMode(false)
+            WakeWordVoiceService.isMainActivityInForeground = true
+            val fgMatch = service.checkTranscriptAgainstDatabase("Hey Gemini")
+            org.junit.Assert.assertNotNull("Wake word should match in foreground", fgMatch)
+            assertEquals(
+                "When MainActivity is already in the foreground, WakeWordVoiceService must NOT fire background startActivity(FLAG_ACTIVITY_NEW_TASK)",
+                null,
+                shadowApp.nextStartedActivity
+            )
+
+            // When app is backgrounded, WakeWordVoiceService MUST fire startActivity(FLAG_ACTIVITY_NEW_TASK or FLAG_ACTIVITY_REORDER_TO_FRONT)
+            WakeWordVoiceService.setIntentionallyPaused(false)
+            WakeWordVoiceService.setSleepMode(false)
+            WakeWordVoiceService.isMainActivityInForeground = false
+            val bgMatch = service.checkTranscriptAgainstDatabase("Hey Gemini")
+            org.junit.Assert.assertNotNull("Wake word should match in background", bgMatch)
+            val startedFromBg = shadowApp.nextStartedActivity
+            org.junit.Assert.assertNotNull(
+                "When MainActivity is in the background, WakeWordVoiceService MUST launch MainActivity",
+                startedFromBg
+            )
+            val expectedFlags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+            assertEquals(expectedFlags, startedFromBg!!.flags and expectedFlags)
+        } finally {
+            WakeWordVoiceService.isMainActivityInForeground = true
+            serviceController.destroy()
+        }
+    }
+
+    @Test
+    fun srTraceLogging_debounceWindow_audioFocusResponses_intentSilenceExtras_andServiceHandoffNullification() {
+        val app = ApplicationProvider.getApplicationContext<android.app.Application>()
+        val serviceController = org.robolectric.Robolectric.buildService(
+            WakeWordVoiceService::class.java,
+            android.content.Intent(app, WakeWordVoiceService::class.java)
+        )
+        val service = serviceController.create().get()
+        val viewModel = com.example.ui.MainViewModel(app)
+        viewModel.setPermissionGrantedOverrideForTest(true)
+        viewModel.onWindowFocusChanged(true)
+
+        try {
+            viewModel.clearDiagnosticTraceLogs()
+
+            // 1. Trigger manual dictation -> logs SERVICE_AUDIORECORD_NULLIFIED and UI_MIC_DEBOUNCE_START immediately
+            val started = viewModel.toggleInternalDictation()
+            assertTrue(started)
+
+            val tracesBeforeDelay = viewModel.speechTraceHistory.value
+            assertTrue(
+                "Expected stage=UI_MIC_DEBOUNCE_START in [SR-Trace] before 300ms delay completes",
+                tracesBeforeDelay.any { it.contains("stage=UI_MIC_DEBOUNCE_START") && it.contains("delayMs=300") }
+            )
+            assertTrue(
+                "Expected stage=SERVICE_AUDIORECORD_NULLIFIED with exact millisecond in [SR-Trace]",
+                tracesBeforeDelay.any { it.contains("stage=SERVICE_AUDIORECORD_NULLIFIED") && it.contains("serviceAudioRecord=null atEpochMs=") }
+            )
+            assertTrue(
+                "lastAudioRecordNullifiedAtEpochMs must be > 0",
+                WakeWordVoiceService.lastAudioRecordNullifiedAtEpochMs > 0L
+            )
+
+            // Advance the Robolectric paused main looper clock by 350ms so delay(300L) completes
+            org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper())
+                .idleFor(java.time.Duration.ofMillis(350))
+
+            val tracesAfterDelay = viewModel.speechTraceHistory.value
+            assertTrue(
+                "Expected stage=UI_MIC_DEBOUNCE_END in [SR-Trace] after 300ms delay",
+                tracesAfterDelay.any { it.contains("stage=UI_MIC_DEBOUNCE_END") && it.contains("elapsedMs=") }
+            )
+
+            // 2. Verify AudioFocus request, abandon, and callback logs include exact OS response names
+            service.requestExclusiveAudioFocus()
+            service.abandonExclusiveAudioFocus()
+            viewModel.speechRecognitionCoordinator.handleAudioFocusChange(android.media.AudioManager.AUDIOFOCUS_LOSS_TRANSIENT)
+            viewModel.speechRecognitionCoordinator.handleAudioFocusChange(android.media.AudioManager.AUDIOFOCUS_GAIN)
+
+            val focusTraces = viewModel.speechTraceHistory.value
+            assertTrue(
+                "Expected SERVICE_AUDIOFOCUS_REQUEST with AUDIOFOCUS_REQUEST_GRANTED or FAILED in [SR-Trace]",
+                focusTraces.any {
+                    it.contains("stage=SERVICE_AUDIOFOCUS_REQUEST") &&
+                        (it.contains("AUDIOFOCUS_REQUEST_GRANTED") || it.contains("AUDIOFOCUS_REQUEST_FAILED"))
+                }
+            )
+            assertTrue(
+                "Expected SERVICE_AUDIOFOCUS_ABANDON in [SR-Trace]",
+                focusTraces.any { it.contains("stage=SERVICE_AUDIOFOCUS_ABANDON") }
+            )
+            assertTrue(
+                "Expected AUDIOFOCUS_YIELD with response=AUDIOFOCUS_LOSS_TRANSIENT(-2) in [SR-Trace]",
+                focusTraces.any {
+                    it.contains("stage=AUDIOFOCUS_YIELD") &&
+                        it.contains("response=AUDIOFOCUS_LOSS_TRANSIENT(-2)")
+                }
+            )
+
+            // 3. Verify configureRecognizerIntent dumps exact 3000ms EOU silence extras to [SR-Trace]
+            WakeWordManager.configureRecognizerIntent(
+                android.content.Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH),
+                app.packageName
+            )
+            val intentTraces = viewModel.speechTraceHistory.value
+            assertTrue(
+                "Expected stage=RECOGNIZER_INTENT_CONFIGURED with 3000ms silence values in [SR-Trace]",
+                intentTraces.any {
+                    it.contains("stage=RECOGNIZER_INTENT_CONFIGURED") &&
+                        it.contains("EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS=3000ms") &&
+                        it.contains("EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS=3000ms")
+                }
+            )
+        } finally {
+            viewModel.cleanShutdown(null)
+            serviceController.destroy()
+        }
+    }
 }
-
-
-

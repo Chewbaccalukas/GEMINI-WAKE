@@ -527,6 +527,15 @@ class WakeWordManager(
         }
 
         fun configureRecognizerIntent(intent: Intent, callingPackage: String? = null): Intent {
+            // Strictly strip any activity task flags (such as FLAG_ACTIVITY_NEW_TASK) from the
+            // foreground SpeechRecognizer intent so Android 14 / Samsung One UI never treats
+            // in-process SpeechRecognizer binding as a background task transition.
+            intent.removeFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_MULTIPLE_TASK
+            )
             intent.putExtra(
                 android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                 android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
@@ -548,6 +557,25 @@ class WakeWordManager(
                 android.speech.RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS,
                 SPEECH_MINIMUM_LENGTH_MS
             )
+            val completeSilenceMs = intent.getLongExtra(
+                android.speech.RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
+                -1L
+            )
+            val possiblyCompleteSilenceMs = intent.getLongExtra(
+                android.speech.RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
+                -1L
+            )
+            val minLengthMs = intent.getLongExtra(
+                android.speech.RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS,
+                -1L
+            )
+            val intentTrace =
+                "EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS=${completeSilenceMs}ms " +
+                    "EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS=${possiblyCompleteSilenceMs}ms " +
+                    "EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS=${minLengthMs}ms " +
+                    "callingPackage=${callingPackage ?: "none"} flags=0x${Integer.toHexString(intent.flags)}"
+            Log.d(TAG, "[SR-Trace] stage=RECOGNIZER_INTENT_CONFIGURED | $intentTrace")
+            WakeWordVoiceService.dispatchDiagnosticTrace("RECOGNIZER_INTENT_CONFIGURED", intentTrace)
             return intent
         }
 
@@ -963,10 +991,19 @@ class WakeWordManager(
                 )
             }
             val granted = res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            val responseLabel = WakeWordVoiceService.formatAudioFocusRequestResult(res)
+            appendDiagnosticTraceLog(
+                stage = "AUDIOFOCUS_REQUEST",
+                details = "response=$responseLabel granted=$granted epochMs=${System.currentTimeMillis()}"
+            )
             _hasAudioFocus.value = granted
             WakeWordVoiceService.setExclusiveAudioFocusState(granted)
             granted
         } catch (e: Exception) {
+            appendDiagnosticTraceLog(
+                stage = "AUDIOFOCUS_REQUEST",
+                details = "response=AUDIOFOCUS_REQUEST_EXCEPTION error=${e.message}"
+            )
             Log.w(TAG, "Error requesting AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE: ${e.message}")
             false
         }
@@ -978,13 +1015,23 @@ class WakeWordManager(
     fun abandonExclusiveAudioFocus() {
         val manager = audioManager ?: return
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val res = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 audioFocusRequest?.let { manager.abandonAudioFocusRequest(it) }
+                    ?: AudioManager.AUDIOFOCUS_REQUEST_GRANTED
             } else {
                 @Suppress("DEPRECATION")
                 manager.abandonAudioFocus(audioFocusChangeListener)
             }
+            val responseLabel = WakeWordVoiceService.formatAudioFocusRequestResult(res)
+            appendDiagnosticTraceLog(
+                stage = "AUDIOFOCUS_ABANDON",
+                details = "response=$responseLabel epochMs=${System.currentTimeMillis()}"
+            )
         } catch (e: Exception) {
+            appendDiagnosticTraceLog(
+                stage = "AUDIOFOCUS_ABANDON",
+                details = "response=AUDIOFOCUS_ABANDON_EXCEPTION error=${e.message}"
+            )
             Log.w(TAG, "Error abandoning audio focus: ${e.message}")
         } finally {
             _hasAudioFocus.value = false
@@ -999,13 +1046,21 @@ class WakeWordManager(
      * - Uses a 500ms debounce ([AUDIOFOCUS_GAIN_DEBOUNCE_MS]) before re-arming on [AudioManager.AUDIOFOCUS_GAIN].
      */
     fun handleAudioFocusChange(focusChange: Int) {
+        val responseLabel = WakeWordVoiceService.formatAudioFocusChange(focusChange)
         if (isTransitioningAudioState) {
-            Log.d(TAG, "Ignoring handleAudioFocusChange($focusChange) while isTransitioningAudioState=true")
+            appendDiagnosticTraceLog(
+                stage = "AUDIOFOCUS_CALLBACK",
+                details = "response=$responseLabel ignored=true (isTransitioningAudioState=true)"
+            )
             return
         }
         when (focusChange) {
             AudioManager.AUDIOFOCUS_LOSS,
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                appendDiagnosticTraceLog(
+                    stage = "AUDIOFOCUS_CALLBACK",
+                    details = "response=$responseLabel action=YIELD_AUDIORECORD"
+                )
                 mainHandler.removeCallbacks(audioFocusGainRunnable)
                 _hasAudioFocus.value = false
                 WakeWordVoiceService.setExclusiveAudioFocusState(false)
@@ -1019,12 +1074,19 @@ class WakeWordManager(
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
                 // Do NOT yield audio focus on CAN_DUCK — keep handsFreeMode and listening active
-                Log.d(TAG, "Ignoring AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK (not yielding audio focus)")
+                appendDiagnosticTraceLog(
+                    stage = "AUDIOFOCUS_CALLBACK",
+                    details = "response=$responseLabel action=IGNORE_CAN_DUCK"
+                )
                 onAudioFocusChangeCallback?.invoke(focusChange)
             }
             AudioManager.AUDIOFOCUS_GAIN,
             AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
             AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE -> {
+                appendDiagnosticTraceLog(
+                    stage = "AUDIOFOCUS_CALLBACK",
+                    details = "response=$responseLabel action=GAIN_DEBOUNCE_${AUDIOFOCUS_GAIN_DEBOUNCE_MS}MS"
+                )
                 _hasAudioFocus.value = true
                 WakeWordVoiceService.setExclusiveAudioFocusState(true)
                 onAudioFocusChangeCallback?.invoke(focusChange)

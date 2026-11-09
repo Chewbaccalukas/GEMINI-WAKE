@@ -1,6 +1,6 @@
 {
-  "summary":  "Revised implementation plan adding synchronous WakeWordVoiceService AudioRecord release (\"wake_word_detected\") prior to Chat navigation/state updates, Chat screen init/onResume handoff protection, synchronous pre-TTS hardware mutex release (\"tts_speaking\"), and 500ms debounced post-TTS re-arming.",
-  "updatedAt":  "2026-11-08T19:10:14.899392458Z",
+  "summary":  "Implementation plan for v13.0 to preserve all v10.2/v10.3 microphone and wake-word handoff fixes while stripping all widget and secondary/debug exported launcher activities from AndroidManifest.xml and verifying via Robolectric tests.",
+  "updatedAt":  "2026-11-09T03:40:38.823366981Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

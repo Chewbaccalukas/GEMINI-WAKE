@@ -70,6 +70,18 @@ class ExampleRobolectricTest {
       "Source AndroidManifest.xml must not contain any <activity-alias>",
       sourceXml.contains("<activity-alias"),
     )
+    assertFalse(
+      "Source AndroidManifest.xml must not contain any AppWidgetProvider (APPWIDGET_UPDATE)",
+      sourceXml.contains("android.appwidget.action.APPWIDGET_UPDATE"),
+    )
+    assertTrue(
+      "Source AndroidManifest.xml must strip androidx.activity.ComponentActivity via tools:node=\"remove\"",
+      sourceXml.contains("androidx.activity.ComponentActivity") && sourceXml.contains("""tools:node="remove""""),
+    )
+    assertTrue(
+      "Source AndroidManifest.xml must strip androidx.compose.ui.tooling.PreviewActivity via tools:node=\"remove\"",
+      sourceXml.contains("androidx.compose.ui.tooling.PreviewActivity") && sourceXml.contains("""tools:node="remove""""),
+    )
 
     val mergedManifest =
       sequenceOf(
@@ -90,6 +102,18 @@ class ExampleRobolectricTest {
       assertFalse(
         "Merged debug AndroidManifest.xml must not contain any <activity-alias>",
         mergedXml.contains("<activity-alias"),
+      )
+      assertFalse(
+        "Merged debug AndroidManifest.xml must not contain any AppWidgetProvider (APPWIDGET_UPDATE)",
+        mergedXml.contains("android.appwidget.action.APPWIDGET_UPDATE"),
+      )
+      assertFalse(
+        "Merged debug AndroidManifest.xml must not contain exported androidx.activity.ComponentActivity",
+        mergedXml.contains("""android:name="androidx.activity.ComponentActivity""""),
+      )
+      assertFalse(
+        "Merged debug AndroidManifest.xml must not contain exported androidx.compose.ui.tooling.PreviewActivity",
+        mergedXml.contains("""android:name="androidx.compose.ui.tooling.PreviewActivity""""),
       )
     }
   }

@@ -71,7 +71,7 @@ object ReplyNotificationHelper {
         ensureNotificationChannel(context)
 
         val launchIntent = Intent(context, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
             putExtra(HeartbeatAlarmReceiver.EXTRA_TARGET_CHAT_ID, chatId)
         }
         val pendingIntent = PendingIntent.getActivity(

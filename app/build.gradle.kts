@@ -17,8 +17,8 @@ android {
     applicationId = "com.aistudio.geminiwake.vztrkq"
     minSdk = 24
     targetSdk = 36
-    versionCode = 12
-    versionName = "12.0"
+    versionCode = 13
+    versionName = "13.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -78,6 +78,10 @@ android {
 tasks.withType<Test> {
   failFast = true
   timeout.set(Duration.ofMinutes(2))
+  systemProperty(
+    "robolectric.dependency.repo.url",
+    "https://maven-central.storage-download.googleapis.com/maven2/",
+  )
   testLogging { events("passed", "failed", "skipped") }
 }
 

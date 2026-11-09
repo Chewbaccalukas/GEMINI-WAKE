@@ -7,12 +7,20 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.ai.ActiveKeyType
 import com.example.cache.BufferMetrics
 import com.example.data.model.ChatSession
 import com.example.ui.theme.AppTheme
@@ -47,9 +55,20 @@ fun GeminiControlSheet(
     permissionsResetCount: Int = 0,
     onResetPermissions: () -> Unit = {},
     onRequestRequiredPermissions: () -> Unit = {},
+    primaryApiKey: String = "",
+    backupApiKey: String = "",
+    activeKeyType: ActiveKeyType = ActiveKeyType.PRIMARY,
+    onSavePrimaryApiKey: (String) -> Unit = {},
+    onSaveBackupApiKey: (String) -> Unit = {},
+    onToggleActiveKey: () -> Unit = {},
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val clipboardManager = LocalClipboardManager.current
+    var primaryKeyDraft by remember(primaryApiKey) { mutableStateOf(primaryApiKey) }
+    var backupKeyDraft by remember(backupApiKey) { mutableStateOf(backupApiKey) }
+    var showKeysPlainText by remember { mutableStateOf(false) }
+
     Column(
         modifier = modifier
             .fillMaxWidth()
@@ -85,6 +104,109 @@ fun GeminiControlSheet(
                     contentDescription = "Close Settings",
                     tint = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+        }
+
+        // 0. Quick Gemini API Key Setup (Primary & Backup Failover)
+        ControlSection(title = "Gemini API Key (Direct & Failover)", icon = Icons.Default.Key) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (primaryApiKey.isNotBlank() || backupApiKey.isNotBlank()) {
+                        "Active Key: ${activeKeyType.shortLabel}"
+                    } else {
+                        "Using Firebase / BuildConfig Default"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    TextButton(
+                        onClick = { showKeysPlainText = !showKeysPlainText },
+                        modifier = Modifier.testTag("toggle_api_key_visibility_button")
+                    ) {
+                        Text(if (showKeysPlainText) "Hide" else "Show")
+                    }
+                    if (primaryApiKey.isNotBlank() && backupApiKey.isNotBlank()) {
+                        TextButton(
+                            onClick = onToggleActiveKey,
+                            modifier = Modifier.testTag("control_sheet_switch_active_key_button")
+                        ) {
+                            Text("Switch Key")
+                        }
+                    }
+                }
+            }
+
+            OutlinedTextField(
+                value = primaryKeyDraft,
+                onValueChange = { primaryKeyDraft = it },
+                label = { Text("Primary Gemini API Key (AIza...)") },
+                singleLine = true,
+                visualTransformation = if (showKeysPlainText) VisualTransformation.None else PasswordVisualTransformation(),
+                trailingIcon = {
+                    IconButton(
+                        onClick = {
+                            val clip = clipboardManager.getText()?.text?.trim().orEmpty()
+                            if (clip.isNotBlank()) {
+                                primaryKeyDraft = clip
+                                onSavePrimaryApiKey(clip)
+                            }
+                        },
+                        modifier = Modifier.testTag("paste_primary_api_key_button")
+                    ) {
+                        Icon(Icons.Default.ContentPaste, contentDescription = "Paste Primary API Key")
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("primary_api_key_input")
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            OutlinedTextField(
+                value = backupKeyDraft,
+                onValueChange = { backupKeyDraft = it },
+                label = { Text("Backup API Key (Optional 429 Failover)") },
+                singleLine = true,
+                visualTransformation = if (showKeysPlainText) VisualTransformation.None else PasswordVisualTransformation(),
+                trailingIcon = {
+                    IconButton(
+                        onClick = {
+                            val clip = clipboardManager.getText()?.text?.trim().orEmpty()
+                            if (clip.isNotBlank()) {
+                                backupKeyDraft = clip
+                                onSaveBackupApiKey(clip)
+                            }
+                        },
+                        modifier = Modifier.testTag("paste_backup_api_key_button")
+                    ) {
+                        Icon(Icons.Default.ContentPaste, contentDescription = "Paste Backup API Key")
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("backup_api_key_input")
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Button(
+                onClick = {
+                    onSavePrimaryApiKey(primaryKeyDraft.trim())
+                    onSaveBackupApiKey(backupKeyDraft.trim())
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("save_api_keys_button")
+            ) {
+                Icon(Icons.Default.Save, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Save API Keys to Device")
             }
         }
 

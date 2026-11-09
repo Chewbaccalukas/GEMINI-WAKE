@@ -850,20 +850,21 @@ class SpeechRecognitionCoordinator(
      *   listening after a 500ms debounced delay ([AUDIOFOCUS_GAIN_REARM_DEBOUNCE_MS]).
      */
     fun handleAudioFocusChange(focusChange: Int) {
+        val responseLabel = WakeWordVoiceService.formatAudioFocusChange(focusChange)
         when (focusChange) {
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
             AudioManager.AUDIOFOCUS_LOSS -> {
                 isTransientAudioFocusLoss = true
                 recordTrace(
                     "AUDIOFOCUS_YIELD",
-                    "focusChange=$focusChange isTransientAudioFocusLoss=true -> calling SpeechRecognizer.cancel() without immediate restart"
+                    "response=$responseLabel focusChange=$focusChange isTransientAudioFocusLoss=true -> calling SpeechRecognizer.cancel() without immediate restart"
                 )
                 cancelRecognizerOnTransientAudioFocusLoss()
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
                 recordTrace(
                     "AUDIOFOCUS_CAN_DUCK_IGNORED",
-                    "focusChange=$focusChange -> keeping SpeechRecognizer active without yielding"
+                    "response=$responseLabel focusChange=$focusChange -> keeping SpeechRecognizer active without yielding"
                 )
             }
             AudioManager.AUDIOFOCUS_GAIN,
@@ -874,10 +875,16 @@ class SpeechRecognitionCoordinator(
                 if (shouldRearmAfterLoss) {
                     recordTrace(
                         "AUDIOFOCUS_GAIN_DEBOUNCE",
-                        "focusChange=$focusChange -> scheduling 500ms debounced re-arm"
+                        "response=$responseLabel focusChange=$focusChange -> scheduling 500ms debounced re-arm"
                     )
                     scheduleAudioFocusGainRearm(delayMs = AUDIOFOCUS_GAIN_REARM_DEBOUNCE_MS)
                 }
+            }
+            else -> {
+                recordTrace(
+                    "AUDIOFOCUS_CALLBACK_UNHANDLED",
+                    "response=$responseLabel focusChange=$focusChange"
+                )
             }
         }
     }

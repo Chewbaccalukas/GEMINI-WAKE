@@ -2665,11 +2665,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private var timerTickerJob: Job? = null
     private var activeGenerationJob: Job? = null
+    private var uiMicDebounceJob: Job? = null
     private val voicePcmOutputStream = java.io.ByteArrayOutputStream()
     private val _lastAudioPacketTimestampMs = MutableStateFlow(System.currentTimeMillis())
     val lastAudioPacketTimestampMs: StateFlow<Long> = _lastAudioPacketTimestampMs.asStateFlow()
 
     init {
+        com.example.voice.WakeWordVoiceService.onDiagnosticTraceCallback = { stage, details ->
+            speechRecognitionCoordinator.recordTrace(stage, details)
+        }
         com.example.util.AppSettingsManager.ensureInitialized(application)
         com.example.heartbeat.BackupReminderWorker.schedulePeriodicBackupReminder(application)
         snippetPlayer.setVolume(_masterVolume.value)
@@ -2984,6 +2988,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         if (android.speech.SpeechRecognizer.isRecognitionAvailable(context) && checkRecordAudioPermission()) {
                             wakeWordManager.isExternalSpeechRecognizerActive = true
                             releaseAllNativeAudioRecordTracksForSpeechRecognizer()
+                            speechRecognitionCoordinator.setProcessingState(false)
+                            speechRecognitionCoordinator.setIntentionallyPaused(false)
                             scheduleSpeechRecognizerRestart(delayMs = 500L, allowDuringUserVoiceTurn = true)
                         }
                     } else {
@@ -3609,6 +3615,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun toggleInternalDictation(manualDraftText: String = ""): Boolean {
         return if (_isInChatDictationActive.value || speechRecognitionCoordinator.isInChatDictationMode) {
+            uiMicDebounceJob?.cancel()
+            uiMicDebounceJob = null
             val capturedSpeech = manualDraftText.trim()
                 .ifBlank { _currentDraftText.value.trim() }
                 .ifBlank { wakeWordManager.lastHeardText.value.trim() }
@@ -3674,8 +3682,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             wakeWordManager.clearLastHeardText()
             _isInChatDictationActive.value = true
             wakeWordManager.setUserVoiceTurn(true)
+            speechRecognitionCoordinator.setProcessingState(false)
+            speechRecognitionCoordinator.setIntentionallyPaused(false)
             speechRecognitionCoordinator.setInChatDictationMode(true)
-            speechRecognitionCoordinator.startListening(userInitiated = true)
+
+            uiMicDebounceJob?.cancel()
+            uiMicDebounceJob = viewModelScope.launch(Dispatchers.Main.immediate) {
+                val debounceStartEpochMs = System.currentTimeMillis()
+                speechRecognitionCoordinator.recordTrace(
+                    stage = "UI_MIC_DEBOUNCE_START",
+                    details = "delayMs=300 startEpochMs=$debounceStartEpochMs serviceNullifiedAtEpochMs=${com.example.voice.WakeWordVoiceService.lastAudioRecordNullifiedAtEpochMs} waiting for hardware lock release"
+                )
+                kotlinx.coroutines.delay(300L)
+                val debounceEndEpochMs = System.currentTimeMillis()
+                val elapsedMs = debounceEndEpochMs - debounceStartEpochMs
+                speechRecognitionCoordinator.recordTrace(
+                    stage = "UI_MIC_DEBOUNCE_END",
+                    details = "delayMs=300 elapsedMs=${elapsedMs}ms endEpochMs=$debounceEndEpochMs hardware lock wait complete"
+                )
+                if (_isInChatDictationActive.value && speechRecognitionCoordinator.isInChatDictationMode) {
+                    speechRecognitionCoordinator.startListening(userInitiated = true)
+                }
+            }
             true
         }
     }
@@ -4674,6 +4702,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onAppBackgrounded() {
         isAppInForeground = false
+        com.example.voice.WakeWordVoiceService.isMainActivityInForeground = false
         _hasWindowFocus.value = false
         _isInChatDictationActive.value = false
         speechRecognitionCoordinator.setWindowFocused(false)
@@ -4687,11 +4716,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onAppForegrounded() {
         isAppInForeground = true
+        com.example.voice.WakeWordVoiceService.isMainActivityInForeground = true
         _hasWindowFocus.value = true
         speechRecognitionCoordinator.setWindowFocused(true)
         wakeWordManager.setWindowFocused(true)
         networkStatusTracker.refresh()
         val isHandoffOrTtsBusy = _isWakeHandoffInProgress.value ||
+            _isInChatDictationActive.value ||
+            speechRecognitionCoordinator.isInChatDictationMode ||
             textToSpeechManager.isSpeaking.value ||
             textToSpeechManager.hasPendingSettlingDelay ||
             speechRecognitionCoordinator.isProcessing ||
@@ -5486,10 +5518,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun cleanShutdown(activity: android.app.Activity?) {
         try {
+            uiMicDebounceJob?.cancel()
+            uiMicDebounceJob = null
             timerTickerJob?.cancel()
             cloudSyncJob?.cancel()
             voiceNavigationSettleJob?.cancel()
             activeGenerationJob?.cancel()
+            com.example.voice.WakeWordVoiceService.onSleepModeChangedCallback = null
+            com.example.voice.WakeWordVoiceService.onWakeWordDetectedCallback = null
+            com.example.voice.WakeWordVoiceService.onVoiceHistoryNavigationRequestedCallback = null
+            com.example.voice.WakeWordVoiceService.onBatterySaverResumeRequestedCallback = null
+            com.example.voice.WakeWordVoiceService.onDiagnosticTraceCallback = null
             destroySpeechRecognizerInternal()
             wakeWordManager.stopContinuousListening()
             wakeWordManager.destroy()
