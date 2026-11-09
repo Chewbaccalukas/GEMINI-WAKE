@@ -1,5 +1,6 @@
 package com.example.voice
 
+import com.example.game.AdventureDrawerTab
 import com.example.ui.theme.AppTheme
 import java.util.Locale
 
@@ -43,6 +44,13 @@ sealed interface VoiceCommandAction {
         val rawTranscript: String
     ) : VoiceCommandAction
 
+    data class OpenAdventureDrawer(
+        val tab: AdventureDrawerTab
+    ) : VoiceCommandAction
+
+    data object SaveAdventureGame : VoiceCommandAction
+    data object CloseAdventureDrawer : VoiceCommandAction
+
     data object None : VoiceCommandAction
 }
 
@@ -63,6 +71,9 @@ class VoiceCommandDispatcher(
             label: String
         ): Boolean
         fun onOpenExternalUrl(urlOrQuery: String, rawTranscript: String): Boolean
+        fun onOpenAdventureDrawer(tab: AdventureDrawerTab): Boolean = false
+        fun onSaveAdventureGame(): Boolean = false
+        fun onCloseAdventureDrawer(): Boolean = false
         fun onCommandCompletedAndRearm(action: VoiceCommandAction, reason: String)
     }
 
@@ -161,6 +172,15 @@ class VoiceCommandDispatcher(
                 }
                 is VoiceCommandAction.OpenExternalUrl -> {
                     callbacks.onOpenExternalUrl(action.urlOrQuery, action.rawTranscript)
+                }
+                is VoiceCommandAction.OpenAdventureDrawer -> {
+                    callbacks.onOpenAdventureDrawer(action.tab)
+                }
+                is VoiceCommandAction.SaveAdventureGame -> {
+                    callbacks.onSaveAdventureGame()
+                }
+                is VoiceCommandAction.CloseAdventureDrawer -> {
+                    callbacks.onCloseAdventureDrawer()
                 }
                 is VoiceCommandAction.None -> false
             }
@@ -518,6 +538,43 @@ class VoiceCommandDispatcher(
                     "rose theme",
                     "color pink"
                 ) -> VoiceCommandAction.SetThemePalette("pink", "rose", "#F48FB1", "Pink")
+
+                normalized in setOf(
+                    "open inventory",
+                    "show inventory",
+                    "view inventory",
+                    "check inventory",
+                    "my inventory",
+                    "inventory"
+                ) -> VoiceCommandAction.OpenAdventureDrawer(AdventureDrawerTab.INVENTORY)
+
+                normalized in setOf(
+                    "check quests",
+                    "show quests",
+                    "open quests",
+                    "view quests",
+                    "quest log",
+                    "open quest log",
+                    "my quests",
+                    "quests"
+                ) -> VoiceCommandAction.OpenAdventureDrawer(AdventureDrawerTab.QUESTS)
+
+                normalized in setOf(
+                    "save game",
+                    "save adventure",
+                    "save campaign",
+                    "save progress",
+                    "quick save"
+                ) -> VoiceCommandAction.SaveAdventureGame
+
+                normalized in setOf(
+                    "close drawer",
+                    "close adventure drawer",
+                    "dismiss drawer",
+                    "hide drawer",
+                    "close inventory",
+                    "close quests"
+                ) -> VoiceCommandAction.CloseAdventureDrawer
 
                 else -> null
             }

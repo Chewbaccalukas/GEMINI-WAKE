@@ -80,6 +80,7 @@ import com.example.voice.HandsFreeVoiceState
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -87,6 +88,7 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -95,14 +97,21 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.unit.LayoutDirection
+import kotlinx.coroutines.launch
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
@@ -491,10 +500,216 @@ fun ChatDetailScreen(
         }
     }
 
-    Scaffold(
-        contentWindowInsets = WindowInsets(0, 0, 0, 0),
-        topBar = {
-            TopAppBar(
+    val adventureScope = rememberCoroutineScope()
+    var fallbackAdventureState by remember(chat.id) {
+        mutableStateOf(com.example.game.AdventureGameState(chatId = chat.id))
+    }
+    val vmAdventureState = viewModel?.adventureState?.collectAsState()?.value
+    val activeAdventureState = vmAdventureState ?: fallbackAdventureState
+
+    val adventureDrawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+
+    // Sync ViewModel drawer open/close state (including voice commands "open inventory", "check quests", "close drawer") with ModalNavigationDrawer
+    LaunchedEffect(activeAdventureState.isDrawerOpen) {
+        if (activeAdventureState.isDrawerOpen && !adventureDrawerState.isOpen) {
+            adventureDrawerState.open()
+        } else if (!activeAdventureState.isDrawerOpen && adventureDrawerState.isOpen) {
+            adventureDrawerState.close()
+        }
+    }
+
+    // Sync manual swipe open/close gestures on ModalNavigationDrawer back to ViewModel
+    LaunchedEffect(adventureDrawerState.currentValue) {
+        val isOpenNow = adventureDrawerState.currentValue == DrawerValue.Open
+        if (viewModel != null) {
+            if (isOpenNow && !activeAdventureState.isDrawerOpen) {
+                viewModel.openAdventureDrawer(activeAdventureState.activeDrawerTab)
+            } else if (!isOpenNow && activeAdventureState.isDrawerOpen) {
+                viewModel.closeAdventureDrawer()
+            }
+        } else {
+            fallbackAdventureState = fallbackAdventureState.copy(isDrawerOpen = isOpenNow)
+        }
+    }
+
+    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+        ModalNavigationDrawer(
+            drawerState = adventureDrawerState,
+            gesturesEnabled = true,
+            drawerContent = {
+                CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                    com.example.ui.components.GameDrawerSheet(
+                        adventureState = activeAdventureState,
+                        accentColor = accentColor,
+                        onSelectTab = { tab ->
+                            if (viewModel != null) {
+                                viewModel.selectAdventureDrawerTab(tab)
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(activeDrawerTab = tab)
+                            }
+                        },
+                        onToggleAdventureMode = { enabled ->
+                            if (viewModel != null) {
+                                viewModel.setAdventureModeEnabled(enabled)
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(isAdventureModeEnabled = enabled)
+                            }
+                        },
+                        onManualSave = {
+                            if (viewModel != null) {
+                                viewModel.saveAdventureGameManually()
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(
+                                    unsavedPlaySeconds = 0L,
+                                    lastSavedAt = System.currentTimeMillis(),
+                                    isSaveSentinelAlertVisible = false,
+                                    statusBannerMessage = "Campaign saved locally"
+                                )
+                            }
+                        },
+                        onSelectDifficulty = { diff ->
+                            if (viewModel != null) {
+                                viewModel.setAdventureDifficulty(diff)
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(
+                                    settings = fallbackAdventureState.settings.copy(difficulty = diff)
+                                )
+                            }
+                        },
+                        onToggleAutoSaveOnQuest = { enabled ->
+                            if (viewModel != null) {
+                                viewModel.setAdventureAutoSaveOnQuest(enabled)
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(
+                                    settings = fallbackAdventureState.settings.copy(autoSaveOnQuest = enabled)
+                                )
+                            }
+                        },
+                        onToggleNotifications = { enabled ->
+                            if (viewModel != null) {
+                                viewModel.setAdventureNotificationsEnabled(enabled)
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(
+                                    settings = fallbackAdventureState.settings.copy(notificationsEnabled = enabled)
+                                )
+                            }
+                        },
+                        onUpdateLoreContext = { lore ->
+                            if (viewModel != null) {
+                                viewModel.updateAdventureLoreContext(lore)
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(
+                                    settings = fallbackAdventureState.settings.copy(loreContext = lore)
+                                )
+                            }
+                        },
+                        onAttachLoreDocument = { uri, mime ->
+                            viewModel?.attachDocumentToAdventure(uri, mime)
+                        },
+                        onUpdateCharacterProfile = { cName, cClass ->
+                            if (viewModel != null) {
+                                viewModel.updateAdventureCharacterProfile(cName, cClass)
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(
+                                    characterName = cName,
+                                    characterClass = cClass
+                                )
+                            }
+                        },
+                        onUpdateCharacterPortrait = { uri ->
+                            if (viewModel != null) {
+                                viewModel.updateAdventureCharacterPortrait(uri)
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(
+                                    characterPortraitUri = uri.toString()
+                                )
+                            }
+                        },
+                        onUseOrInspectItem = { item ->
+                            if (viewModel != null) {
+                                viewModel.useOrInspectAdventureItem(item)
+                            } else {
+                                onSendMessage("[Adventure Action] I use/inspect my ${item.name} (${item.description}).")
+                                fallbackAdventureState = fallbackAdventureState.copy(isDrawerOpen = false)
+                            }
+                            adventureScope.launch { adventureDrawerState.close() }
+                        },
+                        onRollProceduralLoot = {
+                            if (viewModel != null) {
+                                viewModel.rollAndAddProceduralLoot()
+                            } else {
+                                val loot = com.example.game.AdventureEngine.generateProceduralLoot(System.currentTimeMillis())
+                                fallbackAdventureState = fallbackAdventureState.copy(
+                                    inventory = listOf(loot) + fallbackAdventureState.inventory
+                                )
+                            }
+                        },
+                        onToggleQuestCompleted = { questId ->
+                            if (viewModel != null) {
+                                viewModel.toggleAdventureQuestCompleted(questId)
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(
+                                    quests = fallbackAdventureState.quests.map {
+                                        if (it.id == questId) it.copy(isCompleted = !it.isCompleted) else it
+                                    }
+                                )
+                            }
+                        },
+                        onAddCustomQuest = { qTitle, qDesc, qXp ->
+                            if (viewModel != null) {
+                                viewModel.addCustomAdventureQuest(qTitle, qDesc, qXp)
+                            } else {
+                                val newQ = com.example.game.AdventureQuest(
+                                    id = "quest_${System.currentTimeMillis()}",
+                                    title = qTitle,
+                                    description = qDesc,
+                                    isCompleted = false,
+                                    xpReward = qXp
+                                )
+                                fallbackAdventureState = fallbackAdventureState.copy(
+                                    quests = listOf(newQ) + fallbackAdventureState.quests
+                                )
+                            }
+                        },
+                        onSaveGlobalPreset = {
+                            viewModel?.saveAdventureGlobalPreset()
+                        },
+                        onLoadGlobalPreset = {
+                            viewModel?.loadAdventureGlobalPreset()
+                        },
+                        onDismissStatusBanner = {
+                            if (viewModel != null) {
+                                viewModel.dismissAdventureStatusBanner()
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(statusBannerMessage = null)
+                            }
+                        },
+                        onCloseDrawer = {
+                            if (viewModel != null) {
+                                viewModel.closeAdventureDrawer()
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(isDrawerOpen = false)
+                            }
+                            adventureScope.launch { adventureDrawerState.close() }
+                        },
+                        onSelectQuestFilter = { filter ->
+                            if (viewModel != null) {
+                                viewModel.setAdventureQuestFilter(filter)
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(
+                                    settings = fallbackAdventureState.settings.copy(questFilter = filter)
+                                )
+                            }
+                        }
+                    )
+                }
+            }
+        ) {
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                Scaffold(
+                    contentWindowInsets = WindowInsets(0, 0, 0, 0),
+                    topBar = {
+                        TopAppBar(
                 navigationIcon = {
                     IconButton(
                         onClick = onBack,
@@ -718,6 +933,49 @@ fun ChatDetailScreen(
                                         .size(7.dp)
                                         .clip(CircleShape)
                                         .background(Color(0xFF10B981))
+                                )
+                            }
+                        }
+                    }
+
+                    // Header Toggle to Open / Close Infinite Adventure Engine Side Drawer
+                    IconButton(
+                        onClick = {
+                            val nextOpen = !activeAdventureState.isDrawerOpen
+                            if (viewModel != null) {
+                                if (nextOpen) {
+                                    viewModel.openAdventureDrawer()
+                                } else {
+                                    viewModel.closeAdventureDrawer()
+                                }
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(isDrawerOpen = nextOpen)
+                            }
+                            adventureScope.launch {
+                                if (nextOpen) adventureDrawerState.open() else adventureDrawerState.close()
+                            }
+                        },
+                        modifier = Modifier.testTag("chat_header_adventure_drawer_button")
+                    ) {
+                        Box(contentAlignment = Alignment.TopEnd) {
+                            Icon(
+                                imageVector = Icons.Default.AutoAwesome,
+                                contentDescription = "Toggle Infinite Adventure Engine Drawer",
+                                tint = if (activeAdventureState.isAdventureModeEnabled || activeAdventureState.isDrawerOpen) {
+                                    accentColor
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            )
+                            if (activeAdventureState.isAdventureModeEnabled || activeAdventureState.isSaveSentinelAlertVisible) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(7.dp)
+                                        .clip(CircleShape)
+                                        .background(
+                                            if (activeAdventureState.isSaveSentinelAlertVisible) Color(0xFFF59E0B)
+                                            else Color(0xFF10B981)
+                                        )
                                 )
                             }
                         }
@@ -1376,6 +1634,80 @@ fun ChatDetailScreen(
                 )
             }
 
+            // 20-Minute Save Sentinel In-App Quick Save Snackbar Banner
+            AnimatedVisibility(
+                visible = activeAdventureState.isSaveSentinelAlertVisible,
+                enter = fadeIn() + slideInVertically { -it / 2 },
+                exit = fadeOut() + slideOutVertically { -it / 2 }
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = Color(0xFF1E293B),
+                    border = androidx.compose.foundation.BorderStroke(1.5.dp, Color(0xFFF59E0B)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 6.dp)
+                        .testTag("adventure_save_sentinel_snackbar")
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Save Sentinel: 20+ Mins Unsaved Campaign",
+                                style = MaterialTheme.typography.labelLarge.copy(
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = Color(0xFFFBBF24)
+                                )
+                            )
+                            Text(
+                                text = "Save your Level ${activeAdventureState.level} progress now or say \"save game\".",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFFE2E8F0)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        FilledTonalButton(
+                            onClick = {
+                                if (viewModel != null) {
+                                    viewModel.saveAdventureGameManually()
+                                } else {
+                                    fallbackAdventureState = fallbackAdventureState.copy(
+                                        unsavedPlaySeconds = 0L,
+                                        lastSavedAt = System.currentTimeMillis(),
+                                        isSaveSentinelAlertVisible = false
+                                    )
+                                }
+                            },
+                            modifier = Modifier.testTag("adventure_snackbar_quick_save_button")
+                        ) {
+                            Text("Quick Save", fontWeight = FontWeight.Bold)
+                        }
+                        IconButton(
+                            onClick = {
+                                if (viewModel != null) {
+                                    viewModel.dismissAdventureSaveSentinelAlert()
+                                } else {
+                                    fallbackAdventureState = fallbackAdventureState.copy(isSaveSentinelAlertVisible = false)
+                                }
+                            },
+                            modifier = Modifier.size(28.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Dismiss Save Sentinel",
+                                tint = Color(0xFF94A3B8),
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
             // Message List (Maximized Vertical Viewport with SelectionContainer Handle Clearance)
             LazyColumn(
                 state = listState,
@@ -1438,6 +1770,17 @@ fun ChatDetailScreen(
                         },
                         onOpenLink = { url, label ->
                             onOpenChatLink(url, label)
+                        },
+                        onOpenAdventureTab = { targetTab ->
+                            if (viewModel != null) {
+                                viewModel.openAdventureDrawer(targetTab)
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(
+                                    isDrawerOpen = true,
+                                    activeDrawerTab = targetTab
+                                )
+                            }
+                            adventureScope.launch { adventureDrawerState.open() }
                         }
                     )
                 }
@@ -1559,6 +1902,9 @@ fun ChatDetailScreen(
             )
         }
     }
+            }
+        }
+    }
 }
 
 @Composable
@@ -1567,9 +1913,13 @@ fun ChatMessageBubble(
     messageCategory: String? = null,
     onCopy: () -> Unit,
     onSpeak: () -> Unit,
-    onOpenLink: (String, String?) -> Unit = { _, _ -> }
+    onOpenLink: (String, String?) -> Unit = { _, _ -> },
+    onOpenAdventureTab: (com.example.game.AdventureDrawerTab) -> Unit = {}
 ) {
     val isUser = message.sender == "user"
+    val parsedAdventure = remember(message.content) {
+        com.example.game.AdventureEngine.parseInlineMarkers(message.content)
+    }
     val extractedLinks = remember(message.content) {
         WebLinkHistoryManager.extractLinksFromText(message.content)
     }
@@ -1853,13 +2203,22 @@ fun ChatMessageBubble(
                         Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
                             // Markdown prose, lists, inline styles & fenced code blocks inside parent SelectionContainer
                             MarkdownMessageContent(
-                                content = message.content,
+                                content = parsedAdventure.cleanedText,
                                 textColor = MaterialTheme.colorScheme.onSurfaceVariant,
                                 linkColor = MaterialTheme.colorScheme.primary,
                                 messageId = message.id,
                                 onOpenLink = onOpenLink,
                                 wrapInSelectionContainer = false
                             )
+
+                            if (parsedAdventure.events.isNotEmpty()) {
+                                DisableSelection {
+                                    com.example.ui.components.AdventureInlineEventBadges(
+                                        events = parsedAdventure.events,
+                                        onOpenDrawerToTab = onOpenAdventureTab
+                                    )
+                                }
+                            }
 
                             if (extractedLinks.isNotEmpty()) {
                                 DisableSelection {

@@ -129,6 +129,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val wakeWordRepository: WakeWordRepository by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         WakeWordRepository(database.wakeWordDao(), database.chatDao())
     }
+    val adventureGameDao: com.example.game.AdventureGameDao by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+        database.adventureGameDao()
+    }
+    private val _adventureState = MutableStateFlow(com.example.game.AdventureGameState())
+    val adventureState: StateFlow<com.example.game.AdventureGameState> = _adventureState.asStateFlow()
+    private var adventureSaveSentinelJob: kotlinx.coroutines.Job? = null
     val firebaseSyncRepository: FirebaseSyncRepository? by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         isFirebaseSyncInitialized = true
         try {
@@ -735,6 +741,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _pendingWakeQuery.value = null
         _currentDraftText.value = ""
         _wakeConversationSummary.value = null
+        if (chatId != null && chatId > 0L) {
+            loadAdventureStateForChat(chatId)
+        }
     }
 
     internal fun setPermissionGrantedOverrideForTest(granted: Boolean?) {
@@ -1064,6 +1073,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 context = getApplication(),
                 rawUrlOrQuery = urlOrQuery
             )
+        }
+
+        override fun onOpenAdventureDrawer(tab: com.example.game.AdventureDrawerTab): Boolean {
+            openAdventureDrawer(tab)
+            wakeWordManager.setStatusMessage("Opened Adventure ${tab.title}")
+            return true
+        }
+
+        override fun onSaveAdventureGame(): Boolean {
+            saveAdventureGameManually()
+            wakeWordManager.setStatusMessage("Adventure game saved locally & synced")
+            return true
+        }
+
+        override fun onCloseAdventureDrawer(): Boolean {
+            closeAdventureDrawer()
+            wakeWordManager.setStatusMessage("Closed Adventure Drawer")
+            return true
         }
 
         override fun onCommandCompletedAndRearm(
@@ -3278,6 +3305,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _activeTimerChatIds.value = setOf(chatId)
             _liveTrackedSeconds.update { it + (chatId to 0L) }
             startTickerIfNeeded()
+            loadAdventureStateForChat(chatId)
 
             viewModelScope.launch(Dispatchers.IO) {
                 if (_cloudBackupChats.value.isNotEmpty()) {
@@ -4162,7 +4190,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
                 // 2. Fetch current chat details for system instruction and full chronological message history
                 val chat = repository.getChatByIdSync(resolvedChatId)
-                val systemPrompt = chat?.systemInstruction ?: "You are Gemini, an intelligent and helpful AI assistant."
+                val baseSystemPrompt = chat?.systemInstruction ?: "You are Gemini, an intelligent and helpful AI assistant."
+                val currentAdvState = _adventureState.value
+                val systemPrompt = if (currentAdvState.isAdventureModeEnabled) {
+                    com.example.game.AdventureEngine.buildGameMasterSystemPrompt(
+                        baseSystemInstruction = baseSystemPrompt,
+                        state = currentAdvState
+                    )
+                } else {
+                    baseSystemPrompt
+                }
                 val history = withContext(Dispatchers.IO) {
                     messageRepository.getMessagesForChatSync(resolvedChatId)
                         .filter { it.id != userMsgId && !it.isDeleted }
@@ -4197,6 +4234,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
                 val finalAnswer = fullResponse.toString().trim()
                 if (finalAnswer.isNotEmpty() && _currentChatId.value == resolvedChatId) {
+                    val parsedAdventure = com.example.game.AdventureEngine.parseInlineMarkers(finalAnswer)
+                    if (parsedAdventure.events.isNotEmpty()) {
+                        applyInlineAdventureEvents(parsedAdventure.events)
+                    }
                     val aiMsg = ChatMessage(
                         chatId = resolvedChatId,
                         sender = "gemini",
@@ -5520,6 +5561,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         try {
             uiMicDebounceJob?.cancel()
             uiMicDebounceJob = null
+            adventureSaveSentinelJob?.cancel()
+            adventureSaveSentinelJob = null
             timerTickerJob?.cancel()
             cloudSyncJob?.cancel()
             voiceNavigationSettleJob?.cancel()
@@ -5746,8 +5789,478 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // =========================================================================
+    // Gemini's Infinite Adventure Engine — RPG State, Procedural Loot & Sentinel
+    // =========================================================================
+
+    /**
+     * Generates a deterministic procedural [com.example.game.InventoryItem] using a seeded RNG
+     * across fantasy and sci-fi item pools with weighted rarity colors.
+     */
+    fun generateProceduralLoot(seed: Long = System.currentTimeMillis()): com.example.game.InventoryItem {
+        return com.example.game.AdventureEngine.generateProceduralLoot(seed)
+    }
+
+    /**
+     * Generates procedural loot from [seed] and adds it directly to the active campaign inventory.
+     */
+    fun rollAndAddProceduralLoot(seed: Long = System.currentTimeMillis()): com.example.game.InventoryItem {
+        val loot = generateProceduralLoot(seed)
+        _adventureState.update { current ->
+            val updatedList = current.inventory.toMutableList()
+            val existingIdx = updatedList.indexOfFirst {
+                it.id.equals(loot.id, ignoreCase = true) || it.name.equals(loot.name, ignoreCase = true)
+            }
+            if (existingIdx >= 0) {
+                val existing = updatedList[existingIdx]
+                updatedList[existingIdx] = existing.copy(quantity = existing.quantity + loot.quantity)
+            } else {
+                updatedList.add(0, loot)
+            }
+            current.copy(
+                inventory = updatedList,
+                statusBannerMessage = "Rolled ${loot.rarityLabel} Loot: ${loot.name} (x${loot.quantity})"
+            )
+        }
+        persistCurrentAdventureStateAsync()
+        return loot
+    }
+
+    /**
+     * Reads plain text, Markdown (`.md`), JSON, or extracts readable text from attached PDF documents
+     * to dynamically inject custom lore into the Gemini Adventure Engine system prompt context.
+     */
+    fun attachDocumentToAdventure(uri: Uri, mimeType: String? = null) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val app = getApplication<Application>()
+                val extractedLore = com.example.game.AdventureEngine.extractLoreFromDocument(
+                    context = app,
+                    uri = uri,
+                    mimeType = mimeType
+                )
+                val fileName = resolveDisplayFileName(app, uri) ?: "lore_document.txt"
+                if (extractedLore.isNotBlank()) {
+                    _adventureState.update { current ->
+                        val mergedLore = if (current.settings.loreContext.isBlank()) {
+                            "--- [$fileName] ---\n$extractedLore"
+                        } else {
+                            "${current.settings.loreContext.trim()}\n\n--- [$fileName] ---\n$extractedLore"
+                        }.take(16_000)
+                        val updatedFiles = (current.attachedLoreFileNames + fileName).distinct()
+                        current.copy(
+                            isAdventureModeEnabled = true,
+                            settings = current.settings.copy(loreContext = mergedLore),
+                            attachedLoreFileNames = updatedFiles,
+                            statusBannerMessage = "Injected lore from $fileName (${extractedLore.length} chars)"
+                        )
+                    }
+                    persistCurrentAdventureStateSuspend()
+                } else {
+                    _adventureState.update { current ->
+                        current.copy(statusBannerMessage = "Could not extract readable text from $fileName")
+                    }
+                }
+            } catch (e: Exception) {
+                _adventureState.update { current ->
+                    current.copy(statusBannerMessage = "Lore import error: ${e.message ?: "unknown"}")
+                }
+            }
+        }
+    }
+
+    private fun resolveDisplayFileName(context: android.content.Context, uri: Uri): String? {
+        return try {
+            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (nameIndex >= 0 && cursor.moveToFirst()) {
+                    cursor.getString(nameIndex)
+                } else null
+            } ?: uri.lastPathSegment
+        } catch (_: Exception) {
+            uri.lastPathSegment
+        }
+    }
+
+    fun loadAdventureStateForChat(chatId: Long) {
+        if (chatId <= 0L) return
+        val currentDrawerOpen = if (_adventureState.value.chatId == chatId) _adventureState.value.isDrawerOpen else false
+        val currentTab = _adventureState.value.activeDrawerTab
+        viewModelScope.launch(Dispatchers.IO) {
+            val savedEntity = runCatching { adventureGameDao.getStateForChatSync(chatId) }.getOrNull()
+            val presetEntity = if (savedEntity == null) {
+                runCatching {
+                    adventureGameDao.getStateForChatSync(com.example.game.AdventureGameState.GLOBAL_PRESET_CHAT_ID)
+                }.getOrNull()
+            } else null
+
+            val resolvedState = when {
+                savedEntity != null -> savedEntity.toDomainState(
+                    isDrawerOpen = currentDrawerOpen,
+                    activeDrawerTab = currentTab,
+                    unsavedPlaySeconds = 0L
+                )
+                presetEntity != null -> presetEntity.copy(chatId = chatId).toDomainState(
+                    isDrawerOpen = currentDrawerOpen,
+                    activeDrawerTab = currentTab,
+                    unsavedPlaySeconds = 0L
+                )
+                else -> com.example.game.AdventureGameState(
+                    chatId = chatId,
+                    isDrawerOpen = currentDrawerOpen,
+                    activeDrawerTab = currentTab
+                )
+            }
+            _adventureState.value = resolvedState
+            startAdventureSaveSentinelTicker()
+        }
+    }
+
+    private fun startAdventureSaveSentinelTicker() {
+        if (adventureSaveSentinelJob?.isActive == true) return
+        adventureSaveSentinelJob = viewModelScope.launch {
+            while (isActive) {
+                kotlinx.coroutines.delay(1_000L)
+                val current = _adventureState.value
+                if (current.chatId > 0L && (current.isAdventureModeEnabled || current.isDrawerOpen)) {
+                    incrementAdventurePlaySeconds(1L)
+                }
+            }
+        }
+    }
+
+    internal fun advanceAdventurePlayTimerSecondsForTest(seconds: Long) {
+        incrementAdventurePlaySeconds(seconds)
+    }
+
+    private fun incrementAdventurePlaySeconds(deltaSeconds: Long) {
+        if (deltaSeconds <= 0L) return
+        var shouldNotify = false
+        var snapshotForNotification: com.example.game.AdventureGameState? = null
+        _adventureState.update { current ->
+            val nextSeconds = current.unsavedPlaySeconds + deltaSeconds
+            val crossedThreshold =
+                nextSeconds >= com.example.game.AdventureGameState.SAVE_SENTINEL_THRESHOLD_SECONDS &&
+                    !current.isSaveSentinelAlertVisible
+            val updated = current.copy(
+                unsavedPlaySeconds = nextSeconds,
+                isSaveSentinelAlertVisible = current.isSaveSentinelAlertVisible ||
+                    nextSeconds >= com.example.game.AdventureGameState.SAVE_SENTINEL_THRESHOLD_SECONDS
+            )
+            if (crossedThreshold) {
+                shouldNotify = true
+                snapshotForNotification = updated
+            }
+            updated
+        }
+        if (shouldNotify && snapshotForNotification != null) {
+            com.example.game.AdventureEngine.postSaveSentinelNotification(
+                context = getApplication(),
+                state = snapshotForNotification!!
+            )
+        }
+    }
+
+    fun openAdventureDrawer(tab: com.example.game.AdventureDrawerTab = _adventureState.value.activeDrawerTab) {
+        _adventureState.update { current ->
+            val effectiveChatId = current.chatId.takeIf { it > 0L } ?: _currentChatId.value ?: 1L
+            current.copy(
+                chatId = effectiveChatId,
+                isDrawerOpen = true,
+                activeDrawerTab = tab
+            )
+        }
+        startAdventureSaveSentinelTicker()
+    }
+
+    fun closeAdventureDrawer() {
+        _adventureState.update { current ->
+            current.copy(isDrawerOpen = false)
+        }
+    }
+
+    fun selectAdventureDrawerTab(tab: com.example.game.AdventureDrawerTab) {
+        _adventureState.update { current ->
+            current.copy(activeDrawerTab = tab)
+        }
+    }
+
+    fun setAdventureModeEnabled(enabled: Boolean) {
+        _adventureState.update { current ->
+            current.copy(
+                isAdventureModeEnabled = enabled,
+                statusBannerMessage = if (enabled) {
+                    "Adventure Mode ON — Game Master context active"
+                } else {
+                    "Adventure Mode paused"
+                }
+            )
+        }
+        persistCurrentAdventureStateAsync()
+        if (enabled) {
+            startAdventureSaveSentinelTicker()
+        }
+    }
+
+    fun setAdventureDifficulty(difficulty: com.example.game.DifficultyLevel) {
+        _adventureState.update { current ->
+            current.copy(
+                settings = current.settings.copy(difficulty = difficulty),
+                statusBannerMessage = "Difficulty set to ${difficulty.displayName}"
+            )
+        }
+        persistCurrentAdventureStateAsync()
+    }
+
+    fun setAdventureQuestFilter(filter: com.example.game.QuestFilterMode) {
+        _adventureState.update { current ->
+            current.copy(
+                settings = current.settings.copy(questFilter = filter)
+            )
+        }
+        persistCurrentAdventureStateAsync()
+    }
+
+    fun setAdventureAutoSaveOnQuest(enabled: Boolean) {
+        _adventureState.update { current ->
+            current.copy(
+                settings = current.settings.copy(autoSaveOnQuest = enabled)
+            )
+        }
+        persistCurrentAdventureStateAsync()
+    }
+
+    fun setAdventureNotificationsEnabled(enabled: Boolean) {
+        _adventureState.update { current ->
+            current.copy(
+                settings = current.settings.copy(notificationsEnabled = enabled)
+            )
+        }
+        persistCurrentAdventureStateAsync()
+    }
+
+    fun updateAdventureLoreContext(loreContext: String) {
+        _adventureState.update { current ->
+            current.copy(
+                settings = current.settings.copy(loreContext = loreContext)
+            )
+        }
+        persistCurrentAdventureStateAsync()
+    }
+
+    fun updateAdventureCharacterProfile(name: String, characterClass: String) {
+        _adventureState.update { current ->
+            current.copy(
+                characterName = name.ifBlank { "Aether Vanguard" },
+                characterClass = characterClass.ifBlank { "Chrono-Wayfarer" }
+            )
+        }
+        persistCurrentAdventureStateAsync()
+    }
+
+    fun updateAdventureCharacterPortrait(uri: Uri) {
+        _adventureState.update { current ->
+            current.copy(
+                characterPortraitUri = uri.toString(),
+                statusBannerMessage = "Updated character portrait"
+            )
+        }
+        persistCurrentAdventureStateAsync()
+    }
+
+    fun toggleAdventureQuestCompleted(questId: String) {
+        var newlyCompleted = false
+        _adventureState.update { current ->
+            var xpDelta = 0
+            val updatedQuests = current.quests.map { q ->
+                if (q.id == questId) {
+                    val nextCompleted = !q.isCompleted
+                    if (nextCompleted) {
+                        newlyCompleted = true
+                        xpDelta += q.xpReward
+                    } else {
+                        xpDelta -= q.xpReward
+                    }
+                    q.copy(isCompleted = nextCompleted)
+                } else {
+                    q
+                }
+            }
+            current.copy(
+                quests = updatedQuests,
+                totalXp = (current.totalXp + xpDelta).coerceAtLeast(0),
+                statusBannerMessage = if (newlyCompleted) {
+                    "Quest Completed! Auto-saved campaign progress."
+                } else {
+                    "Quest marked active."
+                }
+            )
+        }
+        if (newlyCompleted && _adventureState.value.settings.autoSaveOnQuest) {
+            saveAdventureGameManually(isAutoSave = true)
+        } else {
+            persistCurrentAdventureStateAsync()
+        }
+    }
+
+    fun addCustomAdventureQuest(title: String, description: String, xpReward: Int = 200) {
+        if (title.isBlank()) return
+        val newQuest = com.example.game.AdventureQuest(
+            id = "quest_${System.currentTimeMillis()}",
+            title = title.trim(),
+            description = description.trim().ifBlank { "Fulfill this campaign objective." },
+            isCompleted = false,
+            xpReward = xpReward.coerceAtLeast(25)
+        )
+        _adventureState.update { current ->
+            current.copy(
+                quests = listOf(newQuest) + current.quests,
+                statusBannerMessage = "Added Quest: ${newQuest.title}"
+            )
+        }
+        persistCurrentAdventureStateAsync()
+    }
+
+    fun useOrInspectAdventureItem(item: com.example.game.InventoryItem) {
+        val isConsumable = item.category.equals("Consumable", ignoreCase = true)
+        _adventureState.update { current ->
+            val updatedInventory = if (isConsumable) {
+                current.inventory.mapNotNull { existing ->
+                    if (existing.id == item.id) {
+                        if (existing.quantity > 1) existing.copy(quantity = existing.quantity - 1) else null
+                    } else existing
+                }
+            } else {
+                current.inventory
+            }
+            current.copy(
+                isAdventureModeEnabled = true,
+                isDrawerOpen = false,
+                inventory = updatedInventory,
+                statusBannerMessage = if (isConsumable) {
+                    "Used ${item.name}"
+                } else {
+                    "Inspecting ${item.name} in chat..."
+                }
+            )
+        }
+        persistCurrentAdventureStateAsync()
+        val actionPrompt = if (isConsumable) {
+            "[Adventure Action] I use my ${item.name} (${item.description}). How does this affect my current situation?"
+        } else {
+            "[Adventure Action] I inspect and equip my ${item.name} (${item.description}). What hidden details or tactical options does it reveal?"
+        }
+        sendMessage(text = actionPrompt, triggeredByWakeWord = false)
+    }
+
+    fun applyInlineAdventureEvents(events: List<com.example.game.AdventureInlineEvent>) {
+        if (events.isEmpty()) return
+        var questCompleted = false
+        _adventureState.update { current ->
+            val (updated, completedAny) = com.example.game.AdventureEngine.applyInlineEventsToState(current, events)
+            questCompleted = completedAny
+            updated
+        }
+        if (questCompleted && _adventureState.value.settings.autoSaveOnQuest) {
+            saveAdventureGameManually(isAutoSave = true)
+        } else {
+            persistCurrentAdventureStateAsync()
+        }
+    }
+
+    fun saveAdventureGameManually(isAutoSave: Boolean = false) {
+        val now = System.currentTimeMillis()
+        val targetChatId = (_adventureState.value.chatId.takeIf { it > 0L } ?: _currentChatId.value ?: 1L)
+        _adventureState.update { current ->
+            current.copy(
+                chatId = targetChatId,
+                unsavedPlaySeconds = 0L,
+                lastSavedAt = now,
+                isSaveSentinelAlertVisible = false,
+                statusBannerMessage = if (isAutoSave) {
+                    "Auto-saved campaign on quest completion"
+                } else {
+                    "Campaign saved locally & queued for cloud sync"
+                }
+            )
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            persistCurrentAdventureStateSuspend()
+            if (targetChatId > 0L) {
+                syncChatToCloudIfSignedIn(targetChatId)
+            }
+        }
+    }
+
+    fun saveAdventureGlobalPreset() {
+        val now = System.currentTimeMillis()
+        _adventureState.update { current ->
+            current.copy(
+                lastSavedAt = now,
+                statusBannerMessage = "Saved current campaign as Global Preset"
+            )
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val presetEntity = _adventureState.value.toEntity(
+                    targetChatId = com.example.game.AdventureGameState.GLOBAL_PRESET_CHAT_ID
+                )
+                adventureGameDao.upsertState(presetEntity)
+            }
+        }
+    }
+
+    fun loadAdventureGlobalPreset() {
+        val activeChatId = _adventureState.value.chatId.takeIf { it > 0L } ?: _currentChatId.value ?: 1L
+        viewModelScope.launch(Dispatchers.IO) {
+            val preset = runCatching {
+                adventureGameDao.getStateForChatSync(com.example.game.AdventureGameState.GLOBAL_PRESET_CHAT_ID)
+            }.getOrNull()
+            if (preset != null) {
+                val restored = preset.copy(chatId = activeChatId).toDomainState(
+                    isDrawerOpen = _adventureState.value.isDrawerOpen,
+                    activeDrawerTab = _adventureState.value.activeDrawerTab,
+                    unsavedPlaySeconds = 0L
+                ).copy(statusBannerMessage = "Loaded Global Campaign Preset")
+                _adventureState.value = restored
+                persistCurrentAdventureStateSuspend()
+            } else {
+                _adventureState.update { current ->
+                    current.copy(statusBannerMessage = "No Global Preset saved yet — tap Save Preset first")
+                }
+            }
+        }
+    }
+
+    fun dismissAdventureSaveSentinelAlert() {
+        _adventureState.update { current ->
+            current.copy(isSaveSentinelAlertVisible = false)
+        }
+    }
+
+    fun dismissAdventureStatusBanner() {
+        _adventureState.update { current ->
+            current.copy(statusBannerMessage = null)
+        }
+    }
+
+    private fun persistCurrentAdventureStateAsync() {
+        viewModelScope.launch(Dispatchers.IO) {
+            persistCurrentAdventureStateSuspend()
+        }
+    }
+
+    private suspend fun persistCurrentAdventureStateSuspend() {
+        runCatching {
+            val snapshot = _adventureState.value
+            val targetChatId = snapshot.chatId.takeIf { it > 0L } ?: _currentChatId.value ?: 1L
+            adventureGameDao.upsertState(snapshot.toEntity(targetChatId = targetChatId))
+        }
+    }
+
     override fun onCleared() {
         super.onCleared()
+        adventureSaveSentinelJob?.cancel()
         timerTickerJob?.cancel()
         destroySpeechRecognizerInternal()
         localSyncServer.stop()

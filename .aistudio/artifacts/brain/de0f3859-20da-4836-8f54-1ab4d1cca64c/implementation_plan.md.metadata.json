@@ -1,6 +1,6 @@
 {
-  "summary":  "Implementation plan for v13.0 to preserve all v10.2/v10.3 microphone and wake-word handoff fixes while stripping all widget and secondary/debug exported launcher activities from AndroidManifest.xml and verifying via Robolectric tests.",
-  "updatedAt":  "2026-11-09T03:40:38.823366981Z",
+  "summary":  "Implementation plan for adding the Quest Filter Toggle ('All', 'Active', 'Completed' with live count badges and persisted selection) and the Visual Rarity Glow Indicator System (Common: Grey, Rare: Blue, Epic: Purple, Legendary: Orange, with an animated pulsing aura on Epic and Legendary items and a static outer glow on Common and Rare items) in the Adventure Engine drawer.",
+  "updatedAt":  "2026-11-09T12:33:43.110039844Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

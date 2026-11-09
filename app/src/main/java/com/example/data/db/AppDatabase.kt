@@ -18,6 +18,8 @@ import com.example.data.model.TriggerType
 import com.example.data.model.VoiceCommandEntity
 import com.example.data.model.WakeWord
 import com.example.data.model.WakeWordSample
+import com.example.game.AdventureGameDao
+import com.example.game.AdventureGameEntity
 import com.example.ui.theme.AppTheme
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -34,6 +36,7 @@ import kotlinx.coroutines.launch
  * - [WakeWord] (`wake_words` table)
  * - [WakeWordSample] (`wake_word_samples` table)
  * - [VoiceCommandEntity] (`voice_command_history` table)
+ * - [AdventureGameEntity] (`adventure_game_states` table)
  */
 @Database(
     entities = [
@@ -41,9 +44,10 @@ import kotlinx.coroutines.launch
         ChatMessage::class,
         WakeWordSample::class,
         WakeWord::class,
-        VoiceCommandEntity::class
+        VoiceCommandEntity::class,
+        AdventureGameEntity::class
     ],
-    version = 18,
+    version = 19,
     exportSchema = false
 )
 @TypeConverters(AppDatabase.Converters::class)
@@ -52,6 +56,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun chatDao(): ChatDao
     abstract fun messageDao(): MessageDao
     abstract fun wakeWordDao(): WakeWordDao
+    abstract fun adventureGameDao(): AdventureGameDao
 
     class Converters {
         @TypeConverter
@@ -292,6 +297,28 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_18_19 = object : Migration(18, 19) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `adventure_game_states` (
+                        `chatId` INTEGER NOT NULL PRIMARY KEY,
+                        `isAdventureModeEnabled` INTEGER NOT NULL DEFAULT 0,
+                        `questsJson` TEXT NOT NULL DEFAULT '[]',
+                        `inventoryJson` TEXT NOT NULL DEFAULT '[]',
+                        `settingsJson` TEXT NOT NULL DEFAULT '{}',
+                        `characterName` TEXT NOT NULL DEFAULT 'Aether Vanguard',
+                        `characterClass` TEXT NOT NULL DEFAULT 'Chrono-Wayfarer',
+                        `characterPortraitUri` TEXT,
+                        `attachedLoreFilesJson` TEXT NOT NULL DEFAULT '[]',
+                        `totalXp` INTEGER NOT NULL DEFAULT 150,
+                        `lastSavedAt` INTEGER NOT NULL DEFAULT 0
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
         val ALL_MIGRATIONS: Array<Migration> = arrayOf(
             MIGRATION_1_2,
             MIGRATION_2_3,
@@ -308,7 +335,8 @@ abstract class AppDatabase : RoomDatabase() {
             MIGRATION_14_15,
             MIGRATION_15_16,
             MIGRATION_16_17,
-            MIGRATION_17_18
+            MIGRATION_17_18,
+            MIGRATION_18_19
         )
 
         private val queryExecutor by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
@@ -371,12 +399,17 @@ abstract class AppDatabase : RoomDatabase() {
             return builder.build()
         }
 
+        @Volatile
+        private var populateJob: kotlinx.coroutines.Job? = null
+
         /**
          * Closes and resets the singleton [INSTANCE] reference for isolated test teardown.
          */
         fun clearInstanceForTesting() {
             synchronized(this) {
-                INSTANCE?.close()
+                populateJob?.cancel()
+                populateJob = null
+                runCatching { INSTANCE?.close() }
                 INSTANCE = null
             }
         }
@@ -387,8 +420,12 @@ abstract class AppDatabase : RoomDatabase() {
             override fun onCreate(db: SupportSQLiteDatabase) {
                 super.onCreate(db)
                 INSTANCE?.let { database ->
-                    scope.launch(Dispatchers.IO) {
-                        populateInitialData(database.chatDao(), database.wakeWordDao())
+                    populateJob = scope.launch(Dispatchers.IO) {
+                        runCatching {
+                            if (database.isOpen) {
+                                populateInitialData(database.chatDao(), database.wakeWordDao())
+                            }
+                        }
                     }
                 }
             }
