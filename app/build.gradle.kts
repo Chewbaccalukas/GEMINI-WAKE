@@ -17,8 +17,8 @@ android {
     applicationId = "com.aistudio.geminiwake.vztrkq"
     minSdk = 24
     targetSdk = 36
-    versionCode = 13
-    versionName = "13.0"
+    versionCode = 14
+    versionName = "14.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
