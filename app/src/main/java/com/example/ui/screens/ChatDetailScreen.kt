@@ -700,6 +700,87 @@ fun ChatDetailScreen(
                                     settings = fallbackAdventureState.settings.copy(questFilter = filter)
                                 )
                             }
+                        },
+                        onSelectQuestSortOrder = { sortOrder ->
+                            if (viewModel != null) {
+                                viewModel.setAdventureQuestSortOrder(sortOrder)
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(
+                                    settings = fallbackAdventureState.settings.copy(questSortOrder = sortOrder)
+                                )
+                            }
+                        },
+                        onQuestSearchQueryChange = { query ->
+                            if (viewModel != null) {
+                                viewModel.setAdventureQuestSearchQuery(query)
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(questSearchQuery = query)
+                            }
+                        },
+                        onIncrementQuestStep = { questId ->
+                            if (viewModel != null) {
+                                viewModel.incrementAdventureQuestStep(questId)
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(
+                                    quests = fallbackAdventureState.quests.map { q ->
+                                        if (q.id == questId && !q.isCompleted) {
+                                            val next = (q.safeCurrentStep + 1).coerceAtMost(q.safeTotalSteps)
+                                            q.copy(
+                                                currentStep = next,
+                                                isCompleted = next >= q.safeTotalSteps
+                                            )
+                                        } else q
+                                    }
+                                )
+                            }
+                        },
+                        onShareQuestProgressImage = {
+                            if (viewModel != null) {
+                                viewModel.shareAdventureQuestProgressImage(context)
+                            } else {
+                                com.example.game.AdventureEngine.shareQuestProgressSummaryImage(
+                                    context = context,
+                                    state = activeAdventureState
+                                )
+                            }
+                        },
+                        onRefreshDailyChallenge = {
+                            viewModel?.ensureDailyChallengeQuest()
+                        },
+                        onAddCustomQuestDetailed = { qTitle, qDesc, qXp, qSteps, qPriority ->
+                            if (viewModel != null) {
+                                viewModel.addCustomAdventureQuest(
+                                    title = qTitle,
+                                    description = qDesc,
+                                    xpReward = qXp,
+                                    totalSteps = qSteps,
+                                    priority = qPriority
+                                )
+                            } else {
+                                val newQ = com.example.game.AdventureQuest(
+                                    id = "quest_${System.currentTimeMillis()}",
+                                    title = qTitle,
+                                    description = qDesc,
+                                    isCompleted = false,
+                                    xpReward = qXp,
+                                    currentStep = 0,
+                                    totalSteps = qSteps.coerceAtLeast(1),
+                                    priority = qPriority
+                                )
+                                fallbackAdventureState = fallbackAdventureState.copy(
+                                    quests = listOf(newQ) + fallbackAdventureState.quests
+                                )
+                            }
+                        },
+                        onToggleStealthMode = { enabled ->
+                            if (viewModel != null) {
+                                viewModel.setAdventureStealthMode(enabled)
+                            } else {
+                                fallbackAdventureState = fallbackAdventureState.copy(
+                                    isStealthMode = enabled,
+                                    isOnline = !enabled
+                                )
+                            }
                         }
                     )
                 }
@@ -766,6 +847,25 @@ fun ChatDetailScreen(
                                         color = if (activeKeyType == ActiveKeyType.PRIMARY) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onTertiaryContainer
                                     )
                                 }
+
+                                // Top Navigation Bar Sync Mode Indicator ('Online Sync' vs 'Offline Cache')
+                                Spacer(modifier = Modifier.width(4.dp))
+                                val globalOfflineQueueing by com.example.util.AppSettingsManager.offlineQuestQueueingEnabled.collectAsState()
+                                val isOfflineCacheMode = activeAdventureState.offlineQueueingModeEnabled || globalOfflineQueueing
+                                com.example.ui.components.TopBarSyncModeStatusIndicator(
+                                    isOfflineCacheMode = isOfflineCacheMode,
+                                    pendingQueuedCount = activeAdventureState.pendingOfflineSyncCount,
+                                    onToggleMode = {
+                                        if (viewModel != null) {
+                                            viewModel.toggleOfflineQuestQueueingMode()
+                                        } else {
+                                            val next = !isOfflineCacheMode
+                                            com.example.util.AppSettingsManager.setOfflineQuestQueueingEnabled(context, next)
+                                            com.example.game.AdventureEngine.playSyncModeSwitchHaptic(context, next)
+                                        }
+                                    },
+                                    testTag = "chat_top_bar_sync_mode_indicator"
+                                )
 
                                 if (isPinnedChat) {
                                     Spacer(modifier = Modifier.width(4.dp))

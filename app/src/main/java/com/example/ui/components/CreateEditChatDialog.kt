@@ -154,6 +154,24 @@ fun CreateEditChatDialog(
         mutableStateOf(initialTags)
     }
     var customTagInput by remember { mutableStateOf("") }
+    var selectedPriority by remember(initialChat?.id) {
+        mutableStateOf(
+            if (initialChat != null && initialChat.id > 0L) {
+                com.example.util.AppSettingsManager.getChatPriorityLevel(context, initialChat.id)
+            } else {
+                com.example.util.ChatPriorityLevel.NORMAL
+            }
+        )
+    }
+    var selectedAvatar by remember(initialChat?.id) {
+        mutableStateOf(
+            if (initialChat != null && initialChat.id > 0L) {
+                com.example.util.AppSettingsManager.getChatProfileAvatar(context, initialChat.id)
+            } else {
+                com.example.util.AppSettingsManager.BUILT_IN_PROFILE_AVATARS.first()
+            }
+        )
+    }
 
     var titleError by remember { mutableStateOf(false) }
     var wakeWordError by remember { mutableStateOf(false) }
@@ -163,7 +181,7 @@ fun CreateEditChatDialog(
         onDismissRequest = onDismiss,
         title = {
             Text(
-                text = if (initialChat == null) "New Gemini Chat" else "Edit Chat & Wake Word",
+                text = if (initialChat == null) "New Gemini Chat Profile" else "Edit Chat Profile & Wake Word",
                 style = MaterialTheme.typography.titleLarge
             )
         },
@@ -174,13 +192,47 @@ fun CreateEditChatDialog(
                     .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
+                // Custom Chat Profile Avatar Selector
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = "Chat Profile Avatar (Optional):",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    FlowRow(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("chat_profile_avatar_row"),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        com.example.util.AppSettingsManager.BUILT_IN_PROFILE_AVATARS.forEachIndexed { idx, avatarEmoji ->
+                            val isSelected = selectedAvatar == avatarEmoji
+                            androidx.compose.material3.FilterChip(
+                                selected = isSelected,
+                                onClick = { selectedAvatar = avatarEmoji },
+                                label = {
+                                    Text(
+                                        text = avatarEmoji,
+                                        style = MaterialTheme.typography.titleSmall
+                                    )
+                                },
+                                modifier = Modifier.testTag("chat_profile_avatar_chip_$idx")
+                            )
+                        }
+                    }
+                }
+
                 OutlinedTextField(
                     value = title,
                     onValueChange = {
                         title = it
                         titleError = false
                     },
-                    label = { Text("Chat Title") },
+                    label = { Text("Chat Title / Profile Name") },
                     placeholder = { Text("e.g. Travel Planner, Code Mode") },
                     isError = titleError,
                     supportingText = if (titleError) {
@@ -220,6 +272,45 @@ fun CreateEditChatDialog(
                         .fillMaxWidth()
                         .testTag("chat_wakeword_input")
                 )
+
+                // Common wake word suggestions row
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = "Common Wake Word Suggestions:",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    FlowRow(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("chat_dialog_wake_suggestions_row"),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        com.example.voice.WakeWordRoutingEngine.COMMON_WAKE_WORD_SUGGESTIONS.forEach { suggestion ->
+                            val slug = suggestion.lowercase(java.util.Locale.US).replace(" ", "_")
+                            val isSelected = wakeWord.trim().equals(suggestion, ignoreCase = true)
+                            androidx.compose.material3.FilterChip(
+                                selected = isSelected,
+                                onClick = {
+                                    wakeWord = suggestion
+                                    wakeWordError = false
+                                    duplicateWakeWordConflictTitle = null
+                                },
+                                label = {
+                                    Text(
+                                        text = suggestion,
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                },
+                                modifier = Modifier.testTag("chat_dialog_wake_suggestion_chip_$slug")
+                            )
+                        }
+                    }
+                }
 
                 if (duplicateWakeWordConflictTitle != null) {
                     Card(
@@ -296,9 +387,37 @@ fun CreateEditChatDialog(
                     )
                 }
 
+                // 4-Tier Chat Priority Level Selector (influences default wake routing for general "Hey Gemini")
+                Text(
+                    text = "Chat Priority Level (Weighted with Location & Time Context)",
+                    style = MaterialTheme.typography.labelLarge
+                )
+                FlowRow(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("dialog_priority_level_row"),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    com.example.util.ChatPriorityLevel.entries.forEach { priority ->
+                        val isSelectedPriority = selectedPriority == priority
+                        androidx.compose.material3.FilterChip(
+                            selected = isSelectedPriority,
+                            onClick = { selectedPriority = priority },
+                            label = {
+                                Text(
+                                    text = "${priority.shortBadge} (+${priority.weight})",
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            },
+                            modifier = Modifier.testTag("dialog_priority_chip_${priority.name.lowercase(java.util.Locale.US)}")
+                        )
+                    }
+                }
+
                 // Category / Folder & Multi-Tag Organization Section
                 Text(
-                    text = "Category / Folder (for Wake Word & Browse Filtering)",
+                    text = "Category / Folder (Work, Personal, Learning, etc.)",
                     style = MaterialTheme.typography.labelLarge
                 )
                 val allCategoryOptions = remember(availableCategories, selectedCategory) {
@@ -1037,6 +1156,23 @@ fun CreateEditChatDialog(
                         themeMode = selectedThemeMode
                     )
 
+                    if (chatToSave.id > 0L) {
+                        com.example.util.AppSettingsManager.setChatPriorityLevel(
+                            context = context,
+                            chatId = chatToSave.id,
+                            priority = selectedPriority
+                        )
+                        com.example.util.AppSettingsManager.setChatProfileAvatar(
+                            context = context,
+                            chatId = chatToSave.id,
+                            avatarPresetOrUri = selectedAvatar
+                        )
+                        com.example.util.AppSettingsManager.setChatInitialPrompt(
+                            context = context,
+                            chatId = chatToSave.id,
+                            initialPrompt = systemInstruction.trim()
+                        )
+                    }
                     onSaveCategoryAndTags(selectedCategory.trim().ifBlank { "Work" }, selectedTags)
                     onSave(chatToSave)
                 },

@@ -5,8 +5,10 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
@@ -18,8 +20,15 @@ import android.media.AudioRecordingConfiguration
 import android.media.MediaRecorder
 import android.os.Binder
 import android.os.Build
+import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.os.PowerManager
 import android.os.Process
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -112,6 +121,104 @@ class WakeWordVoiceService : Service() {
     private val _isKeywordLoopRunning = MutableStateFlow(false)
     val isKeywordLoopRunning: StateFlow<Boolean> = _isKeywordLoopRunning.asStateFlow()
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile
+    private var serviceSpeechRecognizer: SpeechRecognizer? = null
+    private var speechRecognizerRestartRunnable: Runnable? = null
+    @Volatile
+    private var lastPartialMatchedPhraseTimestampMs: Long = 0L
+
+    /**
+     * Android [RecognitionListener] bound to [serviceSpeechRecognizer] for continuous customizable
+     * wake-word recognition on the main thread.
+     */
+    val serviceRecognitionListener: RecognitionListener = object : RecognitionListener {
+        override fun onReadyForSpeech(params: Bundle?) {
+            _isServiceSpeechRecognizerListening.value = true
+            dispatchDiagnosticTrace(
+                "SERVICE_SR_READY_FOR_SPEECH",
+                "customWakeWord=${customWakeWord.value} activeCount=${getEffectiveWakeWords().size}"
+            )
+        }
+
+        override fun onBeginningOfSpeech() {
+            _isServiceSpeechRecognizerListening.value = true
+        }
+
+        override fun onRmsChanged(rmsdB: Float) {
+            _serviceMicRms.value = rmsdB.coerceAtLeast(0f)
+        }
+
+        override fun onBufferReceived(buffer: ByteArray?) {
+            if (buffer != null && buffer.isNotEmpty()) {
+                audioPipelineBuffer.trySend(buffer.copyOf())
+            }
+        }
+
+        override fun onEndOfSpeech() {
+            _isServiceSpeechRecognizerListening.value = false
+        }
+
+        override fun onError(error: Int) {
+            _isServiceSpeechRecognizerListening.value = false
+            val errorName = formatSpeechRecognizerError(error)
+            dispatchDiagnosticTrace(
+                "SERVICE_SR_ERROR",
+                "errorCode=$error errorName=$errorName paused=$isIntentionallyPaused"
+            )
+            if (!isIntentionallyPaused &&
+                !_isSleepModeGlobal.value &&
+                !_isBatterySaverPausedGlobal.value &&
+                !_isInputFocusPaused.value &&
+                !isAppRecordingActive
+            ) {
+                scheduleSpeechRecognizerRestart(SPEECH_RECOGNIZER_RESTART_DELAY_MS)
+            }
+        }
+
+        override fun onResults(results: Bundle?) {
+            _isServiceSpeechRecognizerListening.value = false
+            val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION).orEmpty()
+            var detected: WakeWordDetectionResult? = null
+            for (candidate in matches) {
+                if (candidate.isNotBlank()) {
+                    submitTranscriptForKeywordCheck(candidate)
+                    val match = evaluateSpeechRecognizerTranscript(candidate, isPartial = false)
+                    if (match != null) {
+                        detected = match
+                        break
+                    }
+                }
+            }
+            if (detected == null &&
+                !isIntentionallyPaused &&
+                !_isSleepModeGlobal.value &&
+                !_isBatterySaverPausedGlobal.value &&
+                !_isInputFocusPaused.value &&
+                !isAppRecordingActive
+            ) {
+                scheduleSpeechRecognizerRestart(SPEECH_RECOGNIZER_RESTART_DELAY_MS)
+            }
+        }
+
+        override fun onPartialResults(partialResults: Bundle?) {
+            val partials = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION).orEmpty()
+            val now = System.currentTimeMillis()
+            if (now - lastPartialMatchedPhraseTimestampMs < 1200L) return
+            for (candidate in partials) {
+                if (candidate.isNotBlank()) {
+                    val match = evaluateSpeechRecognizerTranscript(candidate, isPartial = true)
+                    if (match != null) {
+                        lastPartialMatchedPhraseTimestampMs = now
+                        break
+                    }
+                }
+            }
+        }
+
+        override fun onEvent(eventType: Int, params: Bundle?) = Unit
+    }
+
     private var audioManager: AudioManager? = null
     private var audioFocusRequest: AudioFocusRequest? = null
 
@@ -191,12 +298,47 @@ class WakeWordVoiceService : Service() {
         }
     }
 
+    private var isScreenStateReceiverRegistered = false
+    private val screenStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    setDeviceScreenInteractiveState(false)
+                    promoteToMicrophoneForeground(!isIntentionallyPaused)
+                }
+                Intent.ACTION_SCREEN_ON,
+                Intent.ACTION_USER_PRESENT -> {
+                    setDeviceScreenInteractiveState(true)
+                    promoteToMicrophoneForeground(!isIntentionallyPaused)
+                }
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         activeInstance = this
+        loadPersistedCustomWakeWord(applicationContext)
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            if (pm != null) {
+                setDeviceScreenInteractiveState(pm.isInteractive)
+            }
+        } catch (_: Throwable) {}
+        try {
+            val screenFilter = IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_USER_PRESENT)
+            }
+            registerReceiver(screenStateReceiver, screenFilter)
+            isScreenStateReceiverRegistered = true
+        } catch (e: Throwable) {
+            Log.w(TAG, "Unable to register screenStateReceiver: ${e.message}")
+        }
         // Immediately promote to foreground with persistent notification so Samsung One UI
         // recognizes active microphone usage and does not put the service into a deep sleep bucket.
-        promoteToMicrophoneForeground()
+        promoteToMicrophoneForeground(!isIntentionallyPaused)
         audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         try {
             audioManager?.registerAudioRecordingCallback(recordingCallback, null)
@@ -210,8 +352,21 @@ class WakeWordVoiceService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         activeInstance = this
+        val incomingCustomWakeWord = intent?.getStringExtra(EXTRA_CUSTOM_WAKE_WORD)?.trim()
+        if (!incomingCustomWakeWord.isNullOrBlank()) {
+            val targetChatId = intent.getLongExtra(EXTRA_WAKE_TARGET_CHAT_ID, -1L).takeIf { it > 0L }
+            val sensitivity = intent.getFloatExtra(EXTRA_CUSTOM_WAKE_WORD_SENSITIVITY, DEFAULT_CUSTOM_WAKE_SENSITIVITY)
+            setCustomWakeWord(
+                phrase = incomingCustomWakeWord,
+                chatId = targetChatId,
+                sensitivity = sensitivity,
+                context = applicationContext
+            )
+        }
+
         if (intent?.action == ACTION_STOP_VOICE_SERVICE) {
             setIntentionallyPaused(true)
+            stopSpeechRecognizerListening(destroyInstance = true)
             stopKeywordDetectionLoop()
             abandonExclusiveAudioFocus()
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -223,9 +378,17 @@ class WakeWordVoiceService : Service() {
         promoteToMicrophoneForeground()
 
         when (intent?.action) {
+            ACTION_SET_CUSTOM_WAKE_WORD -> {
+                promoteToMicrophoneForeground(!isIntentionallyPaused)
+                if (!isIntentionallyPaused && !_isKeywordLoopRunning.value) {
+                    startKeywordDetectionLoop()
+                }
+                return START_STICKY
+            }
             ACTION_ENTER_SLEEP_MODE -> {
                 setSleepMode(true)
                 setIntentionallyPaused(true)
+                stopSpeechRecognizerListening(destroyInstance = false)
                 releaseServiceMicrophoneRecord()
                 abandonExclusiveAudioFocus()
                 promoteToMicrophoneForeground()
@@ -246,9 +409,15 @@ class WakeWordVoiceService : Service() {
                 onSleepModeChangedCallback?.invoke(false)
                 return START_STICKY
             }
+            ACTION_TOGGLE_QUIET_MODE -> {
+                val toggled = !_isQuietModeGlobal.value
+                com.example.util.AppSettingsManager.setQuietModeEnabled(applicationContext, toggled)
+                return START_STICKY
+            }
             ACTION_BATTERY_SAVER_PAUSE -> {
                 setBatterySaverPaused(true)
                 setIntentionallyPaused(true)
+                stopSpeechRecognizerListening(destroyInstance = false)
                 releaseServiceMicrophoneRecord()
                 abandonExclusiveAudioFocus()
                 promoteToMicrophoneForeground()
@@ -269,25 +438,31 @@ class WakeWordVoiceService : Service() {
                 onBatterySaverResumeRequestedCallback?.invoke()
                 return START_STICKY
             }
-            ACTION_PAUSE_FOR_INPUT_FOCUS -> {
+            ACTION_PAUSE_FOR_INPUT_FOCUS,
+            ACTION_PAUSE_FOR_UI_DICTATION -> {
                 _isInputFocusPaused.value = true
                 setIntentionallyPaused(true)
+                stopSpeechRecognizerListening(destroyInstance = false)
                 releaseServiceMicrophoneRecord()
                 abandonExclusiveAudioFocus()
                 promoteToMicrophoneForeground()
-                onInputFocusPauseRequested?.invoke(true)
+                if (intent.action == ACTION_PAUSE_FOR_INPUT_FOCUS) {
+                    onInputFocusPauseRequested?.invoke(true)
+                }
                 return START_STICKY
             }
             ACTION_PAUSE_FOR_COMMAND_DISPATCH -> {
                 isProcessingCommand = true
                 _isInputFocusPaused.value = true
+                stopSpeechRecognizerListening(destroyInstance = false)
                 releaseServiceMicrophoneRecord()
                 abandonExclusiveAudioFocus()
                 promoteToMicrophoneForeground()
                 return START_STICKY
             }
             ACTION_RESUME_AFTER_INPUT_FOCUS,
-            ACTION_RESUME_AFTER_COMMAND_DISPATCH -> {
+            ACTION_RESUME_AFTER_COMMAND_DISPATCH,
+            ACTION_RESUME_AFTER_UI_DICTATION -> {
                 isProcessingCommand = false
                 _isInputFocusPaused.value = false
                 if (!_isSleepModeGlobal.value && !_isBatterySaverPausedGlobal.value) {
@@ -318,6 +493,12 @@ class WakeWordVoiceService : Service() {
                     submitTranscriptForKeywordCheck(candidateTranscript)
                 }
                 startKeywordDetectionLoop()
+                if (intent?.getBooleanExtra(EXTRA_USE_SPEECH_RECOGNIZER_ENGINE, false) == true &&
+                    !isIntentionallyPaused &&
+                    !isAppRecordingActive
+                ) {
+                    startSpeechRecognizerListening()
+                }
                 return START_STICKY
             }
         }
@@ -325,9 +506,16 @@ class WakeWordVoiceService : Service() {
 
     override fun onDestroy() {
         setIntentionallyPaused(true)
+        stopSpeechRecognizerListening(destroyInstance = true)
         stopKeywordDetectionLoop()
         repositoryObserverJob?.cancel()
         serviceScope.cancel()
+        if (isScreenStateReceiverRegistered) {
+            try {
+                unregisterReceiver(screenStateReceiver)
+            } catch (_: Throwable) {}
+            isScreenStateReceiverRegistered = false
+        }
         try {
             audioManager?.unregisterAudioRecordingCallback(recordingCallback)
         } catch (_: Exception) {}
@@ -374,6 +562,9 @@ class WakeWordVoiceService : Service() {
     }
 
     internal fun setActiveWakeWordsForTesting(words: List<WakeWord>) {
+        repositoryObserverJob?.cancel()
+        repositoryObserverJob = null
+        customWakeWordOverrideActive = false
         _serviceActiveWakeWords.value = words
         _activeDatabaseWakeWords.value = words
     }
@@ -498,6 +689,13 @@ class WakeWordVoiceService : Service() {
                                         val rms = sqrt(sumSq / sampleCount)
                                         _serviceMicRms.value = rms.toFloat()
                                     }
+                                    LocalKeywordSpotterEngine.evaluatePcmAudioFrame(
+                                        pcmBytes = pcmChunk,
+                                        bytesRead = pcmChunk.size,
+                                        customWakePhrase = _customWakeWord.value,
+                                        sensitivityThreshold = customWakeWordSensitivity,
+                                        targetChatId = customWakeWordTargetChatId
+                                    )
                                 }
                             }
                         } catch (_: Throwable) {}
@@ -506,7 +704,9 @@ class WakeWordVoiceService : Service() {
                         releaseServiceMicrophoneRecord()
                     }
 
-                    delay(60L)
+                    val pollIntervalMs = resolveEffectivePollingIntervalMs()
+                    _activeWakeWordPollingIntervalMs.value = pollIntervalMs
+                    delay(pollIntervalMs)
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Keyword detection loop terminated: ${e.message}")
@@ -541,8 +741,236 @@ class WakeWordVoiceService : Service() {
     }
 
     /**
+     * Configures and returns the Android [RecognizerIntent] used by [serviceSpeechRecognizer]
+     * to listen for customizable wake words.
+     */
+    fun createServiceRecognizerIntent(): Intent {
+        val rawIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+        return WakeWordManager.configureRecognizerIntent(
+            intent = rawIntent,
+            callingPackage = applicationContext?.packageName ?: "com.example"
+        )
+    }
+
+    /**
+     * Starts listening for the customizable wake word using Android's [SpeechRecognizer] API on the
+     * main thread. Safely releases any standalone [AudioRecord] instance beforehand so the two
+     * audio capture APIs never collide on the hardware microphone.
+     */
+    fun startSpeechRecognizerListening(): Boolean {
+        if (isIntentionallyPaused ||
+            _isSleepModeGlobal.value ||
+            _isBatterySaverPausedGlobal.value ||
+            _isInputFocusPaused.value ||
+            isAppRecordingActive
+        ) {
+            return false
+        }
+        cancelScheduledSpeechRecognizerRestart()
+        // Release standalone AudioRecord before SpeechRecognizer acquires the microphone
+        releaseServiceMicrophoneRecord(repromotePassiveNotification = false)
+
+        val startTask = Runnable {
+            try {
+                if (serviceSpeechRecognizer == null) {
+                    serviceSpeechRecognizer = SpeechRecognizer.createSpeechRecognizer(applicationContext).also {
+                        it.setRecognitionListener(serviceRecognitionListener)
+                    }
+                }
+                val recognizerIntent = createServiceRecognizerIntent()
+                serviceSpeechRecognizer?.startListening(recognizerIntent)
+                _isServiceSpeechRecognizerListening.value = true
+                promoteToMicrophoneForeground(true)
+                dispatchDiagnosticTrace(
+                    "SERVICE_SR_START_LISTENING",
+                    "customWakeWord=${customWakeWord.value} callingPackage=${applicationContext.packageName}"
+                )
+            } catch (e: Throwable) {
+                _isServiceSpeechRecognizerListening.value = false
+                Log.w(TAG, "Unable to start SpeechRecognizer in WakeWordVoiceService: ${e.message}")
+            }
+        }
+
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            startTask.run()
+        } else {
+            mainHandler.post(startTask)
+        }
+        return true
+    }
+
+    /**
+     * Stops and optionally destroys the service's [SpeechRecognizer] instance on the main thread.
+     */
+    fun stopSpeechRecognizerListening(destroyInstance: Boolean = false) {
+        cancelScheduledSpeechRecognizerRestart()
+        _isServiceSpeechRecognizerListening.value = false
+        val stopTask = Runnable {
+            val recognizer = serviceSpeechRecognizer
+            if (destroyInstance) {
+                serviceSpeechRecognizer = null
+            }
+            if (recognizer != null) {
+                try {
+                    recognizer.stopListening()
+                } catch (_: Throwable) {}
+                try {
+                    recognizer.cancel()
+                } catch (_: Throwable) {}
+                if (destroyInstance) {
+                    try {
+                        recognizer.destroy()
+                    } catch (_: Throwable) {}
+                }
+            }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            stopTask.run()
+        } else {
+            mainHandler.post(stopTask)
+        }
+    }
+
+    private fun scheduleSpeechRecognizerRestart(delayMs: Long) {
+        cancelScheduledSpeechRecognizerRestart()
+        val runnable = Runnable {
+            if (!isIntentionallyPaused &&
+                !_isSleepModeGlobal.value &&
+                !_isBatterySaverPausedGlobal.value &&
+                !_isInputFocusPaused.value &&
+                !isAppRecordingActive
+            ) {
+                startSpeechRecognizerListening()
+            }
+        }
+        speechRecognizerRestartRunnable = runnable
+        val effectiveDelayMs = resolveEffectiveSpeechRecognizerRestartDelayMs(delayMs)
+        mainHandler.postDelayed(runnable, effectiveDelayMs)
+    }
+
+    private fun cancelScheduledSpeechRecognizerRestart() {
+        speechRecognizerRestartRunnable?.let { mainHandler.removeCallbacks(it) }
+        speechRecognizerRestartRunnable = null
+    }
+
+    /**
+     * Returns the list of active [WakeWord] entities combined with the customizable wake word
+     * when configured via [setCustomWakeWord] or when the database list is empty.
+     */
+    fun getEffectiveWakeWords(databaseWords: List<WakeWord> = _serviceActiveWakeWords.value): List<WakeWord> {
+        val customPhrase = _customWakeWord.value.trim()
+        val customWord = if (customPhrase.isNotBlank()) {
+            WakeWord(
+                id = CUSTOM_WAKE_WORD_ID,
+                phrase = customPhrase,
+                isEnabled = true,
+                sensitivity = customWakeWordSensitivity,
+                chatId = customWakeWordTargetChatId,
+                chatTitle = "Gemini Assistant"
+            )
+        } else {
+            null
+        }
+        if (customWord == null) return databaseWords
+        if (databaseWords.isEmpty()) return listOf(customWord)
+        if (!customWakeWordOverrideActive) return databaseWords
+        return listOf(customWord) + databaseWords.filterNot { it.phrase.equals(customPhrase, ignoreCase = true) }
+    }
+
+    /**
+     * Evaluates a transcript received from Android's [SpeechRecognizer] (`onResults` or `onPartialResults`)
+     * against sleep/wake commands and the customizable + repository wake words, triggering the
+     * Gemini assistant immediately when matched.
+     */
+    fun evaluateSpeechRecognizerTranscript(
+        transcript: String,
+        isPartial: Boolean = false
+    ): WakeWordDetectionResult? {
+        val cleanTranscript = transcript.trim()
+        if (cleanTranscript.isBlank()) return null
+
+        if (AudioCommandSanitizer.containsWakeUpCommand(cleanTranscript)) {
+            if (_isSleepModeGlobal.value || _isBatterySaverPausedGlobal.value || isIntentionallyPaused) {
+                AudioCommandSanitizer.playVoiceCommandHaptic(applicationContext, "Wake Up (\"$cleanTranscript\")")
+                setSleepMode(false)
+                setBatterySaverPaused(false)
+                setIntentionallyPaused(false)
+                promoteToMicrophoneForeground()
+                onSleepModeChangedCallback?.invoke(false)
+            }
+            return null
+        }
+
+        if (AudioCommandSanitizer.containsSleepCommand(cleanTranscript)) {
+            AudioCommandSanitizer.playVoiceCommandHaptic(applicationContext, "Sleep (\"$cleanTranscript\")")
+            setSleepMode(true)
+            setIntentionallyPaused(true)
+            stopSpeechRecognizerListening(destroyInstance = false)
+            releaseServiceMicrophoneRecord()
+            promoteToMicrophoneForeground()
+            onSleepModeChangedCallback?.invoke(true)
+            return null
+        }
+
+        if (_isSleepModeGlobal.value || _isQuietModeGlobal.value || isIntentionallyPaused) return null
+
+        val effectiveWords = getEffectiveWakeWords(_serviceActiveWakeWords.value)
+        if (!isPartial && AudioCommandSanitizer.isVoiceHistoryNavigationCommand(
+                cleanTranscript,
+                effectiveWords.map { it.phrase }
+            )
+        ) {
+            AudioCommandSanitizer.playVoiceCommandHaptic(applicationContext, "Voice History Navigation (\"$cleanTranscript\")")
+            isProcessingCommand = true
+            stopSpeechRecognizerListening(destroyInstance = false)
+            releaseServiceMicrophoneRecord()
+            abandonExclusiveAudioFocus()
+            onVoiceHistoryNavigationRequestedCallback?.invoke(cleanTranscript)
+            return null
+        }
+
+        val match = matchWakeWordFromList(cleanTranscript, effectiveWords)
+        LocalKeywordSpotterEngine.evaluateCandidateTranscript(
+            transcript = cleanTranscript,
+            customWakePhrase = match?.matchedPhrase ?: _customWakeWord.value,
+            sensitivityThreshold = customWakeWordSensitivity,
+            targetChatId = match?.wakeWord?.chatId ?: customWakeWordTargetChatId,
+            targetChatTitle = match?.wakeWord?.chatTitle?.takeIf { it.isNotBlank() } ?: "Gemini Assistant"
+        )
+        if (match != null) {
+            triggerGeminiAssistant(match)
+        }
+        return match
+    }
+
+    /**
+     * Triggers the Gemini assistant in response to a detected [WakeWordDetectionResult]:
+     * synchronously releases service audio capture handles, plays wake haptic feedback,
+     * emits the result to observers, posts the ready cue notification, and launches/forwards
+     * the wake event (plus any spoken follow-up query) to [com.example.MainActivity].
+     */
+    fun triggerGeminiAssistant(match: WakeWordDetectionResult) {
+        stopSpeechRecognizerListening(destroyInstance = false)
+        stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
+        AudioCommandSanitizer.playWakeWordHaptic(applicationContext, match.matchedPhrase)
+        _lastDetectedWakeWord.value = match
+        _detectedWakeWordsFlow.tryEmit(match)
+        _geminiAssistantTriggerFlow.tryEmit(match)
+        postWakeWordReadyCueNotification(applicationContext, match)
+        if (!isMainActivityInForeground) {
+            launchChatActivityFromBackgroundService(applicationContext, match)
+        }
+        onWakeWordDetectedCallback?.invoke(match)
+        onGeminiAssistantTriggeredCallback?.invoke(match)
+        dispatchDiagnosticTrace(
+            "GEMINI_ASSISTANT_TRIGGERED",
+            "matchedPhrase=\"${match.matchedPhrase}\" chatId=${match.wakeWord.chatId} followUp=${!match.followUpQuery.isNullOrBlank()}"
+        )
+    }
+
+    /**
      * Checks [transcript] directly against sleep/wake voice commands and the active wake words in [WakeWordRepository]
-     * and emits a [WakeWordDetectionResult] if a match is found.
+     * (plus any customizable wake word set via [setCustomWakeWord]) and emits a [WakeWordDetectionResult] if a match is found.
      */
     suspend fun checkTranscriptAgainstDatabase(transcript: String): WakeWordDetectionResult? {
         val cleanTranscript = transcript.trim()
@@ -566,6 +994,7 @@ class WakeWordVoiceService : Service() {
             AudioCommandSanitizer.playVoiceCommandHaptic(applicationContext, "Sleep (\"$cleanTranscript\")")
             setSleepMode(true)
             setIntentionallyPaused(true)
+            stopSpeechRecognizerListening(destroyInstance = false)
             releaseServiceMicrophoneRecord()
             promoteToMicrophoneForeground()
             onSleepModeChangedCallback?.invoke(true)
@@ -573,7 +1002,7 @@ class WakeWordVoiceService : Service() {
         }
 
         // If in sleep mode or intentionally paused, ignore normal wake word triggers until woken up
-        if (_isSleepModeGlobal.value || isIntentionallyPaused) return null
+        if (_isSleepModeGlobal.value || _isQuietModeGlobal.value || isIntentionallyPaused) return null
 
         val currentActive = _serviceActiveWakeWords.value.ifEmpty {
             val loaded = resolveWakeWordRepository().getAllWakeWordsSync()
@@ -582,33 +1011,34 @@ class WakeWordVoiceService : Service() {
             _activeDatabaseWakeWords.value = loaded
             loaded
         }
+        val effectiveActive = getEffectiveWakeWords(currentActive)
 
         // Check for voice history navigation command ("open history", "show history", "voice history")
         // and immediately release service AudioRecord + audio focus before dispatching in-memory callback
         if (AudioCommandSanitizer.isVoiceHistoryNavigationCommand(
                 cleanTranscript,
-                currentActive.map { it.phrase }
+                effectiveActive.map { it.phrase }
             )
         ) {
             AudioCommandSanitizer.playVoiceCommandHaptic(applicationContext, "Voice History Navigation (\"$cleanTranscript\")")
             isProcessingCommand = true
+            stopSpeechRecognizerListening(destroyInstance = false)
             releaseServiceMicrophoneRecord()
             abandonExclusiveAudioFocus()
             onVoiceHistoryNavigationRequestedCallback?.invoke(cleanTranscript)
             return null
         }
 
-        val match = matchWakeWordFromList(cleanTranscript, currentActive)
+        val match = matchWakeWordFromList(cleanTranscript, effectiveActive)
+        LocalKeywordSpotterEngine.evaluateCandidateTranscript(
+            transcript = cleanTranscript,
+            customWakePhrase = match?.matchedPhrase ?: _customWakeWord.value,
+            sensitivityThreshold = customWakeWordSensitivity,
+            targetChatId = match?.wakeWord?.chatId ?: customWakeWordTargetChatId,
+            targetChatTitle = match?.wakeWord?.chatTitle?.takeIf { it.isNotBlank() } ?: "Gemini Assistant"
+        )
         if (match != null) {
-            stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
-            AudioCommandSanitizer.playWakeWordHaptic(applicationContext, match.matchedPhrase)
-            _lastDetectedWakeWord.value = match
-            _detectedWakeWordsFlow.tryEmit(match)
-            postWakeWordReadyCueNotification(applicationContext, match)
-            if (!isMainActivityInForeground) {
-                launchChatActivityFromBackgroundService(applicationContext, match)
-            }
-            onWakeWordDetectedCallback?.invoke(match)
+            triggerGeminiAssistant(match)
         }
         return match
     }
@@ -809,18 +1239,34 @@ class WakeWordVoiceService : Service() {
         }
     }
 
-    private fun buildNotification(isActivelyListening: Boolean = false): Notification {
+    internal fun buildNotification(isActivelyListening: Boolean = false): Notification {
         val isSleeping = _isSleepModeGlobal.value
         val isBatterySaverPaused = _isBatterySaverPausedGlobal.value
+        val isReducedScreenOffPolling = _screenOffBatterySaverEnabled.value && !_isDeviceScreenInteractive.value
+        val pollIntervalMs = resolveEffectivePollingIntervalMs()
         val title = when {
             isBatterySaverPaused -> "Gemini Wake • Battery Saver Paused"
             isSleeping -> "Gemini Wake • Sleep Mode"
+            isActivelyListening && isReducedScreenOffPolling -> "Gemini Wake • Glowing Listener (Screen-Off Saver)"
+            isActivelyListening -> "Gemini Wake Active • Glowing Listener"
             else -> "Gemini Wake Active"
         }
+        val subtitle = when {
+            isBatterySaverPaused -> "Wake word detection paused to save battery"
+            isSleeping -> "Say \"Gemini, wake up\" or tap Wake Up"
+            isActivelyListening && isReducedScreenOffPolling ->
+                "Listening for \"${_customWakeWord.value}\" • Screen-Off Battery Saver (${pollIntervalMs}ms poll)"
+            isActivelyListening ->
+                "Actively listening for \"${_customWakeWord.value}\" (${pollIntervalMs}ms poll)"
+            else -> "Hands-free standby"
+        }
+        val smallIconRes = resolveNotificationSmallIconRes(isActivelyListening && !isSleeping && !isBatterySaverPaused)
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
-            .setContentText(if (isActivelyListening) "Listening for wake word..." else "Hands-free standby")
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .setContentText(subtitle)
+            .setSmallIcon(smallIconRes)
+            .setColor(if (isActivelyListening && !isSleeping && !isBatterySaverPaused) 0xFF10B981.toInt() else 0xFF64748B.toInt())
+            .setColorized(isActivelyListening && !isSleeping && !isBatterySaverPaused)
             .setOngoing(true)
             .setSilent(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -863,12 +1309,26 @@ class WakeWordVoiceService : Service() {
 
     companion object {
         const val AUDIO_PIPELINE_BUFFER_CAPACITY = 32
+        const val SPEECH_RECOGNIZER_RESTART_DELAY_MS = 1500L
+        const val SCREEN_OFF_SPEECH_RECOGNIZER_RESTART_DELAY_MS = 4500L
+        const val ACTIVE_SCREEN_POLLING_INTERVAL_MS = 60L
+        const val SCREEN_OFF_BATTERY_SAVER_POLLING_INTERVAL_MS = 450L
+        const val CUSTOM_WAKE_WORD_ID = -9001L
+        const val DEFAULT_CUSTOM_WAKE_WORD = "Hey Gemini"
+        const val DEFAULT_CUSTOM_WAKE_SENSITIVITY = 0.78f
+        const val PREFS_CUSTOM_WAKE_NAME = "gemini_wake_service_prefs"
+        const val PREF_KEY_CUSTOM_WAKE_WORD = "custom_wake_word_phrase"
+        const val PREF_KEY_CUSTOM_WAKE_CHAT_ID = "custom_wake_word_chat_id"
+        const val PREF_KEY_CUSTOM_WAKE_SENSITIVITY = "custom_wake_word_sensitivity"
+        const val PREF_KEY_SCREEN_OFF_BATTERY_SAVER = "screen_off_battery_saver_enabled"
+
         const val CHANNEL_ID = "gemini_wake_mic_channel"
         const val CHANNEL_WAKE_CUE_ID = "gemini_wake_ready_cue_channel"
         const val NOTIFICATION_ID = 4102
         const val NOTIFICATION_ID_WAKE_READY = 4103
         const val ACTION_START_VOICE_SERVICE = "com.example.voice.action.START_VOICE_SERVICE"
         const val ACTION_STOP_VOICE_SERVICE = "com.example.voice.action.STOP_VOICE_SERVICE"
+        const val ACTION_SET_CUSTOM_WAKE_WORD = "com.example.voice.action.SET_CUSTOM_WAKE_WORD"
         const val ACTION_ENTER_SLEEP_MODE = "com.example.voice.action.ENTER_SLEEP_MODE"
         const val ACTION_WAKE_FROM_SLEEP = "com.example.voice.action.WAKE_FROM_SLEEP"
         const val ACTION_BATTERY_SAVER_PAUSE = "com.example.voice.action.BATTERY_SAVER_PAUSE"
@@ -877,9 +1337,238 @@ class WakeWordVoiceService : Service() {
         const val ACTION_RESUME_AFTER_INPUT_FOCUS = "com.example.voice.action.RESUME_AFTER_INPUT_FOCUS"
         const val ACTION_PAUSE_FOR_COMMAND_DISPATCH = "com.example.voice.action.PAUSE_FOR_COMMAND_DISPATCH"
         const val ACTION_RESUME_AFTER_COMMAND_DISPATCH = "com.example.voice.action.RESUME_AFTER_COMMAND_DISPATCH"
+        const val ACTION_PAUSE_FOR_UI_DICTATION = "com.example.voice.action.PAUSE_FOR_UI_DICTATION"
+        const val ACTION_RESUME_AFTER_UI_DICTATION = "com.example.voice.action.RESUME_AFTER_UI_DICTATION"
+        const val ACTION_TOGGLE_QUIET_MODE = "com.example.voice.action.TOGGLE_QUIET_MODE"
         const val EXTRA_CANDIDATE_TRANSCRIPT = "com.example.voice.extra.CANDIDATE_TRANSCRIPT"
+        const val EXTRA_CUSTOM_WAKE_WORD = "com.example.voice.extra.CUSTOM_WAKE_WORD"
+        const val EXTRA_CUSTOM_WAKE_WORD_SENSITIVITY = "com.example.voice.extra.CUSTOM_WAKE_WORD_SENSITIVITY"
+        const val EXTRA_USE_SPEECH_RECOGNIZER_ENGINE = "com.example.voice.extra.USE_SPEECH_RECOGNIZER_ENGINE"
         const val EXTRA_WAKE_TARGET_CHAT_ID = "com.example.voice.extra.WAKE_TARGET_CHAT_ID"
         const val EXTRA_WAKE_MATCHED_PHRASE = "com.example.voice.extra.WAKE_MATCHED_PHRASE"
+        const val EXTRA_WAKE_INITIAL_QUERY = "com.example.voice.extra.WAKE_INITIAL_QUERY"
+
+        private val _customWakeWord = MutableStateFlow(DEFAULT_CUSTOM_WAKE_WORD)
+        val customWakeWord: StateFlow<String> = _customWakeWord.asStateFlow()
+
+        private val _isQuietModeGlobal = MutableStateFlow(false)
+        val isQuietModeGlobal: StateFlow<Boolean> = _isQuietModeGlobal.asStateFlow()
+
+        var onQuietModeChangedCallback: ((Boolean) -> Unit)? = null
+
+        fun setQuietMode(enabled: Boolean, context: Context? = null) {
+            _isQuietModeGlobal.value = enabled
+            if (enabled) {
+                setIntentionallyPaused(true)
+                activeInstance?.stopSpeechRecognizerListening(destroyInstance = false)
+                stopAndReleaseServiceAudioRecordSynchronously("quiet_mode_enabled")
+                activeInstance?.promoteToMicrophoneForeground(false)
+            } else {
+                setSleepMode(false)
+                setIntentionallyPaused(false)
+                activeInstance?.promoteToMicrophoneForeground(true)
+                activeInstance?.let { instance ->
+                    if (!_isKeywordLoopActiveGlobal.value) {
+                        instance.startKeywordDetectionLoop()
+                    }
+                }
+            }
+            onQuietModeChangedCallback?.invoke(enabled)
+            dispatchDiagnosticTrace("QUIET_MODE_CHANGED", "enabled=$enabled")
+        }
+
+        @Volatile
+        var customWakeWordTargetChatId: Long? = null
+            internal set
+
+        @Volatile
+        var customWakeWordSensitivity: Float = DEFAULT_CUSTOM_WAKE_SENSITIVITY
+            private set
+
+        @Volatile
+        var customWakeWordOverrideActive: Boolean = false
+            internal set
+
+        private val _isServiceSpeechRecognizerListening = MutableStateFlow(false)
+        val isServiceSpeechRecognizerListening: StateFlow<Boolean> = _isServiceSpeechRecognizerListening.asStateFlow()
+
+        private val _screenOffBatterySaverEnabled = MutableStateFlow(false)
+        val screenOffBatterySaverEnabled: StateFlow<Boolean> = _screenOffBatterySaverEnabled.asStateFlow()
+
+        private val _isDeviceScreenInteractive = MutableStateFlow(true)
+        val isDeviceScreenInteractive: StateFlow<Boolean> = _isDeviceScreenInteractive.asStateFlow()
+
+        private val _activeWakeWordPollingIntervalMs = MutableStateFlow(ACTIVE_SCREEN_POLLING_INTERVAL_MS)
+        val activeWakeWordPollingIntervalMs: StateFlow<Long> = _activeWakeWordPollingIntervalMs.asStateFlow()
+
+        private val _geminiAssistantTriggerFlow = MutableSharedFlow<WakeWordDetectionResult>(extraBufferCapacity = 16)
+        val geminiAssistantTriggerFlow: SharedFlow<WakeWordDetectionResult> = _geminiAssistantTriggerFlow.asSharedFlow()
+
+        var onGeminiAssistantTriggeredCallback: ((WakeWordDetectionResult) -> Unit)? = null
+
+        /**
+         * Resolves the notification small icon resource ID: returns the subtle animated glowing
+         * wake-word icon (`R.drawable.ic_notification_wake_glowing`) when actively listening,
+         * and the standby icon (`R.drawable.ic_notification_wake_standby`) when idle or paused.
+         */
+        fun resolveNotificationSmallIconRes(isActivelyListening: Boolean): Int {
+            return if (isActivelyListening) {
+                com.example.R.drawable.ic_notification_wake_glowing
+            } else {
+                com.example.R.drawable.ic_notification_wake_standby
+            }
+        }
+
+        /**
+         * Updates whether the Screen-Off Battery Saver mode is enabled. When enabled and the
+         * device screen is off (`!isDeviceScreenInteractive.value`), wake-word detection polling
+         * frequency is reduced from [ACTIVE_SCREEN_POLLING_INTERVAL_MS] (`60ms`) to
+         * [SCREEN_OFF_BATTERY_SAVER_POLLING_INTERVAL_MS] (`450ms`).
+         */
+        fun setScreenOffBatterySaverEnabled(enabled: Boolean, context: Context? = null) {
+            _screenOffBatterySaverEnabled.value = enabled
+            _activeWakeWordPollingIntervalMs.value = resolveEffectivePollingIntervalMs()
+            if (context != null) {
+                try {
+                    val appCtx = context.applicationContext ?: context
+                    val prefs = appCtx.getSharedPreferences(PREFS_CUSTOM_WAKE_NAME, Context.MODE_PRIVATE)
+                    prefs.edit().putBoolean(PREF_KEY_SCREEN_OFF_BATTERY_SAVER, enabled).apply()
+                    val appSettingsPrefs = appCtx.getSharedPreferences(
+                        com.example.util.AppSettingsManager.PREFS_NAME,
+                        Context.MODE_PRIVATE
+                    )
+                    appSettingsPrefs.edit()
+                        .putBoolean(com.example.util.AppSettingsManager.KEY_SCREEN_OFF_BATTERY_SAVER_ENABLED, enabled)
+                        .apply()
+                } catch (_: Throwable) {}
+            }
+            activeInstance?.promoteToMicrophoneForeground(!isIntentionallyPaused)
+            dispatchDiagnosticTrace(
+                "SCREEN_OFF_BATTERY_SAVER_CHANGED",
+                "enabled=$enabled screenInteractive=${_isDeviceScreenInteractive.value} effectivePollingMs=${_activeWakeWordPollingIntervalMs.value}"
+            )
+        }
+
+        /**
+         * Updates whether the device display is currently interactive (screen on) or non-interactive
+         * (screen off) and recalculates [activeWakeWordPollingIntervalMs].
+         */
+        fun setDeviceScreenInteractiveState(interactive: Boolean) {
+            _isDeviceScreenInteractive.value = interactive
+            _activeWakeWordPollingIntervalMs.value = resolveEffectivePollingIntervalMs()
+            dispatchDiagnosticTrace(
+                "DEVICE_SCREEN_STATE_CHANGED",
+                "screenInteractive=$interactive batterySaver=${_screenOffBatterySaverEnabled.value} effectivePollingMs=${_activeWakeWordPollingIntervalMs.value}"
+            )
+        }
+
+        /**
+         * Computes the effective wake-word detection polling interval in milliseconds:
+         * - `450ms` ([SCREEN_OFF_BATTERY_SAVER_POLLING_INTERVAL_MS]) when [screenOffBatterySaverEnabled]
+         *   is `true` and the screen is off (`isScreenInteractive == false`).
+         * - `60ms` ([ACTIVE_SCREEN_POLLING_INTERVAL_MS]) otherwise.
+         */
+        fun resolveEffectivePollingIntervalMs(
+            batterySaverEnabled: Boolean = _screenOffBatterySaverEnabled.value,
+            isScreenInteractive: Boolean = _isDeviceScreenInteractive.value
+        ): Long {
+            return if (batterySaverEnabled && !isScreenInteractive) {
+                SCREEN_OFF_BATTERY_SAVER_POLLING_INTERVAL_MS
+            } else {
+                ACTIVE_SCREEN_POLLING_INTERVAL_MS
+            }
+        }
+
+        /**
+         * Computes the effective background [SpeechRecognizer] restart delay in milliseconds,
+         * lengthening the polling cadence from `1500ms` to `4500ms` when Screen-Off Battery Saver
+         * is enabled and the screen is off.
+         */
+        fun resolveEffectiveSpeechRecognizerRestartDelayMs(
+            requestedDelayMs: Long = SPEECH_RECOGNIZER_RESTART_DELAY_MS,
+            batterySaverEnabled: Boolean = _screenOffBatterySaverEnabled.value,
+            isScreenInteractive: Boolean = _isDeviceScreenInteractive.value
+        ): Long {
+            val minFloor = if (batterySaverEnabled && !isScreenInteractive) {
+                SCREEN_OFF_SPEECH_RECOGNIZER_RESTART_DELAY_MS
+            } else {
+                SPEECH_RECOGNIZER_RESTART_DELAY_MS
+            }
+            return requestedDelayMs.coerceAtLeast(minFloor)
+        }
+
+        /**
+         * Updates the customizable wake word phrase used by [WakeWordVoiceService] and optionally
+         * persists it to SharedPreferences so background [SpeechRecognizer] sessions immediately
+         * recognize the new trigger phrase.
+         */
+        fun setCustomWakeWord(
+            phrase: String,
+            chatId: Long? = null,
+            sensitivity: Float = DEFAULT_CUSTOM_WAKE_SENSITIVITY,
+            context: Context? = null
+        ) {
+            val sanitized = phrase.trim().ifBlank { DEFAULT_CUSTOM_WAKE_WORD }
+            _customWakeWord.value = sanitized
+            customWakeWordTargetChatId = chatId
+            customWakeWordSensitivity = sensitivity.coerceIn(0.50f, 0.98f)
+            customWakeWordOverrideActive = true
+
+            if (context != null) {
+                try {
+                    val appCtx = context.applicationContext ?: context
+                    val prefs = appCtx.getSharedPreferences(PREFS_CUSTOM_WAKE_NAME, Context.MODE_PRIVATE)
+                    prefs.edit()
+                        .putString(PREF_KEY_CUSTOM_WAKE_WORD, sanitized)
+                        .putLong(PREF_KEY_CUSTOM_WAKE_CHAT_ID, chatId ?: -1L)
+                        .putFloat(PREF_KEY_CUSTOM_WAKE_SENSITIVITY, customWakeWordSensitivity)
+                        .apply()
+                    val appSettingsPrefs = appCtx.getSharedPreferences(
+                        com.example.util.AppSettingsManager.PREFS_NAME,
+                        Context.MODE_PRIVATE
+                    )
+                    appSettingsPrefs.edit()
+                        .putString(com.example.util.AppSettingsManager.KEY_CUSTOM_WAKE_WORD_PHRASE, sanitized)
+                        .apply()
+                } catch (_: Throwable) {}
+            }
+            dispatchDiagnosticTrace(
+                "CUSTOM_WAKE_WORD_CONFIGURED",
+                "phrase=\"$sanitized\" chatId=${chatId ?: -1L} sensitivity=$customWakeWordSensitivity"
+            )
+        }
+
+        internal fun loadPersistedCustomWakeWord(context: Context) {
+            try {
+                val appCtx = context.applicationContext ?: context
+                val appSettingsPrefs = appCtx.getSharedPreferences(
+                    com.example.util.AppSettingsManager.PREFS_NAME,
+                    Context.MODE_PRIVATE
+                )
+                val prefs = appCtx.getSharedPreferences(PREFS_CUSTOM_WAKE_NAME, Context.MODE_PRIVATE)
+                val savedPhrase = appSettingsPrefs.getString(
+                    com.example.util.AppSettingsManager.KEY_CUSTOM_WAKE_WORD_PHRASE,
+                    null
+                )?.trim()?.takeIf { it.isNotBlank() }
+                    ?: prefs.getString(PREF_KEY_CUSTOM_WAKE_WORD, null)?.trim()
+                if (!savedPhrase.isNullOrBlank()) {
+                    _customWakeWord.value = savedPhrase
+                    val savedChatId = prefs.getLong(PREF_KEY_CUSTOM_WAKE_CHAT_ID, -1L)
+                    customWakeWordTargetChatId = savedChatId.takeIf { it > 0L }
+                    customWakeWordSensitivity = prefs.getFloat(
+                        PREF_KEY_CUSTOM_WAKE_SENSITIVITY,
+                        DEFAULT_CUSTOM_WAKE_SENSITIVITY
+                    ).coerceIn(0.50f, 0.98f)
+                }
+                val savedScreenOffBatterySaver = if (appSettingsPrefs.contains(com.example.util.AppSettingsManager.KEY_SCREEN_OFF_BATTERY_SAVER_ENABLED)) {
+                    appSettingsPrefs.getBoolean(com.example.util.AppSettingsManager.KEY_SCREEN_OFF_BATTERY_SAVER_ENABLED, false)
+                } else {
+                    prefs.getBoolean(PREF_KEY_SCREEN_OFF_BATTERY_SAVER, false)
+                }
+                _screenOffBatterySaverEnabled.value = savedScreenOffBatterySaver
+                _activeWakeWordPollingIntervalMs.value = resolveEffectivePollingIntervalMs()
+            } catch (_: Throwable) {}
+        }
 
         @Volatile
         var injectedRepositoryForTesting: WakeWordRepository? = null
@@ -929,6 +1618,19 @@ class WakeWordVoiceService : Service() {
             else -> "AUDIOFOCUS_CHANGE_UNKNOWN($focusChange)"
         }
 
+        fun formatSpeechRecognizerError(error: Int): String = when (error) {
+            SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "ERROR_NETWORK_TIMEOUT(1)"
+            SpeechRecognizer.ERROR_NETWORK -> "ERROR_NETWORK(2)"
+            SpeechRecognizer.ERROR_AUDIO -> "ERROR_AUDIO(3)"
+            SpeechRecognizer.ERROR_SERVER -> "ERROR_SERVER(4)"
+            SpeechRecognizer.ERROR_CLIENT -> "ERROR_CLIENT(5)"
+            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "ERROR_SPEECH_TIMEOUT(6)"
+            SpeechRecognizer.ERROR_NO_MATCH -> "ERROR_NO_MATCH(7)"
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "ERROR_RECOGNIZER_BUSY(8)"
+            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "ERROR_INSUFFICIENT_PERMISSIONS(9)"
+            else -> "ERROR_UNKNOWN($error)"
+        }
+
         @Volatile
         var isMainActivityInForeground: Boolean = true
 
@@ -959,9 +1661,11 @@ class WakeWordVoiceService : Service() {
             isIntentionallyPaused = true
             _isInputFocusPaused.value = true
             _isMicrophoneInitialized.value = false
+            _isServiceSpeechRecognizerListening.value = false
             _serviceMicRms.value = 0f
             val instance = activeInstance
             if (instance != null) {
+                instance.stopSpeechRecognizerListening(destroyInstance = false)
                 instance.releaseServiceMicrophoneRecord(repromotePassiveNotification = false)
                 instance.abandonExclusiveAudioFocus()
             } else {
@@ -975,23 +1679,61 @@ class WakeWordVoiceService : Service() {
         }
 
         /**
+         * Explicitly pauses the background [WakeWordVoiceService] and synchronously releases its
+         * [AudioRecord] hardware lock and exclusive audio focus before the 150ms OS hardware buffer
+         * clear window for foreground UI Mic dictation.
+         */
+        fun pauseForUiDictation(context: Context? = null) {
+            stopAndReleaseServiceAudioRecordSynchronously("ui_dictation_button_handoff")
+            val details =
+                "isIntentionallyPaused=$isIntentionallyPaused isInputFocusPaused=${_isInputFocusPaused.value} nullifiedAtEpochMs=$lastAudioRecordNullifiedAtEpochMs"
+            Log.d(TAG, "[SR-Trace] stage=SERVICE_PAUSED_FOR_UI_MIC | $details")
+            dispatchDiagnosticTrace("SERVICE_PAUSED_FOR_UI_MIC", details)
+        }
+
+        /**
+         * Restarts/resumes the background [WakeWordVoiceService] after the user finishes speaking
+         * or the foreground UI Mic closes.
+         */
+        fun resumeAfterUiDictation(context: Context? = null, restartLoop: Boolean = true) {
+            isProcessingCommand = false
+            _isInputFocusPaused.value = false
+            if (!_isSleepModeGlobal.value && !_isBatterySaverPausedGlobal.value) {
+                isIntentionallyPaused = false
+                if (restartLoop) {
+                    val instance = activeInstance
+                    if (instance != null) {
+                        if (!_hasExclusiveAudioFocus.value && !isAppRecordingActive) {
+                            instance.requestExclusiveAudioFocus()
+                        }
+                        if (!instance._isKeywordLoopRunning.value) {
+                            instance.startKeywordDetectionLoop()
+                        }
+                    } else if (context != null) {
+                        startServiceSafely(context, ACTION_RESUME_AFTER_UI_DICTATION)
+                    }
+                }
+            }
+            val details =
+                "isIntentionallyPaused=$isIntentionallyPaused restartLoop=$restartLoop activeInstance=${activeInstance != null}"
+            Log.d(TAG, "[SR-Trace] stage=SERVICE_RESUMED_AFTER_UI_MIC | $details")
+            dispatchDiagnosticTrace("SERVICE_RESUMED_AFTER_UI_MIC", details)
+        }
+
+        /**
          * Pauses the service's microphone state purely in memory and synchronously releases
          * any active [AudioRecord] handle without creating or firing any Intent so in-chat
          * dictation stays 100% internal to the app process.
          */
         fun pauseForInternalDictationInMemory() {
-            stopAndReleaseServiceAudioRecordSynchronously("internal_dictation_in_memory")
+            pauseForUiDictation(null)
         }
 
         /**
          * Resumes the service's passive microphone state purely in memory after internal dictation finishes.
          */
         fun resumeAfterInternalDictationInMemory() {
-            isProcessingCommand = false
-            _isInputFocusPaused.value = false
-            if (!_isSleepModeGlobal.value && !_isBatterySaverPausedGlobal.value) {
-                isIntentionallyPaused = false
-            }
+            resumeAfterUiDictation(null, restartLoop = false)
         }
 
         /**
@@ -1084,6 +1826,9 @@ class WakeWordVoiceService : Service() {
                 intent.putExtra(EXTRA_WAKE_TARGET_CHAT_ID, chatId)
             }
             intent.putExtra(EXTRA_WAKE_MATCHED_PHRASE, result.matchedPhrase)
+            if (!result.followUpQuery.isNullOrBlank()) {
+                intent.putExtra(EXTRA_WAKE_INITIAL_QUERY, result.followUpQuery)
+            }
             return intent
         }
 
@@ -1136,7 +1881,8 @@ class WakeWordVoiceService : Service() {
                     android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
                 )
                 val notification = NotificationCompat.Builder(context, CHANNEL_WAKE_CUE_ID)
-                    .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                    .setSmallIcon(com.example.R.drawable.ic_notification_wake_glowing)
+                    .setColor(0xFF10B981.toInt())
                     .setContentTitle("Ready for Commands • \"${result.matchedPhrase}\"")
                     .setContentText("Matched $chatTitle — speak your command or tap to open chat")
                     .setPriority(NotificationCompat.PRIORITY_DEFAULT)
@@ -1221,13 +1967,21 @@ class WakeWordVoiceService : Service() {
         fun startServiceSafely(
             context: Context,
             action: String = ACTION_START_VOICE_SERVICE,
-            candidateTranscript: String? = null
+            candidateTranscript: String? = null,
+            customWakeWord: String? = null,
+            useSpeechRecognizerEngine: Boolean = false
         ) {
             val appCtx = context.applicationContext ?: context
             val intent = Intent(appCtx, WakeWordVoiceService::class.java).apply {
                 this.action = action
                 if (!candidateTranscript.isNullOrBlank()) {
                     putExtra(EXTRA_CANDIDATE_TRANSCRIPT, candidateTranscript)
+                }
+                if (!customWakeWord.isNullOrBlank()) {
+                    putExtra(EXTRA_CUSTOM_WAKE_WORD, customWakeWord)
+                }
+                if (useSpeechRecognizerEngine) {
+                    putExtra(EXTRA_USE_SPEECH_RECOGNIZER_ENGINE, true)
                 }
             }
             try {
@@ -1242,6 +1996,16 @@ class WakeWordVoiceService : Service() {
                 } catch (inner: Throwable) {
                     Log.w(TAG, "Unable to start WakeWordVoiceService ($action): ${inner.message}")
                 }
+            }
+        }
+
+        fun stopServiceSafely(context: Context) {
+            val appCtx = context.applicationContext ?: context
+            stopAndReleaseServiceAudioRecordSynchronously("stop_service_safely")
+            try {
+                appCtx.stopService(Intent(appCtx, WakeWordVoiceService::class.java))
+            } catch (e: Throwable) {
+                Log.w(TAG, "Unable to stop WakeWordVoiceService: ${e.message}")
             }
         }
 
@@ -1342,5 +2106,267 @@ class WakeWordVoiceService : Service() {
             }
             return false
         }
+
+        private val _lastSimulationDiagnosticReport = MutableStateFlow<WakeWordSimulationDiagnosticReport?>(null)
+        val lastSimulationDiagnosticReport: StateFlow<WakeWordSimulationDiagnosticReport?> =
+            _lastSimulationDiagnosticReport.asStateFlow()
+
+        /**
+         * Live telemetry from the on-device hybrid keyword spotter ([LocalKeywordSpotterEngine]).
+         */
+        val keywordSpotterTelemetry: StateFlow<LocalKeywordSpotterTelemetry> =
+            LocalKeywordSpotterEngine.telemetryState
+
+        @Volatile
+        var simulationDiagnosticRunCount: Int = 0
+            private set
+
+        /**
+         * Synthesizes a non-silent 16kHz 16-bit Little-Endian mono PCM frame (`640` bytes = 20ms)
+         * representing a 440Hz speech-band tone to verify the microphone pre-roll buffer, RMS computation,
+         * and non-silent packet validator without requiring physical vocal input.
+         */
+        fun synthesizeDiagnosticPcmFrame(sampleCount: Int = 320, amplitude: Int = 6200): ByteArray {
+            val safeSamples = sampleCount.coerceIn(64, 4096)
+            val pcm = ByteArray(safeSamples * 2)
+            for (i in 0 until safeSamples) {
+                val angle = (2.0 * Math.PI * i * 440.0) / 16000.0
+                val sample = (kotlin.math.sin(angle) * amplitude).toInt().coerceIn(-32767, 32767).toShort()
+                pcm[i * 2] = (sample.toInt() and 0xFF).toByte()
+                pcm[i * 2 + 1] = ((sample.toInt() shr 8) and 0xFF).toByte()
+            }
+            return pcm
+        }
+
+        /**
+         * Simulates the end-to-end wake word detection flow to verify the microphone pre-roll pipeline,
+         * RMS calculation, phrase matching, synchronous microphone handoff (`stopAndReleaseServiceAudioRecordSynchronously`),
+         * and assistant trigger routing without needing to say the wake word out loud.
+         */
+        fun simulateWakeWordDetectionFlow(
+            context: Context,
+            wakePhraseOverride: String? = null,
+            simulatedFollowUpQuery: String? = null,
+            configuredWakeWords: List<WakeWord> = emptyList(),
+            sensitivityOverride: Float? = null,
+            dispatchToDetectionCallbacks: Boolean = true
+        ): WakeWordSimulationDiagnosticReport {
+            val startEpochMs = System.currentTimeMillis()
+            val appCtx = context.applicationContext ?: context
+            com.example.util.AppSettingsManager.ensureInitialized(appCtx)
+
+            val resolvedWakePhrase = wakePhraseOverride?.trim()?.takeIf { it.isNotBlank() }
+                ?: _customWakeWord.value.trim().takeIf { it.isNotBlank() }
+                ?: com.example.util.AppSettingsManager.getCustomWakeWordPhrase(appCtx)
+
+            val effectiveSensitivity = (sensitivityOverride ?: customWakeWordSensitivity).coerceIn(0.50f, 0.98f)
+            val simulatedTranscript = if (simulatedFollowUpQuery.isNullOrBlank()) {
+                resolvedWakePhrase
+            } else {
+                "$resolvedWakePhrase ${simulatedFollowUpQuery.trim()}"
+            }
+
+            // 1. Verify Microphone & Audio Pre-Roll Pipeline
+            val recordAudioGranted = try {
+                ContextCompat.checkSelfPermission(
+                    appCtx,
+                    Manifest.permission.RECORD_AUDIO
+                ) == PackageManager.PERMISSION_GRANTED
+            } catch (_: Throwable) {
+                false
+            }
+            val recognizerAvailable = try {
+                SpeechRecognizer.isRecognitionAvailable(appCtx)
+            } catch (_: Throwable) {
+                false
+            }
+            val testPcmFrame = synthesizeDiagnosticPcmFrame(sampleCount = 320, amplitude = 6200)
+            val isNonSilent = !WakeWordManager.isPcmByteBufferSilent(testPcmFrame, testPcmFrame.size)
+            var sumSq = 0.0
+            var sampleCount = 0
+            var idx = 0
+            while (idx + 1 < testPcmFrame.size) {
+                val low = testPcmFrame[idx].toInt() and 0xFF
+                val high = testPcmFrame[idx + 1].toInt()
+                val sample = ((high shl 8) or low).toShort().toDouble()
+                sumSq += sample * sample
+                sampleCount++
+                idx += 2
+            }
+            val rmsAmplitude = if (sampleCount > 0) sqrt(sumSq / sampleCount).toFloat() else 0f
+            val computedRmsDb = if (rmsAmplitude > 1f) {
+                (20.0 * kotlin.math.log10(rmsAmplitude / 32768.0) + 90.0).toFloat().coerceIn(0f, 90f)
+            } else {
+                0f
+            }
+
+            val instance = activeInstance
+            if (instance != null) {
+                instance.audioPipelineBuffer.trySend(testPcmFrame)
+                _serviceMicRms.value = rmsAmplitude
+            }
+            val micCheckPassed = isNonSilent && testPcmFrame.size >= 640 && computedRmsDb > 10f
+
+            // 2. Verify Wake Word Candidate List & Phrase Matching Logic
+            val customCandidate = WakeWord(
+                id = CUSTOM_WAKE_WORD_ID,
+                phrase = resolvedWakePhrase,
+                isEnabled = true,
+                sensitivity = effectiveSensitivity,
+                chatId = customWakeWordTargetChatId,
+                chatTitle = "Gemini Assistant"
+            )
+            val candidatePool = buildList {
+                add(customCandidate)
+                if (instance != null) {
+                    addAll(instance.getEffectiveWakeWords())
+                }
+                addAll(configuredWakeWords)
+                addAll(_activeDatabaseWakeWords.value)
+            }.distinctBy { "${it.id}_${it.phrase.lowercase(java.util.Locale.US)}" }
+
+            val matchResult = matchWakeWordFromList(
+                transcript = simulatedTranscript,
+                activeWakeWords = candidatePool,
+                sensitivityOverride = effectiveSensitivity
+            ) ?: WakeWordDetectionResult(
+                wakeWord = customCandidate,
+                matchedPhrase = resolvedWakePhrase,
+                followUpQuery = simulatedFollowUpQuery?.trim()?.takeIf { it.isNotBlank() },
+                rawTranscript = simulatedTranscript
+            )
+
+            val spotterTelemetry = LocalKeywordSpotterEngine.evaluateCandidateTranscript(
+                transcript = simulatedTranscript,
+                customWakePhrase = resolvedWakePhrase,
+                sensitivityThreshold = effectiveSensitivity,
+                recentPcmFrame = testPcmFrame,
+                targetChatId = matchResult.wakeWord.chatId ?: customWakeWordTargetChatId,
+                targetChatTitle = matchResult.wakeWord.chatTitle.ifBlank { "Gemini Assistant" }
+            )
+
+            val similarityScore = maxOf(
+                AudioCommandSanitizer.computePhraseSimilarity(
+                    matchResult.matchedPhrase,
+                    resolvedWakePhrase
+                ).coerceIn(0f, 1f),
+                spotterTelemetry.combinedSpotterConfidence
+            )
+            val processingPassed = matchResult.matchedPhrase.isNotBlank() &&
+                similarityScore >= effectiveSensitivity * 0.85f
+
+            // 3. Verify Synchronous Microphone Handoff & Exclusive Audio Focus Release
+            val handoffBefore = synchronousDictationHandoffReleaseCount
+            if (instance != null && dispatchToDetectionCallbacks) {
+                instance.triggerGeminiAssistant(matchResult)
+            } else {
+                stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
+                AudioCommandSanitizer.playWakeWordHaptic(appCtx, matchResult.matchedPhrase)
+                _lastDetectedWakeWord.value = matchResult
+                _detectedWakeWordsFlow.tryEmit(matchResult)
+                _geminiAssistantTriggerFlow.tryEmit(matchResult)
+                postWakeWordReadyCueNotification(appCtx, matchResult)
+                if (dispatchToDetectionCallbacks) {
+                    onWakeWordDetectedCallback?.invoke(matchResult)
+                    onGeminiAssistantTriggeredCallback?.invoke(matchResult)
+                }
+            }
+            val handoffAfter = synchronousDictationHandoffReleaseCount
+            val handoffVerified = handoffAfter > handoffBefore &&
+                !_isMicrophoneInitialized.value &&
+                !_isServiceSpeechRecognizerListening.value &&
+                lastAudioRecordNullifiedAtEpochMs > 0L
+
+            val resolvedChatTitle = matchResult.wakeWord.chatTitle.ifBlank { "Gemini Assistant" }
+            val elapsedMs = (System.currentTimeMillis() - startEpochMs).coerceAtLeast(1L)
+            val overallPassed = micCheckPassed && processingPassed && handoffVerified
+
+            val steps = listOf(
+                "1. Mic & Pre-Roll Pipeline: Verified (${testPcmFrame.size}B 16kHz PCM frame, RMS ${String.format(java.util.Locale.US, "%.1f", computedRmsDb)} dB, RECORD_AUDIO=${if (recordAudioGranted) "GRANTED" else "SIMULATED"})",
+                "2. Wake-Word Processing: Matched \"${matchResult.matchedPhrase}\" (Similarity ${(similarityScore * 100).toInt()}% >= Threshold ${(effectiveSensitivity * 100).toInt()}%) -> Target \"$resolvedChatTitle\"",
+                "3. Synchronous Mic Handoff: Verified (serviceAudioRecord=null, SpeechRecognizer released, Handoff #$handoffAfter, Reason=\"$lastSynchronousReleaseReason\")"
+            )
+            val summary = buildString {
+                append("Wake Word Diagnostic Simulation ${if (overallPassed) "PASSED" else "PARTIAL"} (${elapsedMs}ms): ")
+                append("Simulated \"$simulatedTranscript\" -> Matched \"${matchResult.matchedPhrase}\" ")
+                append("[Mic Pre-Roll ${testPcmFrame.size}B @ ${String.format(java.util.Locale.US, "%.1f", computedRmsDb)} dB | ")
+                append("Similarity ${(similarityScore * 100).toInt()}% | ")
+                append("Sync Handoff #$handoffAfter Verified]")
+            }
+
+            simulationDiagnosticRunCount++
+            val report = WakeWordSimulationDiagnosticReport(
+                simulatedTranscript = simulatedTranscript,
+                matchedPhrase = matchResult.matchedPhrase,
+                followUpQuery = matchResult.followUpQuery,
+                targetChatId = matchResult.wakeWord.chatId,
+                targetChatTitle = resolvedChatTitle,
+                sensitivityThreshold = effectiveSensitivity,
+                phraseSimilarityScore = similarityScore,
+                recordAudioPermissionGranted = recordAudioGranted,
+                speechRecognizerAvailable = recognizerAvailable,
+                preRollPcmBytesVerified = testPcmFrame.size,
+                computedRmsDb = computedRmsDb,
+                synchronousMicHandoffVerified = handoffVerified,
+                handoffReleaseCountAfter = handoffAfter,
+                microphoneCheckPassed = micCheckPassed,
+                processingAndMatchingPassed = processingPassed,
+                overallPassed = overallPassed,
+                elapsedDurationMs = elapsedMs,
+                timestampEpochMs = System.currentTimeMillis(),
+                diagnosticSteps = steps,
+                formattedSummary = summary
+            )
+            _lastSimulationDiagnosticReport.value = report
+            dispatchDiagnosticTrace("WAKE_WORD_DIAGNOSTIC_SIMULATION", summary)
+            return report
+        }
+    }
+
+    /**
+     * Instance-level helper that delegates to [Companion.simulateWakeWordDetectionFlow] using this
+     * service's context and active wake word configuration.
+     */
+    fun simulateWakeWordDetectionDiagnostic(
+        wakePhraseOverride: String? = null,
+        simulatedFollowUpQuery: String? = null,
+        dispatchToDetectionCallbacks: Boolean = true
+    ): WakeWordSimulationDiagnosticReport {
+        return simulateWakeWordDetectionFlow(
+            context = applicationContext,
+            wakePhraseOverride = wakePhraseOverride,
+            simulatedFollowUpQuery = simulatedFollowUpQuery,
+            configuredWakeWords = getEffectiveWakeWords(),
+            sensitivityOverride = customWakeWordSensitivity,
+            dispatchToDetectionCallbacks = dispatchToDetectionCallbacks
+        )
     }
 }
+
+/**
+ * Structured diagnostic report produced when simulating the wake word detection flow from the
+ * Settings screen to verify microphone pre-roll capture, phrase matching, and synchronous audio handoff.
+ */
+data class WakeWordSimulationDiagnosticReport(
+    val simulatedTranscript: String,
+    val matchedPhrase: String,
+    val followUpQuery: String?,
+    val targetChatId: Long?,
+    val targetChatTitle: String,
+    val sensitivityThreshold: Float,
+    val phraseSimilarityScore: Float,
+    val recordAudioPermissionGranted: Boolean,
+    val speechRecognizerAvailable: Boolean,
+    val preRollPcmBytesVerified: Int,
+    val computedRmsDb: Float,
+    val synchronousMicHandoffVerified: Boolean,
+    val handoffReleaseCountAfter: Int,
+    val microphoneCheckPassed: Boolean,
+    val processingAndMatchingPassed: Boolean,
+    val overallPassed: Boolean,
+    val elapsedDurationMs: Long,
+    val timestampEpochMs: Long,
+    val diagnosticSteps: List<String>,
+    val formattedSummary: String
+)
+

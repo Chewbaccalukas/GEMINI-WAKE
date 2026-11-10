@@ -691,7 +691,7 @@ class HandsFreeVoiceCommandTest {
             intent.getStringExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL)
         )
         assertEquals(
-            3000L,
+            5000L,
             intent.getLongExtra(android.speech.RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 0L)
         )
         assertEquals(
@@ -699,7 +699,7 @@ class HandsFreeVoiceCommandTest {
             intent.getLongExtra(android.speech.RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 0L)
         )
         assertEquals(
-            5000L,
+            3000L,
             intent.getLongExtra(android.speech.RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 0L)
         )
 

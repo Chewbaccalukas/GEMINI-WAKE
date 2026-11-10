@@ -20,6 +20,8 @@ import com.example.data.model.WakeWord
 import com.example.data.model.WakeWordSample
 import com.example.game.AdventureGameDao
 import com.example.game.AdventureGameEntity
+import com.example.game.AdventureQuestHistoryEntity
+import com.example.game.PlayerPresence
 import com.example.ui.theme.AppTheme
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -37,6 +39,8 @@ import kotlinx.coroutines.launch
  * - [WakeWordSample] (`wake_word_samples` table)
  * - [VoiceCommandEntity] (`voice_command_history` table)
  * - [AdventureGameEntity] (`adventure_game_states` table)
+ * - [AdventureQuestHistoryEntity] (`adventure_quest_history` table)
+ * - [PlayerPresence] (`player_presence_cache` table)
  */
 @Database(
     entities = [
@@ -45,9 +49,11 @@ import kotlinx.coroutines.launch
         WakeWordSample::class,
         WakeWord::class,
         VoiceCommandEntity::class,
-        AdventureGameEntity::class
+        AdventureGameEntity::class,
+        AdventureQuestHistoryEntity::class,
+        PlayerPresence::class
     ],
-    version = 19,
+    version = 21,
     exportSchema = false
 )
 @TypeConverters(AppDatabase.Converters::class)
@@ -319,6 +325,57 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_19_20 = object : Migration(19, 20) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `adventure_game_states` ADD COLUMN `syncStatus` TEXT NOT NULL DEFAULT 'SYNCED'")
+                db.execSQL("ALTER TABLE `adventure_game_states` ADD COLUMN `pendingOfflineMutations` INTEGER NOT NULL DEFAULT 0")
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `adventure_quest_history` (
+                        `historyId` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        `chatId` INTEGER NOT NULL,
+                        `questId` TEXT NOT NULL,
+                        `title` TEXT NOT NULL,
+                        `description` TEXT NOT NULL,
+                        `priority` TEXT NOT NULL DEFAULT 'MEDIUM',
+                        `isCompleted` INTEGER NOT NULL DEFAULT 0,
+                        `currentStep` INTEGER NOT NULL DEFAULT 0,
+                        `totalSteps` INTEGER NOT NULL DEFAULT 1,
+                        `xpReward` INTEGER NOT NULL DEFAULT 100,
+                        `isDailyChallenge` INTEGER NOT NULL DEFAULT 0,
+                        `actionType` TEXT NOT NULL DEFAULT 'UPDATED',
+                        `syncStatus` TEXT NOT NULL DEFAULT 'SYNCED',
+                        `updatedAt` INTEGER NOT NULL DEFAULT 0
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_adventure_quest_history_chatId` ON `adventure_quest_history` (`chatId`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_adventure_quest_history_syncStatus` ON `adventure_quest_history` (`syncStatus`)")
+            }
+        }
+
+        val MIGRATION_20_21 = object : Migration(20, 21) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `player_presence_cache` (
+                        `odinUid` TEXT NOT NULL PRIMARY KEY,
+                        `displayName` TEXT NOT NULL,
+                        `level` INTEGER NOT NULL,
+                        `completedQuestCount` INTEGER NOT NULL,
+                        `currentActiveChatTitle` TEXT NOT NULL,
+                        `isOnline` INTEGER NOT NULL,
+                        `isStealthMode` INTEGER NOT NULL,
+                        `sessionStartedEpochMs` INTEGER NOT NULL,
+                        `lastHeartbeatEpochMs` INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_player_presence_cache_lastHeartbeatEpochMs` ON `player_presence_cache` (`lastHeartbeatEpochMs`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_player_presence_cache_isOnline` ON `player_presence_cache` (`isOnline`)")
+            }
+        }
+
         val ALL_MIGRATIONS: Array<Migration> = arrayOf(
             MIGRATION_1_2,
             MIGRATION_2_3,
@@ -336,7 +393,9 @@ abstract class AppDatabase : RoomDatabase() {
             MIGRATION_15_16,
             MIGRATION_16_17,
             MIGRATION_17_18,
-            MIGRATION_18_19
+            MIGRATION_18_19,
+            MIGRATION_19_20,
+            MIGRATION_20_21
         )
 
         private val queryExecutor by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {

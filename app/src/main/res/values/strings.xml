@@ -1,3 +1,15 @@
 <resources>
     <string name="app_name">Gemini Wake</string>
+    <string name="settings_simulate_wake_word_button">Simulate Wake Word Detection</string>
+    <string name="settings_simulate_wake_word_flow_button">Simulate Wake Word Detection Flow</string>
+    <string name="settings_simulate_wake_word_subtitle">Simulates the wake word detection flow to verify microphone pre-roll, phrase matching, and synchronous handoff without speaking out loud</string>
+    <string name="settings_simulate_wake_word_passed_badge">DIAGNOSTIC PASSED</string>
+    <string name="settings_datastore_sensitivity_title">Wake Word Detection Sensitivity Threshold (DataStore)</string>
+    <string name="settings_datastore_sensitivity_subtitle">Adjust the wake word detection sensitivity threshold saved in Jetpack DataStore</string>
+    <string name="settings_screen_off_battery_saver_title">Screen-Off Battery Saver (Reduced Polling)</string>
+    <string name="settings_screen_off_battery_saver_subtitle">Reduces wake word detection polling frequency from 60ms to 450ms when the screen is off to save battery</string>
+    <string name="wake_word_glowing_widget_active_label">Wake Listener Active &amp; Glowing</string>
 </resources>
+
+
+

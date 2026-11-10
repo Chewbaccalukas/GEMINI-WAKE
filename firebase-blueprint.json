@@ -188,6 +188,71 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "PlayerPresenceDoc": {
+      "title": "PlayerPresenceDoc",
+      "description": "Multiplayer presence and RPG progression status for the Infinite Adventure Engine.",
+      "type": "object",
+      "properties": {
+        "odinUid": {
+          "type": "string",
+          "description": "Authenticated user UID owning this presence document."
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Adventurer display name."
+        },
+        "level": {
+          "type": "integer",
+          "description": "Current RPG character level (>= 1)."
+        },
+        "completedQuestCount": {
+          "type": "integer",
+          "description": "Total completed quests count (>= 0)."
+        },
+        "currentActiveChatTitle": {
+          "type": "string",
+          "description": "Active chat title, or 'Offline' when offline or in Stealth Mode."
+        },
+        "isOnline": {
+          "type": "boolean",
+          "description": "Whether the player is actively online (always false when isStealthMode is true)."
+        },
+        "isStealthMode": {
+          "type": "boolean",
+          "description": "Whether 'Always Offline' Stealth Mode privacy is active."
+        },
+        "sessionStartedEpochMs": {
+          "type": "integer",
+          "description": "Epoch milliseconds when the current session started (0 when in Stealth Mode or offline)."
+        },
+        "lastHeartbeatEpochMs": {
+          "type": "integer",
+          "description": "Epoch milliseconds of the latest client heartbeat."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Optional server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the latest presence update."
+        }
+      },
+      "required": [
+        "odinUid",
+        "displayName",
+        "level",
+        "completedQuestCount",
+        "currentActiveChatTitle",
+        "isOnline",
+        "isStealthMode",
+        "sessionStartedEpochMs",
+        "lastHeartbeatEpochMs",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -208,6 +273,12 @@
         "$ref": "#/entities/WakeWordDoc"
       },
       "description": "Per-user synchronized custom wake words and sensitivity settings."
+    },
+    "/presence/{uid}": {
+      "schema": {
+        "$ref": "#/entities/PlayerPresenceDoc"
+      },
+      "description": "Multiplayer presence and RPG status documents for the Adventure Engine."
     }
   }
 }

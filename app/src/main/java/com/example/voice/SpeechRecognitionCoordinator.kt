@@ -86,8 +86,8 @@ class SpeechRecognitionCoordinator(
         /** Safety timeout to guarantee STREAM_SYSTEM is unmuted even if onReadyForSpeech never fires. */
         const val SYSTEM_STREAM_UNMUTE_WATCHDOG_MS = 600L
 
-        /** Trailing silence debounce window (1250ms) to auto-finalize one-breath wake queries from partial transcripts. */
-        const val TRAILING_SILENCE_DEBOUNCE_MS = 1250L
+        /** Trailing silence debounce window (3000ms) aligned with RecognizerIntent silence extras to auto-finalize one-breath wake queries from partial transcripts without cutting off speech early. */
+        const val TRAILING_SILENCE_DEBOUNCE_MS = 3000L
 
         /** Required 500ms debounce window before re-arming SpeechRecognizer on AUDIOFOCUS_GAIN. */
         const val AUDIOFOCUS_GAIN_REARM_DEBOUNCE_MS = 500L
@@ -564,14 +564,19 @@ class SpeechRecognitionCoordinator(
     }
 
     /**
-     * Builds the [RecognizerIntent] configured with free-form speech model and silence windows.
+     * Builds the [RecognizerIntent] configured with free-form speech model and explicit silence windows
+     * (3000ms possibly complete silence, 5000ms complete silence, 3000ms minimum speech length).
      */
     fun createRecognizerIntent(): Intent {
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-        return WakeWordManager.configureRecognizerIntent(
+        WakeWordManager.configureRecognizerIntent(
             intent = intent,
             callingPackage = appContext.packageName
         )
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 3000L)
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 5000L)
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 3000L)
+        return intent
     }
 
     /**

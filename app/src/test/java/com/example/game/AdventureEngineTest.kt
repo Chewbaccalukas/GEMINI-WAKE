@@ -278,4 +278,326 @@ class AdventureEngineTest {
             shadowOf(Looper.getMainLooper()).idle()
         }
     }
+
+    @Test
+    fun questEnhancements_chimeAndHaptics_multiStepProgress_dailyChallengeRarePlus_sortDropdown_andShareImageSummary() {
+        val viewModel = MainViewModel(app)
+        try {
+            val addedCountBefore = AdventureEngine.questAddedFeedbackCount
+            val completedCountBefore = AdventureEngine.questCompletedFeedbackCount
+
+            // 1. Add a 3-step HIGH priority quest -> triggers subtle chime + haptic feedback
+            viewModel.addCustomAdventureQuest(
+                title = "Calibrate the Quantum Relay",
+                description = "Align all 3 phase emitters across the spire.",
+                xpReward = 400,
+                totalSteps = 3,
+                priority = QuestPriority.HIGH
+            )
+            assertTrue(
+                "Adding a quest must trigger subtle chime + haptic vibration feedback",
+                AdventureEngine.questAddedFeedbackCount > addedCountBefore
+            )
+
+            val addedQuest = viewModel.adventureState.value.quests.first { it.title == "Calibrate the Quantum Relay" }
+            assertEquals(0, addedQuest.currentStep)
+            assertEquals(3, addedQuest.totalSteps)
+            assertEquals(0, addedQuest.completionPercent)
+            assertEquals(QuestPriority.HIGH, addedQuest.priority)
+
+            // 2. Advance step manually via +1 Step button -> Step 1/3 (33%)
+            viewModel.incrementAdventureQuestStep(addedQuest.id, stepDelta = 1)
+            val afterStep1 = viewModel.adventureState.value.quests.first { it.id == addedQuest.id }
+            assertEquals(1, afterStep1.currentStep)
+            assertEquals(33, afterStep1.completionPercent)
+            assertFalse(afterStep1.isCompleted)
+
+            // Advance remaining 2 steps via inline AI marker [QUEST_STEP: ...] -> auto-completes at Step 3/3 (100%)
+            val markerText = """
+                The final two emitters lock into resonance!
+                [QUEST_STEP: {"id":"${addedQuest.id}","stepDelta":2}]
+            """.trimIndent()
+            val parsedStep = AdventureEngine.parseInlineMarkers(markerText)
+            assertEquals(1, parsedStep.events.size)
+            viewModel.applyInlineAdventureEvents(parsedStep.events)
+
+            val afterStep3 = viewModel.adventureState.value.quests.first { it.id == addedQuest.id }
+            assertEquals(3, afterStep3.currentStep)
+            assertEquals(100, afterStep3.completionPercent)
+            assertTrue("Reaching final step must auto-complete the quest", afterStep3.isCompleted)
+            assertTrue(
+                "Completing a multi-step quest must trigger completion chime + haptic feedback",
+                AdventureEngine.questCompletedFeedbackCount > completedCountBefore
+            )
+
+            // 3. Daily Challenge ("Quest of the Day") generation & guaranteed Rare+ loot reward
+            val dailyQuest = viewModel.ensureDailyChallengeQuest(
+                interactionHistoryOverride = listOf("Starlight Citadel", "Chrono Warden Protocol", "Void Relic")
+            )
+            assertTrue(dailyQuest.isDailyChallenge)
+            assertTrue(dailyQuest.title.startsWith("Quest of the Day:"))
+            val invSizeBeforeDaily = viewModel.adventureState.value.inventory.size
+            val xpBeforeDaily = viewModel.adventureState.value.totalXp
+
+            // Complete the daily challenge
+            viewModel.toggleAdventureQuestCompleted(dailyQuest.id)
+            val stateAfterDaily = viewModel.adventureState.value
+            assertTrue(
+                "Completing Quest of the Day must award bonus XP",
+                stateAfterDaily.totalXp >= xpBeforeDaily + dailyQuest.xpReward
+            )
+            assertTrue(
+                "Completing Quest of the Day must grant a guaranteed Rare/Epic/Legendary loot item",
+                stateAfterDaily.inventory.size >= invSizeBeforeDaily
+            )
+            val topLoot = stateAfterDaily.inventory.first()
+            assertTrue(
+                "Daily Challenge reward loot must be Rare, Epic, or Legendary (never Common)",
+                topLoot.rarityTier in setOf(RarityTier.RARE, RarityTier.EPIC, RarityTier.LEGENDARY)
+            )
+
+            // 4. Sort Dropdown Menu ('Newest', 'Oldest', 'High Priority')
+            viewModel.setAdventureQuestFilter(QuestFilterMode.ALL)
+            viewModel.setAdventureQuestSortOrder(QuestSortOrder.NEWEST)
+            val newestSorted = viewModel.adventureState.value.filteredQuests
+            assertTrue(newestSorted.first().createdAt >= newestSorted.last().createdAt)
+
+            viewModel.setAdventureQuestSortOrder(QuestSortOrder.OLDEST)
+            val oldestSorted = viewModel.adventureState.value.filteredQuests
+            assertTrue(oldestSorted.first().createdAt <= oldestSorted.last().createdAt)
+
+            viewModel.setAdventureQuestSortOrder(QuestSortOrder.HIGH_PRIORITY)
+            val prioritySorted = viewModel.adventureState.value.filteredQuests
+            assertTrue(prioritySorted.first().priority.sortWeight >= prioritySorted.last().priority.sortWeight)
+
+            // 5. Export & Share Active Quest Progress as Image Summary PNG
+            val exportedPng = viewModel.shareAdventureQuestProgressImage(app)
+            assertNotNull("Exported quest progress summary PNG must not be null", exportedPng)
+            assertTrue("Exported PNG file must exist and be non-empty", exportedPng!!.exists() && exportedPng.length() > 0L)
+        } finally {
+            shadowOf(Looper.getMainLooper()).idle()
+            viewModel.cleanShutdown(null)
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+    }
+
+    @Test
+    fun questSearchBar_andOfflineRoomQuestHistoryQueueAutoSync_andConnectivityBadge() {
+        val viewModel = MainViewModel(app)
+        try {
+            // 1. Verify Online connectivity indicator badge default state
+            viewModel.setAdventureNetworkOnlineForTest(true)
+            assertTrue(viewModel.adventureState.value.isOnline)
+            assertEquals(AdventureSyncStatus.SYNCED, viewModel.adventureState.value.syncStatus)
+            assertEquals("Online • Synced", viewModel.adventureState.value.connectivityBadgeLabel)
+
+            // 2. Simulate going OFFLINE and performing quest mutations (add quest, step update, daily challenge)
+            viewModel.setAdventureNetworkOnlineForTest(false)
+            assertFalse(viewModel.adventureState.value.isOnline)
+            assertEquals(AdventureSyncStatus.PENDING_OFFLINE, viewModel.adventureState.value.syncStatus)
+            assertTrue(viewModel.adventureState.value.connectivityBadgeLabel.startsWith("Offline • Queued"))
+
+            viewModel.addCustomAdventureQuest(
+                title = "Decrypt the Starlight Vault",
+                description = "Use the obsidian keycard in the sunken archive.",
+                xpReward = 350,
+                totalSteps = 2,
+                priority = QuestPriority.HIGH
+            )
+            val vaultQuest = viewModel.adventureState.value.quests.first { it.title == "Decrypt the Starlight Vault" }
+            viewModel.incrementAdventureQuestStep(vaultQuest.id, stepDelta = 1)
+            val dailyQuest = viewModel.ensureDailyChallengeQuest(
+                dateKeyOverride = "2026-11-09",
+                interactionHistoryOverride = listOf("Nebula Sanctum")
+            )
+
+            // Verify offline mutations are queued with PENDING_OFFLINE in state and questHistory
+            val offlineState = viewModel.adventureState.value
+            assertFalse(offlineState.isOnline)
+            assertEquals(AdventureSyncStatus.PENDING_OFFLINE, offlineState.syncStatus)
+            assertTrue("Offline mutations must increment pendingOfflineSyncCount", offlineState.pendingOfflineSyncCount >= 3)
+            assertEquals(
+                "Offline • Queued (${offlineState.pendingOfflineSyncCount})",
+                offlineState.connectivityBadgeLabel
+            )
+            assertTrue(
+                "Offline quest history log must record PENDING_OFFLINE entries",
+                offlineState.questHistory.any {
+                    it.questId == vaultQuest.id && it.syncStatus == AdventureSyncStatus.PENDING_OFFLINE.name
+                }
+            )
+
+            // 3. Verify Multi-Field Quest Search Bar (Title, Description, Priority, and Daily Badge)
+            viewModel.setAdventureQuestFilter(QuestFilterMode.ALL)
+
+            // Search by Title keyword
+            viewModel.setAdventureQuestSearchQuery("Starlight Vault")
+            assertEquals(1, viewModel.adventureState.value.filteredQuests.size)
+            assertEquals(vaultQuest.id, viewModel.adventureState.value.filteredQuests.first().id)
+
+            // Search by Description keyword
+            viewModel.setAdventureQuestSearchQuery("obsidian keycard")
+            assertEquals(1, viewModel.adventureState.value.filteredQuests.size)
+            assertEquals(vaultQuest.id, viewModel.adventureState.value.filteredQuests.first().id)
+
+            // Search by Priority badge / name
+            viewModel.setAdventureQuestSearchQuery("HIGH")
+            assertTrue(
+                "Searching 'HIGH' must return only HIGH priority quests",
+                viewModel.adventureState.value.filteredQuests.isNotEmpty() &&
+                    viewModel.adventureState.value.filteredQuests.all { it.priority == QuestPriority.HIGH }
+            )
+
+            // Search by Daily Challenge badge keyword ("daily" / "quest of the day")
+            viewModel.setAdventureQuestSearchQuery("daily")
+            assertTrue(
+                "Searching 'daily' must match the Daily Challenge quest",
+                viewModel.adventureState.value.filteredQuests.any { it.id == dailyQuest.id && it.isDailyChallenge }
+            )
+
+            // Clear search query -> restores full quest list
+            viewModel.setAdventureQuestSearchQuery("")
+            assertEquals(viewModel.adventureState.value.quests.size, viewModel.adventureState.value.filteredQuests.size)
+
+            // 4. Transition back to ONLINE -> verify queued offline changes auto-sync
+            viewModel.setAdventureNetworkOnlineForTest(true)
+            val deadline = System.currentTimeMillis() + 3_000L
+            while (viewModel.adventureState.value.pendingOfflineSyncCount > 0 && System.currentTimeMillis() < deadline) {
+                shadowOf(Looper.getMainLooper()).idle()
+                Thread.sleep(25L)
+            }
+            shadowOf(Looper.getMainLooper()).idle()
+
+            val syncedState = viewModel.adventureState.value
+            assertTrue(syncedState.isOnline)
+            assertEquals(0, syncedState.pendingOfflineSyncCount)
+            assertEquals(AdventureSyncStatus.SYNCED, syncedState.syncStatus)
+            assertEquals("Online • Synced", syncedState.connectivityBadgeLabel)
+        } finally {
+            shadowOf(Looper.getMainLooper()).idle()
+            viewModel.cleanShutdown(null)
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+    }
+
+    @Test
+    fun testLowPowerModeDisablesWakeWordListenerPreservesUiMicAndCalculatesBatteryHours() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        com.example.util.AppSettingsManager.setLowPowerModeEnabled(app, false)
+        val viewModel = MainViewModel(app)
+        try {
+            viewModel.setPermissionGrantedOverrideForTest(true)
+            viewModel.onWindowFocusChanged(true)
+
+            // 1. Verify UI_MIC_HARDWARE_CLEAR_DELAY_MS is 500L
+            assertEquals(500L, viewModel.UI_MIC_HARDWARE_CLEAR_DELAY_MS)
+
+            // 2. Verify dynamic battery drain calculation when wake-word listener is active vs disabled
+            val activeWakeEstimate = viewModel.refreshBatteryDrainEstimate(
+                batteryPercentOverride = 80,
+                measuredCurrentMaOverride = 220f
+            )
+            assertFalse(activeWakeEstimate.lowPowerModeEnabled)
+            assertTrue(activeWakeEstimate.formattedLabel.startsWith("Estimated Hours Remaining:"))
+
+            // 3. Enable Low Power Mode -> background wake-word listener is disabled, estimated hours remaining increases
+            viewModel.setLowPowerModeEnabled(true)
+            assertTrue(viewModel.lowPowerModeEnabled.value)
+
+            val lowPowerEstimate = viewModel.refreshBatteryDrainEstimate(
+                batteryPercentOverride = 80,
+                measuredCurrentMaOverride = 152f
+            )
+            assertTrue(lowPowerEstimate.lowPowerModeEnabled)
+            assertTrue(
+                "Disabling wake-word listener in Low Power Mode must extend estimated hours remaining",
+                lowPowerEstimate.estimatedHoursRemaining > activeWakeEstimate.estimatedHoursRemaining
+            )
+            assertTrue(lowPowerEstimate.bonusHoursSaved > 0f)
+            assertTrue(lowPowerEstimate.formattedLabel.contains("Estimated Hours Remaining:"))
+            assertTrue(lowPowerEstimate.formattedLabel.contains("saved"))
+
+            // 4. Attempting to start continuous background wake-word listener in Low Power Mode is blocked
+            viewModel.startContinuousWakeWordListening(userInitiated = true)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertFalse(
+                "Constant background wake-word listener must remain disabled in Low Power Mode",
+                viewModel.wakeWordManager.isListening.value
+            )
+
+            // 5. UI microphone button (toggleInChatDictation / toggleInternalDictation) remains functional
+            val uiMicStarted = viewModel.toggleInChatDictation()
+            assertTrue("UI microphone button must remain functional in Low Power Mode", uiMicStarted)
+            assertTrue(viewModel.isInChatDictationActive.value)
+
+            // Stop UI mic dictation -> background wake listener still stays off
+            viewModel.toggleInChatDictation()
+            assertFalse(viewModel.isInChatDictationActive.value)
+            assertFalse(viewModel.wakeWordManager.isListening.value)
+        } finally {
+            com.example.util.AppSettingsManager.setLowPowerModeEnabled(app, false)
+            shadowOf(Looper.getMainLooper()).idle()
+            viewModel.cleanShutdown(null)
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+    }
+
+    @Test
+    fun testGlobalOfflineQuestQueueingToggleTopBarSyncModeAndHapticFeedback() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        com.example.util.AppSettingsManager.setOfflineQuestQueueingEnabled(app, false)
+        val viewModel = MainViewModel(app)
+        try {
+            viewModel.setAdventureNetworkOnlineForTest(true)
+            viewModel.setOfflineQuestQueueingEnabled(false, triggerHaptic = false)
+            assertEquals("Online Sync", viewModel.adventureState.value.topBarSyncModeLabel)
+
+            // 1. Switch global toggle to Offline Cache mode -> verify top bar status & subtle haptic feedback
+            val hapticsBefore = AdventureEngine.syncModeSwitchHapticCount
+            viewModel.toggleOfflineQuestQueueingMode()
+            assertTrue(viewModel.offlineQuestQueueingEnabled.value)
+            assertTrue(viewModel.adventureState.value.offlineQueueingModeEnabled)
+            assertEquals("Offline Cache", viewModel.adventureState.value.topBarSyncModeLabel)
+            assertEquals(hapticsBefore + 1, AdventureEngine.syncModeSwitchHapticCount)
+
+            // 2. Mutate quest progress while in Offline Cache mode (even though network is online)
+            //    -> verify quest progress is cached in Room queue (PENDING_OFFLINE) for later synchronization
+            viewModel.addCustomAdventureQuest(
+                title = "Cache the Astral Beacon",
+                description = "Store telemetry in the offline Room queue.",
+                xpReward = 250,
+                totalSteps = 2,
+                priority = QuestPriority.HIGH
+            )
+            val cachedState = viewModel.adventureState.value
+            assertEquals(AdventureSyncStatus.PENDING_OFFLINE, cachedState.syncStatus)
+            assertTrue(cachedState.pendingOfflineSyncCount >= 1)
+            assertTrue(cachedState.connectivityBadgeLabel.startsWith("Offline • Queued"))
+
+            // 3. Switch global toggle back to Online Sync mode -> verify haptic feedback & immediate Room queue flush
+            val hapticsBeforeOnline = AdventureEngine.syncModeSwitchHapticCount
+            viewModel.toggleOfflineQuestQueueingMode()
+            assertFalse(viewModel.offlineQuestQueueingEnabled.value)
+            assertEquals("Online Sync", viewModel.adventureState.value.topBarSyncModeLabel)
+            assertEquals(hapticsBeforeOnline + 1, AdventureEngine.syncModeSwitchHapticCount)
+
+            val deadline = System.currentTimeMillis() + 3_000L
+            while (viewModel.adventureState.value.pendingOfflineSyncCount > 0 && System.currentTimeMillis() < deadline) {
+                shadowOf(Looper.getMainLooper()).idle()
+                Thread.sleep(25L)
+            }
+            shadowOf(Looper.getMainLooper()).idle()
+
+            val syncedState = viewModel.adventureState.value
+            assertEquals(0, syncedState.pendingOfflineSyncCount)
+            assertEquals(AdventureSyncStatus.SYNCED, syncedState.syncStatus)
+            assertEquals("Online • Synced", syncedState.connectivityBadgeLabel)
+        } finally {
+            com.example.util.AppSettingsManager.setOfflineQuestQueueingEnabled(app, false)
+            shadowOf(Looper.getMainLooper()).idle()
+            viewModel.cleanShutdown(null)
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+    }
 }
+

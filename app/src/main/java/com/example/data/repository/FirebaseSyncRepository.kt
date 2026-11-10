@@ -158,6 +158,55 @@ class FirebaseSyncRepository(
         }
     }
 
+    /**
+     * Multi-syncs the user's selected wake-word target chat session across Cloud Firestore
+     * (`/users/{userId}/chats`): sets `isDefaultWakeChat = true` on [selectedChatDoc] and clears
+     * `isDefaultWakeChat = false` on any previously defaulted chat documents so all connected
+     * devices stay synchronized.
+     */
+    suspend fun setDefaultWakeChatMultiSync(
+        userId: String,
+        selectedChatDoc: FirestoreChatDoc,
+        existingCloudChats: List<FirestoreChatDoc> = emptyList()
+    ): String {
+        val selectedDocId = selectedChatDoc.id.ifBlank {
+            FirestoreChatDoc.docIdForChat(selectedChatDoc.localChatId)
+        }
+        val promotedDoc = selectedChatDoc.copy(
+            id = selectedDocId,
+            userId = userId,
+            isDefaultWakeChat = true
+        )
+        saveChatDoc(userId, promotedDoc)
+
+        val candidatesToDemote = buildList {
+            addAll(existingCloudChats.filter { it.id != selectedDocId && it.isDefaultWakeChat })
+            runCatching {
+                val queriedDefaults = firestore.collection(chatsPath(userId))
+                    .whereEqualTo("isDefaultWakeChat", true)
+                    .get()
+                    .await()
+                    .toObjects<FirestoreChatDoc>()
+                addAll(queriedDefaults.filter { it.id != selectedDocId })
+            }
+        }.distinctBy { it.id }
+
+        for (otherDoc in candidatesToDemote) {
+            if (otherDoc.id.isNotBlank() && otherDoc.id != selectedDocId) {
+                val otherPath = "${chatsPath(userId)}/${otherDoc.id}"
+                runCatching {
+                    firestore.document(otherPath).update(
+                        mapOf(
+                            "isDefaultWakeChat" to false,
+                            "updatedAt" to FieldValue.serverTimestamp()
+                        )
+                    ).await()
+                }
+            }
+        }
+        return selectedDocId
+    }
+
     // =========================================================================
     // Messages (/users/{userId}/messages/{messageId})
     // =========================================================================

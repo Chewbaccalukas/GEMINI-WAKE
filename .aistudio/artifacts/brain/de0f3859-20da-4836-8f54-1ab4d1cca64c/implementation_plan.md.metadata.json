@@ -1,6 +1,6 @@
 {
-  "summary":  "Implementation plan for adding the Quest Filter Toggle ('All', 'Active', 'Completed' with live count badges and persisted selection) and the Visual Rarity Glow Indicator System (Common: Grey, Rare: Blue, Epic: Purple, Legendary: Orange, with an animated pulsing aura on Epic and Legendary items and a static outer glow on Common and Rare items) in the Adventure Engine drawer.",
-  "updatedAt":  "2026-11-09T12:33:43.110039844Z",
+  "summary":  "Implementation plan for the Multiplayer Presence & Friend Status system in the Adventure Engine, covering the PlayerPresence model, Room + Firestore presence/{uid} sync with 30s heartbeats and 2-minute timeout, Stealth Mode ('Always Offline') privacy enforcement, and the FriendPresenceCard UI in GameDrawerSheet.kt.",
+  "updatedAt":  "2026-11-10T04:40:02.326439823Z",
   "requestFeedback":  true,
   "userFacing":  true
 }

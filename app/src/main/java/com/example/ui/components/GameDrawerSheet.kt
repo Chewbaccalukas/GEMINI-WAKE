@@ -51,6 +51,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
@@ -73,14 +74,26 @@ import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Save
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.VpnKey
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.rememberCoroutineScope
+import com.example.game.PlayerPresence
+import com.example.game.PlayerPresenceCoordinator
+import com.example.util.AppSettingsManager
+import kotlinx.coroutines.launch
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -123,9 +136,12 @@ import com.example.game.AdventureDrawerTab
 import com.example.game.AdventureGameState
 import com.example.game.AdventureInlineEvent
 import com.example.game.AdventureQuest
+import com.example.game.AdventureSyncStatus
 import com.example.game.DifficultyLevel
 import com.example.game.InventoryItem
 import com.example.game.QuestFilterMode
+import com.example.game.QuestPriority
+import com.example.game.QuestSortOrder
 import com.example.game.RarityTier
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -156,6 +172,56 @@ fun parseHexColorSafe(hex: String, fallback: Color = Color(0xFF38BDF8)): Color {
         Color(android.graphics.Color.parseColor(hex.trim()))
     } catch (_: Throwable) {
         fallback
+    }
+}
+
+/**
+ * Compact visual connectivity indicator badge displayed in the Quest Drawer header showing whether
+ * the app is currently `'Online'` (synced) or `'Offline'` (queued changes in local Room cache).
+ */
+@Composable
+fun AdventureConnectivityStatusBadge(
+    adventureState: AdventureGameState,
+    testTag: String = "adventure_connectivity_status_badge",
+    modifier: Modifier = Modifier
+) {
+    val isOnline = adventureState.isOnline
+    val pendingCount = adventureState.pendingOfflineSyncCount
+    val badgeColor = when {
+        !isOnline -> Color(0xFFF59E0B) // Amber for Offline / Queued changes
+        adventureState.syncStatus == AdventureSyncStatus.SYNCING || pendingCount > 0 -> Color(0xFF38BDF8)
+        else -> Color(0xFF10B981) // Emerald for Online / Synced
+    }
+    val statusText = adventureState.connectivityBadgeLabel
+
+    Surface(
+        shape = RoundedCornerShape(999.dp),
+        color = badgeColor.copy(alpha = 0.16f),
+        border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.65f)),
+        modifier = modifier.testTag(testTag)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(7.dp)
+                    .clip(CircleShape)
+                    .background(badgeColor)
+            )
+            Text(
+                text = statusText,
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.ExtraBold
+                ),
+                color = badgeColor,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
     }
 }
 
@@ -246,6 +312,13 @@ fun GameDrawerSheet(
     onDismissStatusBanner: () -> Unit,
     onCloseDrawer: () -> Unit,
     onSelectQuestFilter: (QuestFilterMode) -> Unit = {},
+    onSelectQuestSortOrder: (QuestSortOrder) -> Unit = {},
+    onQuestSearchQueryChange: (String) -> Unit = {},
+    onIncrementQuestStep: (String) -> Unit = {},
+    onShareQuestProgressImage: () -> Unit = {},
+    onRefreshDailyChallenge: () -> Unit = {},
+    onAddCustomQuestDetailed: ((String, String, Int, Int, QuestPriority) -> Unit)? = null,
+    onToggleStealthMode: ((Boolean) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -254,6 +327,8 @@ fun GameDrawerSheet(
     var newQuestTitle by rememberSaveable { mutableStateOf("") }
     var newQuestDesc by rememberSaveable { mutableStateOf("") }
     var newQuestXp by rememberSaveable { mutableStateOf("200") }
+    var newQuestSteps by rememberSaveable { mutableStateOf("3") }
+    var newQuestPriority by remember { mutableStateOf(QuestPriority.MEDIUM) }
 
     // Photo Picker for Character Portrait (PNG, JPEG, WEBP)
     val portraitPickerLauncher = rememberLauncherForActivityResult(
@@ -337,13 +412,22 @@ fun GameDrawerSheet(
                         } else {
                             "Per-Chat RPG Campaign • ${unsavedMins}m session"
                         }
-                        Text(
-                            text = saveSubtitle,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = Color(0xFF94A3B8),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            AdventureConnectivityStatusBadge(
+                                adventureState = adventureState,
+                                testTag = "adventure_connectivity_status_badge"
+                            )
+                            Text(
+                                text = saveSubtitle,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color(0xFF94A3B8),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                     }
                 }
 
@@ -527,6 +611,15 @@ fun GameDrawerSheet(
 
             Spacer(modifier = Modifier.height(8.dp))
 
+            // 2b. Multiplayer Presence & Friend Status Pinned Party Header + Expandable List
+            AdventurePartyPresenceDrawerSection(
+                adventureState = adventureState,
+                accentColor = accentColor,
+                onToggleStealthMode = onToggleStealthMode
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
             // 3. Segmented Tab Bar (Inventory, Quests, Character, Lore)
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -606,25 +699,39 @@ fun GameDrawerSheet(
                             newQuestTitle = newQuestTitle,
                             newQuestDesc = newQuestDesc,
                             newQuestXp = newQuestXp,
+                            newQuestSteps = newQuestSteps,
+                            newQuestPriority = newQuestPriority,
                             onSelectQuestFilter = onSelectQuestFilter,
+                            onSelectQuestSortOrder = onSelectQuestSortOrder,
+                            onQuestSearchQueryChange = onQuestSearchQueryChange,
                             onToggleShowAddQuest = { showAddQuestFields = !showAddQuestFields },
                             onNewQuestTitleChange = { newQuestTitle = it },
                             onNewQuestDescChange = { newQuestDesc = it },
                             onNewQuestXpChange = { newQuestXp = it },
+                            onNewQuestStepsChange = { newQuestSteps = it },
+                            onNewQuestPriorityChange = { newQuestPriority = it },
                             onConfirmAddQuest = {
                                 if (newQuestTitle.isNotBlank()) {
                                     val xpVal = newQuestXp.filter { it.isDigit() }.toIntOrNull() ?: 200
-                                    onAddCustomQuest(
-                                        newQuestTitle.trim(),
-                                        newQuestDesc.trim().ifBlank { "Complete this objective in your adventure." },
-                                        xpVal
-                                    )
+                                    val stepsVal = (newQuestSteps.filter { it.isDigit() }.toIntOrNull() ?: 1).coerceIn(1, 50)
+                                    val cleanTitle = newQuestTitle.trim()
+                                    val cleanDesc = newQuestDesc.trim().ifBlank { "Complete this objective in your adventure." }
+                                    if (onAddCustomQuestDetailed != null) {
+                                        onAddCustomQuestDetailed(cleanTitle, cleanDesc, xpVal, stepsVal, newQuestPriority)
+                                    } else {
+                                        onAddCustomQuest(cleanTitle, cleanDesc, xpVal)
+                                    }
                                     newQuestTitle = ""
                                     newQuestDesc = ""
+                                    newQuestSteps = "3"
+                                    newQuestPriority = QuestPriority.MEDIUM
                                     showAddQuestFields = false
                                 }
                             },
-                            onToggleQuestCompleted = onToggleQuestCompleted
+                            onToggleQuestCompleted = onToggleQuestCompleted,
+                            onIncrementQuestStep = onIncrementQuestStep,
+                            onShareQuestProgressImage = onShareQuestProgressImage,
+                            onRefreshDailyChallenge = onRefreshDailyChallenge
                         )
                     }
 
@@ -1156,21 +1263,32 @@ private fun QuestsListSection(
     newQuestTitle: String,
     newQuestDesc: String,
     newQuestXp: String,
+    newQuestSteps: String,
+    newQuestPriority: QuestPriority,
     onSelectQuestFilter: (QuestFilterMode) -> Unit,
+    onSelectQuestSortOrder: (QuestSortOrder) -> Unit,
+    onQuestSearchQueryChange: (String) -> Unit,
     onToggleShowAddQuest: () -> Unit,
     onNewQuestTitleChange: (String) -> Unit,
     onNewQuestDescChange: (String) -> Unit,
     onNewQuestXpChange: (String) -> Unit,
+    onNewQuestStepsChange: (String) -> Unit,
+    onNewQuestPriorityChange: (QuestPriority) -> Unit,
     onConfirmAddQuest: () -> Unit,
-    onToggleQuestCompleted: (String) -> Unit
+    onToggleQuestCompleted: (String) -> Unit,
+    onIncrementQuestStep: (String) -> Unit,
+    onShareQuestProgressImage: () -> Unit,
+    onRefreshDailyChallenge: () -> Unit
 ) {
     var expandedQuestIds by remember { mutableStateOf(setOf(adventureState.quests.firstOrNull()?.id.orEmpty())) }
+    var sortDropdownExpanded by remember { mutableStateOf(false) }
     val animatedMilestone by animateFloatAsState(
         targetValue = adventureState.questCompletionProgressFraction,
         animationSpec = spring(),
         label = "quest_milestone_progress"
     )
     val visibleQuests = adventureState.filteredQuests
+    val dailyQuest = adventureState.dailyChallengeQuest
 
     Column(
         modifier = Modifier
@@ -1178,7 +1296,7 @@ private fun QuestsListSection(
             .verticalScroll(rememberScrollState())
             .testTag("adventure_quests_list")
     ) {
-        // Milestone Progress Card
+        // 1. Campaign Milestone Progress Card + Share Active Quest Progress Image Button
         Surface(
             shape = RoundedCornerShape(14.dp),
             color = Color(0xFF1E293B),
@@ -1191,20 +1309,40 @@ private fun QuestsListSection(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "Campaign Quest Milestones",
-                        style = MaterialTheme.typography.labelLarge.copy(
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Campaign Quest Milestones",
+                            style = MaterialTheme.typography.labelLarge.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            )
                         )
-                    )
-                    Text(
-                        text = "${adventureState.completedQuestCount} / ${adventureState.quests.size} Done",
-                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                        color = accentColor
-                    )
+                        Text(
+                            text = "${adventureState.completedQuestCount} / ${adventureState.quests.size} Completed (${(adventureState.questCompletionProgressFraction * 100).toInt()}%)",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                            color = accentColor
+                        )
+                    }
+                    FilledTonalButton(
+                        onClick = onShareQuestProgressImage,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        modifier = Modifier
+                            .height(34.dp)
+                            .testTag("adventure_share_quest_progress_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Share,
+                            contentDescription = "Share Quest Progress Image Summary",
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(5.dp))
+                        Text(
+                            text = "Share Image",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                        )
+                    }
                 }
-                Spacer(modifier = Modifier.height(6.dp))
+                Spacer(modifier = Modifier.height(8.dp))
                 LinearProgressIndicator(
                     progress = { animatedMilestone },
                     color = Color(0xFF10B981),
@@ -1219,38 +1357,335 @@ private fun QuestsListSection(
 
         Spacer(modifier = Modifier.height(10.dp))
 
+        // 2. Daily Challenge System ("Quest of the Day") Spotlight Card
+        Surface(
+            shape = RoundedCornerShape(14.dp),
+            color = Color(0xFF1E1B4B).copy(alpha = 0.72f),
+            border = BorderStroke(
+                width = 1.5.dp,
+                brush = Brush.linearGradient(
+                    listOf(Color(0xFFF59E0B), Color(0xFFC084FC))
+                )
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("adventure_daily_challenge_card")
+        ) {
+            Column(modifier = Modifier.padding(12.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Star,
+                            contentDescription = "Quest of the Day",
+                            tint = Color(0xFFF59E0B),
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "QUEST OF THE DAY",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontWeight = FontWeight.ExtraBold,
+                                color = Color(0xFFFBBF24)
+                            )
+                        )
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = Color(0xFFF59E0B).copy(alpha = 0.22f),
+                        border = BorderStroke(0.8.dp, Color(0xFFF59E0B))
+                    ) {
+                        Text(
+                            text = "BONUS XP + RARE+ LOOT",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.ExtraBold
+                            ),
+                            color = Color(0xFFFDE68A),
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(6.dp))
+
+                if (dailyQuest != null) {
+                    Text(
+                        text = dailyQuest.title,
+                        style = MaterialTheme.typography.titleSmall.copy(
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
+                    )
+                    Spacer(modifier = Modifier.height(3.dp))
+                    Text(
+                        text = dailyQuest.description,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFFE2E8F0)
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Step ${dailyQuest.safeCurrentStep}/${dailyQuest.safeTotalSteps} • ${dailyQuest.completionPercent}%",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = if (dailyQuest.isCompleted) Color(0xFF10B981) else Color(0xFFFBBF24)
+                        )
+                        Text(
+                            text = "+${dailyQuest.xpReward} XP",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.ExtraBold),
+                            color = Color(0xFFC084FC)
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    LinearProgressIndicator(
+                        progress = { dailyQuest.completionFraction },
+                        color = if (dailyQuest.isCompleted) Color(0xFF10B981) else Color(0xFFF59E0B),
+                        trackColor = Color(0xFF0F172A),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(6.dp)
+                            .clip(RoundedCornerShape(3.dp))
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (!dailyQuest.isCompleted && dailyQuest.safeTotalSteps > 1) {
+                            OutlinedButton(
+                                onClick = { onIncrementQuestStep(dailyQuest.id) },
+                                border = BorderStroke(1.dp, Color(0xFFF59E0B)),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                modifier = Modifier
+                                    .height(32.dp)
+                                    .testTag("adventure_daily_challenge_step_button")
+                            ) {
+                                Text(
+                                    text = "+1 Step",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color(0xFFFBBF24)
+                                    )
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
+                        }
+                        FilledTonalButton(
+                            onClick = { onToggleQuestCompleted(dailyQuest.id) },
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            modifier = Modifier
+                                .height(32.dp)
+                                .testTag("adventure_daily_challenge_complete_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Check,
+                                contentDescription = null,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = if (dailyQuest.isCompleted) "Completed (Claimed)" else "Complete Daily",
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold)
+                            )
+                        }
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Generate today's personalized challenge from your chat & voice history.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color(0xFFCBD5E1),
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        OutlinedButton(
+                            onClick = onRefreshDailyChallenge,
+                            border = BorderStroke(1.dp, Color(0xFFF59E0B)),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            modifier = Modifier
+                                .height(32.dp)
+                                .testTag("adventure_generate_daily_challenge_button")
+                        ) {
+                            Text(
+                                text = "Generate",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFFFBBF24)
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        // 3. Quest List Header with Online/Offline Visual Indicator, Sort Dropdown Menu & New Quest Button
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = "Adventure Objectives",
-                style = MaterialTheme.typography.labelLarge.copy(
-                    fontWeight = FontWeight.Bold,
-                    color = Color(0xFFE2E8F0)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Adventure Objectives",
+                    style = MaterialTheme.typography.labelLarge.copy(
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFFE2E8F0)
+                    )
                 )
-            )
-            OutlinedButton(
-                onClick = onToggleShowAddQuest,
-                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                modifier = Modifier
-                    .height(32.dp)
-                    .testTag("adventure_add_quest_toggle_button")
+                Spacer(modifier = Modifier.height(3.dp))
+                AdventureConnectivityStatusBadge(
+                    adventureState = adventureState,
+                    testTag = "adventure_quest_header_connectivity_badge"
+                )
+            }
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Default.Add,
-                    contentDescription = "Add Custom Quest",
-                    modifier = Modifier.size(14.dp)
-                )
-                Spacer(modifier = Modifier.width(4.dp))
-                Text("New Quest", style = MaterialTheme.typography.labelSmall)
+                // Sort Dropdown Menu ('Newest', 'Oldest', 'High Priority')
+                Box {
+                    OutlinedButton(
+                        onClick = { sortDropdownExpanded = true },
+                        border = BorderStroke(1.dp, Color(0xFF475569)),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                        modifier = Modifier
+                            .height(32.dp)
+                            .testTag("adventure_quest_sort_dropdown_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.Sort,
+                            contentDescription = "Sort Quests",
+                            tint = accentColor,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = adventureState.questSortOrder.displayName,
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFFE2E8F0)
+                            )
+                        )
+                    }
+
+                    DropdownMenu(
+                        expanded = sortDropdownExpanded,
+                        onDismissRequest = { sortDropdownExpanded = false }
+                    ) {
+                        QuestSortOrder.entries.forEach { sortOrder ->
+                            val isSelected = adventureState.questSortOrder == sortOrder
+                            DropdownMenuItem(
+                                text = {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            text = sortOrder.displayName,
+                                            fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.Normal
+                                        )
+                                        if (isSelected) {
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Icon(
+                                                imageVector = Icons.Default.Check,
+                                                contentDescription = "Selected Sort Order",
+                                                tint = accentColor,
+                                                modifier = Modifier.size(15.dp)
+                                            )
+                                        }
+                                    }
+                                },
+                                onClick = {
+                                    sortDropdownExpanded = false
+                                    onSelectQuestSortOrder(sortOrder)
+                                },
+                                modifier = Modifier.testTag(
+                                    "adventure_quest_sort_option_${sortOrder.name.lowercase(Locale.US)}"
+                                )
+                            )
+                        }
+                    }
+                }
+
+                OutlinedButton(
+                    onClick = onToggleShowAddQuest,
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                    modifier = Modifier
+                        .height(32.dp)
+                        .testTag("adventure_add_quest_toggle_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Add,
+                        contentDescription = "Add Custom Quest",
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("New Quest", style = MaterialTheme.typography.labelSmall)
+                }
             }
         }
 
         Spacer(modifier = Modifier.height(8.dp))
 
-        // 3-Way Quest Filter Toggle Row ('All', 'Active', 'Completed') with Live Count Badges
+        // 3b. Multi-Field Quest Search Bar (filters by title, description, priority, or daily badge)
+        OutlinedTextField(
+            value = adventureState.questSearchQuery,
+            onValueChange = onQuestSearchQueryChange,
+            placeholder = {
+                Text(
+                    text = "Search title, lore, priority, or daily...",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF94A3B8)
+                )
+            },
+            leadingIcon = {
+                Icon(
+                    imageVector = Icons.Default.Search,
+                    contentDescription = "Search Quests",
+                    tint = accentColor,
+                    modifier = Modifier.size(18.dp)
+                )
+            },
+            trailingIcon = {
+                if (adventureState.questSearchQuery.isNotEmpty()) {
+                    IconButton(
+                        onClick = { onQuestSearchQueryChange("") },
+                        modifier = Modifier
+                            .size(28.dp)
+                            .testTag("adventure_quest_search_clear_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Clear Quest Search",
+                            tint = Color(0xFFCBD5E1),
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+            },
+            singleLine = true,
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("adventure_quest_search_input")
+        )
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        // 4. 3-Way Quest Filter Toggle Row ('All', 'Active', 'Completed') with Live Count Badges
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1349,7 +1784,7 @@ private fun QuestsListSection(
                     Spacer(modifier = Modifier.height(6.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         OutlinedTextField(
@@ -1357,8 +1792,49 @@ private fun QuestsListSection(
                             onValueChange = onNewQuestXpChange,
                             label = { Text("XP Reward") },
                             singleLine = true,
-                            modifier = Modifier.width(120.dp)
+                            modifier = Modifier.weight(1f)
                         )
+                        OutlinedTextField(
+                            value = newQuestSteps,
+                            onValueChange = onNewQuestStepsChange,
+                            label = { Text("Total Steps") },
+                            singleLine = true,
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("adventure_new_quest_steps_input")
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            QuestPriority.entries.forEach { prio ->
+                                val selected = newQuestPriority == prio
+                                val prioColor = parseHexColorSafe(prio.colorHex, accentColor)
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (selected) prioColor.copy(alpha = 0.22f) else Color(0xFF0F172A),
+                                    border = BorderStroke(1.dp, if (selected) prioColor else Color(0xFF334155)),
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .clickable { onNewQuestPriorityChange(prio) }
+                                        .testTag("adventure_new_quest_priority_${prio.name.lowercase(Locale.US)}")
+                                ) {
+                                    Text(
+                                        text = prio.badgeLabel,
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold
+                                        ),
+                                        color = if (selected) prioColor else Color(0xFF94A3B8),
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                                    )
+                                }
+                            }
+                        }
                         Button(
                             onClick = onConfirmAddQuest,
                             modifier = Modifier.testTag("adventure_confirm_add_quest_button")
@@ -1425,12 +1901,22 @@ private fun QuestsListSection(
         visibleQuests.forEach { quest ->
             val isExpanded = expandedQuestIds.contains(quest.id)
             val statusColor = if (quest.isCompleted) Color(0xFF10B981) else accentColor
+            val priorityColor = parseHexColorSafe(quest.priority.colorHex, accentColor)
+            val animatedQuestProgress by animateFloatAsState(
+                targetValue = quest.completionFraction,
+                animationSpec = spring(),
+                label = "quest_progress_${quest.id}"
+            )
             Card(
                 shape = RoundedCornerShape(14.dp),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
                 border = BorderStroke(
                     width = 1.dp,
-                    color = if (quest.isCompleted) Color(0xFF10B981).copy(alpha = 0.5f) else Color(0xFF334155)
+                    color = when {
+                        quest.isCompleted -> Color(0xFF10B981).copy(alpha = 0.5f)
+                        quest.isDailyChallenge -> Color(0xFFF59E0B).copy(alpha = 0.65f)
+                        else -> Color(0xFF334155)
+                    }
                 ),
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1455,25 +1941,65 @@ private fun QuestsListSection(
                             modifier = Modifier.weight(1f)
                         ) {
                             Icon(
-                                imageVector = if (quest.isCompleted) Icons.Default.CheckCircle else Icons.Default.Explore,
+                                imageVector = when {
+                                    quest.isCompleted -> Icons.Default.CheckCircle
+                                    quest.isDailyChallenge -> Icons.Default.Star
+                                    else -> Icons.Default.Explore
+                                },
                                 contentDescription = null,
-                                tint = statusColor,
+                                tint = if (quest.isDailyChallenge && !quest.isCompleted) Color(0xFFF59E0B) else statusColor,
                                 modifier = Modifier.size(20.dp)
                             )
                             Spacer(modifier = Modifier.width(8.dp))
-                            Column {
-                                Text(
-                                    text = quest.title,
-                                    style = MaterialTheme.typography.titleSmall.copy(
-                                        fontWeight = FontWeight.Bold,
-                                        color = Color.White
+                            Column(modifier = Modifier.weight(1f)) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = quest.title,
+                                        style = MaterialTheme.typography.titleSmall.copy(
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color.White
+                                        ),
+                                        modifier = Modifier.weight(1f, fill = false)
                                     )
-                                )
-                                Text(
-                                    text = if (quest.isCompleted) "Completed • +${quest.xpReward} XP Earned" else "Active Objective • +${quest.xpReward} XP",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = statusColor
-                                )
+                                    Surface(
+                                        shape = RoundedCornerShape(5.dp),
+                                        color = priorityColor.copy(alpha = 0.2f),
+                                        border = BorderStroke(0.6.dp, priorityColor.copy(alpha = 0.7f))
+                                    ) {
+                                        Text(
+                                            text = if (quest.isDailyChallenge) "DAILY" else quest.priority.badgeLabel,
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                fontSize = 8.sp,
+                                                fontWeight = FontWeight.ExtraBold
+                                            ),
+                                            color = priorityColor,
+                                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                                        )
+                                    }
+                                }
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = if (quest.isCompleted) "Completed • +${quest.xpReward} XP Earned" else "Active • +${quest.xpReward} XP",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = statusColor
+                                    )
+                                    Text(
+                                        text = "Step ${quest.safeCurrentStep}/${quest.safeTotalSteps} • ${quest.completionPercent}%",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold
+                                        ),
+                                        color = Color(0xFFCBD5E1),
+                                        modifier = Modifier.testTag("adventure_quest_progress_label_${quest.id}")
+                                    )
+                                }
                             }
                         }
 
@@ -1484,15 +2010,17 @@ private fun QuestsListSection(
                         )
                     }
 
+                    // Linear Progress Indicator directly below each quest title showing completion % for multi-step goals
                     Spacer(modifier = Modifier.height(6.dp))
                     LinearProgressIndicator(
-                        progress = { if (quest.isCompleted) 1f else 0.45f },
-                        color = statusColor,
+                        progress = { animatedQuestProgress },
+                        color = if (quest.isDailyChallenge && !quest.isCompleted) Color(0xFFF59E0B) else statusColor,
                         trackColor = Color(0xFF0F172A),
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(5.dp)
+                            .height(6.dp)
                             .clip(RoundedCornerShape(3.dp))
+                            .testTag("adventure_quest_progress_bar_${quest.id}")
                     )
 
                     AnimatedVisibility(visible = isExpanded) {
@@ -1505,8 +2033,36 @@ private fun QuestsListSection(
                             Spacer(modifier = Modifier.height(8.dp))
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.End
+                                horizontalArrangement = Arrangement.End,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
+                                if (!quest.isCompleted && quest.safeTotalSteps > 1) {
+                                    OutlinedButton(
+                                        onClick = { onIncrementQuestStep(quest.id) },
+                                        border = BorderStroke(1.dp, accentColor.copy(alpha = 0.7f)),
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                        modifier = Modifier
+                                            .height(34.dp)
+                                            .testTag("adventure_quest_step_button_${quest.id}")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Add,
+                                            contentDescription = "Advance Quest Step",
+                                            tint = accentColor,
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(
+                                            text = "+1 Step (${quest.safeCurrentStep}/${quest.safeTotalSteps})",
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                fontWeight = FontWeight.Bold,
+                                                color = accentColor
+                                            )
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                }
+
                                 FilledTonalButton(
                                     onClick = { onToggleQuestCompleted(quest.id) },
                                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
@@ -1526,6 +2082,69 @@ private fun QuestsListSection(
                                     )
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6. Local Room Offline Quest History Cache Log
+        if (adventureState.questHistory.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(10.dp))
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = Color(0xFF1E293B).copy(alpha = 0.78f),
+                border = BorderStroke(1.dp, Color(0xFF334155)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("adventure_offline_history_section")
+            ) {
+                Column(modifier = Modifier.padding(12.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Offline Room Quest History (${adventureState.questHistory.size})",
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFFE2E8F0)
+                            )
+                        )
+                        AdventureConnectivityStatusBadge(
+                            adventureState = adventureState,
+                            testTag = "adventure_history_connectivity_badge"
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    adventureState.questHistory.take(5).forEach { entry ->
+                        val isQueued = entry.syncStatus.equals(AdventureSyncStatus.PENDING_OFFLINE.name, ignoreCase = true)
+                        val entryColor = if (isQueued) Color(0xFFF59E0B) else Color(0xFF10B981)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 3.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "[${entry.actionType}] ${entry.title}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color(0xFFCBD5E1),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (isQueued) "Queued" else "Synced",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold
+                                ),
+                                color = entryColor
+                            )
                         }
                     }
                 }
@@ -1975,6 +2594,46 @@ fun AdventureInlineEventBadges(
                     }
                 }
 
+                is AdventureInlineEvent.QuestStepUpdated -> {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = Color(0xFF0F172A).copy(alpha = 0.88f),
+                        border = BorderStroke(1.dp, Color(0xFFC084FC)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable { onOpenDrawerToTab(AdventureDrawerTab.QUESTS) }
+                            .testTag("adventure_badge_quest_step_$idx")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Bolt,
+                                contentDescription = "Quest Step Advanced",
+                                tint = Color(0xFFC084FC),
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "QUEST PROGRESS (+${event.stepDelta} STEP): ${event.questIdOrTitle}",
+                                    style = MaterialTheme.typography.labelMedium.copy(
+                                        fontWeight = FontWeight.ExtraBold,
+                                        color = Color(0xFFC084FC)
+                                    )
+                                )
+                                Text(
+                                    text = "Multi-step milestone updated • Tap to view Quest Log",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Color(0xFFE9D5FF)
+                                )
+                            }
+                        }
+                    }
+                }
+
                 is AdventureInlineEvent.LootDropped -> {
                     val rarityColor = parseHexColorSafe(event.item.rarityColorHex, Color(0xFFF59E0B))
                     Surface(
@@ -2021,3 +2680,571 @@ fun AdventureInlineEventBadges(
         }
     }
 }
+
+/**
+ * Compact visual status indicator for the Top Navigation Bar showing whether the app is currently
+ * in `'Online Sync'` mode or `'Offline Cache'` mode based on the user's global toggle setting.
+ * Tapping the indicator toggles the global setting and triggers subtle haptic feedback via
+ * [com.example.game.AdventureEngine.playSyncModeSwitchHaptic].
+ */
+@Composable
+fun TopBarSyncModeStatusIndicator(
+    isOfflineCacheMode: Boolean,
+    pendingQueuedCount: Int = 0,
+    onToggleMode: () -> Unit,
+    modifier: Modifier = Modifier,
+    testTag: String = "top_bar_sync_mode_indicator"
+) {
+    val badgeColor = if (isOfflineCacheMode) {
+        Color(0xFFF59E0B)
+    } else {
+        Color(0xFF10B981)
+    }
+    val modeLabel = if (isOfflineCacheMode) {
+        if (pendingQueuedCount > 0) {
+            "Offline Cache ($pendingQueuedCount)"
+        } else {
+            "Offline Cache"
+        }
+    } else {
+        "Online Sync"
+    }
+
+    Surface(
+        shape = RoundedCornerShape(999.dp),
+        color = badgeColor.copy(alpha = 0.16f),
+        border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.65f)),
+        modifier = modifier
+            .clip(RoundedCornerShape(999.dp))
+            .clickable { onToggleMode() }
+            .testTag(testTag)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(6.dp)
+                    .clip(CircleShape)
+                    .background(badgeColor)
+            )
+            Icon(
+                imageVector = if (isOfflineCacheMode) Icons.Default.CloudUpload else Icons.Default.CheckCircle,
+                contentDescription = "Top navigation sync mode: $modeLabel",
+                tint = badgeColor,
+                modifier = Modifier.size(12.dp)
+            )
+            Text(
+                text = modeLabel,
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 10.sp
+                ),
+                color = badgeColor,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+/**
+ * Pinned Multiplayer Presence & Friend Status section inside [GameDrawerSheet] featuring:
+ * - Quick "Always Offline" (Stealth Mode) eye toggle icon in the header.
+ * - Live local player [FriendPresenceCard] and expandable party/friend list.
+ * - Optional quick "Add Friend by UID" input row.
+ */
+@Composable
+fun AdventurePartyPresenceDrawerSection(
+    adventureState: AdventureGameState,
+    accentColor: Color,
+    onToggleStealthMode: ((Boolean) -> Unit)? = null,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val isStealthModePref by AppSettingsManager.isStealthMode.collectAsState()
+    val effectiveStealth = adventureState.isStealthMode || isStealthModePref
+    val coordinatorLocal by PlayerPresenceCoordinator.localPlayerPresence.collectAsState()
+    val coordinatorParty by PlayerPresenceCoordinator.partyPresenceList.collectAsState()
+    val pinnedFriendUids by AppSettingsManager.pinnedFriendUids.collectAsState()
+
+    var isPartyExpanded by rememberSaveable { mutableStateOf(false) }
+    var friendUidInput by rememberSaveable { mutableStateOf("") }
+    val nowMs = System.currentTimeMillis()
+
+    val localPresence = remember(
+        adventureState.localPresence,
+        coordinatorLocal,
+        adventureState.characterName,
+        adventureState.level,
+        adventureState.completedQuestCount,
+        adventureState.isOnline,
+        effectiveStealth
+    ) {
+        val base = adventureState.localPresence ?: coordinatorLocal
+        base.copy(
+            displayName = adventureState.characterName.ifBlank { base.displayName },
+            level = adventureState.level,
+            completedQuestCount = adventureState.completedQuestCount,
+            isOnline = if (effectiveStealth) false else adventureState.isOnline,
+            isStealthMode = effectiveStealth
+        ).enforceStealthPrivacy()
+    }
+
+    val partyList = remember(adventureState.partyPresences, coordinatorParty, localPresence) {
+        val raw = if (adventureState.partyPresences.isNotEmpty()) {
+            adventureState.partyPresences
+        } else {
+            coordinatorParty
+        }
+        val others = raw.filter { it.odinUid != localPresence.odinUid }
+        listOf(localPresence) + others
+    }
+
+    val onlineCount = partyList.count { it.isEffectivelyOnline(nowMs) }
+
+    val handleToggleStealth: () -> Unit = {
+        PlayerPresenceCoordinator.toggleStealthModeFromUi(
+            context = context,
+            currentPresence = localPresence,
+            nowEpochMs = nowMs,
+            onStealthChanged = { nextStealth ->
+                onToggleStealthMode?.invoke(nextStealth)
+            }
+        )
+    }
+
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = Color(0xFF1E293B),
+        border = BorderStroke(
+            1.dp,
+            if (effectiveStealth) Color(0xFF64748B) else accentColor.copy(alpha = 0.45f)
+        ),
+        modifier = modifier
+            .fillMaxWidth()
+            .testTag("adventure_party_presence_section")
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            // Header row with Online Party Counter + "Always Offline" Eye Toggle + Expand Button
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(9.dp)
+                            .clip(CircleShape)
+                            .background(
+                                if (effectiveStealth || !localPresence.isEffectivelyOnline(nowMs)) {
+                                    Color(0xFF94A3B8) // Gray for Offline / Stealth
+                                } else {
+                                    Color(0xFF10B981) // Green for Online
+                                }
+                            )
+                            .testTag("adventure_party_header_status_dot")
+                    )
+                    Column {
+                        Text(
+                            text = if (effectiveStealth) {
+                                "Party Presence • Always Offline"
+                            } else {
+                                "Party Presence • $onlineCount Online"
+                            },
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontWeight = FontWeight.ExtraBold,
+                                color = Color.White
+                            ),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = if (effectiveStealth) {
+                                "Stealth Mode active — appearing Offline to friends"
+                            } else {
+                                "${localPresence.formattedChatContext(nowMs)} • ${localPresence.formattedElapsedSessionTime(nowMs)}"
+                            },
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                            color = Color(0xFF94A3B8),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(
+                        onClick = handleToggleStealth,
+                        modifier = Modifier
+                            .size(34.dp)
+                            .testTag("adventure_stealth_mode_toggle_button")
+                    ) {
+                        Icon(
+                            imageVector = if (effectiveStealth) {
+                                Icons.Default.VisibilityOff
+                            } else {
+                                Icons.Default.Visibility
+                            },
+                            contentDescription = if (effectiveStealth) {
+                                "Disable Always Offline Stealth Mode"
+                            } else {
+                                "Enable Always Offline Stealth Mode"
+                            },
+                            tint = if (effectiveStealth) Color(0xFFF59E0B) else Color(0xFF10B981),
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+
+                    IconButton(
+                        onClick = { isPartyExpanded = !isPartyExpanded },
+                        modifier = Modifier
+                            .size(34.dp)
+                            .testTag("adventure_friend_drawer_expand_button")
+                    ) {
+                        Icon(
+                            imageVector = if (isPartyExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                            contentDescription = if (isPartyExpanded) "Collapse Friend Status" else "Expand Friend Status",
+                            tint = Color(0xFFCBD5E1),
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+            }
+
+            // Local Player's FriendPresenceCard (always visible in header or expanded)
+            FriendPresenceCard(
+                presence = localPresence,
+                isLocalPlayer = true,
+                nowEpochMs = nowMs,
+                onToggleStealthMode = {
+                    onToggleStealthMode?.invoke(AppSettingsManager.isStealthMode.value)
+                }
+            )
+
+            AnimatedVisibility(
+                visible = isPartyExpanded,
+                enter = fadeIn() + expandVertically(),
+                exit = fadeOut() + shrinkVertically()
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("adventure_friend_presence_expanded_list"),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    HorizontalDivider(color = Color(0xFF334155))
+
+                    // Add Friend by UID Row
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = friendUidInput,
+                            onValueChange = { friendUidInput = it },
+                            placeholder = {
+                                Text(
+                                    text = "Add friend by Odin UID...",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Color(0xFF64748B)
+                                )
+                            },
+                            singleLine = true,
+                            textStyle = MaterialTheme.typography.labelSmall.copy(color = Color.White),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("adventure_add_friend_uid_input")
+                        )
+                        FilledTonalButton(
+                            onClick = {
+                                val cleanUid = friendUidInput.trim()
+                                if (cleanUid.isNotEmpty()) {
+                                    AppSettingsManager.addPinnedFriendUid(context, cleanUid)
+                                    friendUidInput = ""
+                                    scope.launch {
+                                        PlayerPresenceCoordinator.refreshPartyListFromRoom(context)
+                                    }
+                                }
+                            },
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            modifier = Modifier.testTag("adventure_add_friend_uid_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Add,
+                                contentDescription = "Add Friend UID",
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(3.dp))
+                            Text("Add", style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+
+                    val otherFriends = partyList.filter { it.odinUid != localPresence.odinUid }
+                    if (otherFriends.isEmpty()) {
+                        Text(
+                            text = "No other adventurers in lobby yet. Add a friend UID above or sign in to sync global presence.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color(0xFF94A3B8),
+                            modifier = Modifier.padding(vertical = 4.dp)
+                        )
+                    } else {
+                        otherFriends.take(8).forEach { friendPresence ->
+                            FriendPresenceCard(
+                                presence = friendPresence,
+                                isLocalPlayer = false,
+                                isPinnedFriend = pinnedFriendUids.contains(friendPresence.odinUid),
+                                nowEpochMs = nowMs,
+                                onRemoveFriend = if (pinnedFriendUids.contains(friendPresence.odinUid)) {
+                                    {
+                                        AppSettingsManager.removePinnedFriendUid(context, friendPresence.odinUid)
+                                        scope.launch {
+                                            PlayerPresenceCoordinator.refreshPartyListFromRoom(context)
+                                        }
+                                    }
+                                } else null
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Friend Status Card (`FriendPresenceCard`) displaying:
+ * - Online status dot (Green `#10B981` for Online, Gray `#94A3B8` for Offline/Stealth).
+ * - Level badge (`Lv. X`) and Total Quests Completed counter (`Y Quests`).
+ * - Active chat context (`"In: <Chat Title>"`) and elapsed session time (`"Online for Xh Ym"`).
+ * - An `"Always Offline"` eye toggle icon in the card/header connected to [AppSettingsManager]
+ *   and [PlayerPresenceCoordinator] for immediate Firestore `isStealthMode` + `'Offline'` status sync.
+ */
+@Composable
+fun FriendPresenceCard(
+    presence: PlayerPresence,
+    isLocalPlayer: Boolean = true,
+    isPinnedFriend: Boolean = false,
+    nowEpochMs: Long = System.currentTimeMillis(),
+    onToggleStealthMode: (() -> Unit)? = null,
+    onRemoveFriend: (() -> Unit)? = null,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    remember(context) {
+        AppSettingsManager.ensureInitialized(context)
+        true
+    }
+    val persistedStealth by AppSettingsManager.isStealthMode.collectAsState()
+    var localStealthOverride by remember(presence.odinUid, presence.isStealthMode) {
+        mutableStateOf<Boolean?>(null)
+    }
+
+    val isControllableStealthCard = isLocalPlayer || onToggleStealthMode != null
+    val effectivePresence = remember(presence, persistedStealth, localStealthOverride, isControllableStealthCard) {
+        if (isControllableStealthCard) {
+            val resolvedStealth = localStealthOverride ?: (presence.isStealthMode || persistedStealth)
+            presence.copy(
+                isStealthMode = resolvedStealth,
+                isOnline = if (resolvedStealth) false else presence.isOnline
+            ).enforceStealthPrivacy()
+        } else {
+            presence.enforceStealthPrivacy()
+        }
+    }
+
+    val sanitized = effectivePresence
+    val isOnlineEffective = sanitized.isEffectivelyOnline(nowEpochMs)
+    val statusDotColor = if (isOnlineEffective) {
+        Color(0xFF10B981) // Green for Online
+    } else {
+        Color(0xFF94A3B8) // Gray for Offline / Stealth
+    }
+
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = Color(0xFF0F172A),
+        border = BorderStroke(
+            1.dp,
+            if (isOnlineEffective) Color(0xFF10B981).copy(alpha = 0.45f) else Color(0xFF334155)
+        ),
+        modifier = modifier
+            .fillMaxWidth()
+            .testTag("friend_presence_card_${sanitized.odinUid}")
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                // Online Status Dot (Green for Online, Gray for Offline/Stealth)
+                Box(
+                    modifier = Modifier
+                        .size(10.dp)
+                        .clip(CircleShape)
+                        .background(statusDotColor)
+                        .testTag("friend_presence_status_dot_${sanitized.odinUid}")
+                )
+
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(3.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = if (isLocalPlayer) "${sanitized.displayName} (You)" else sanitized.displayName,
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            ),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.testTag("friend_presence_name_${sanitized.odinUid}")
+                        )
+
+                        // Level Badge
+                        Surface(
+                            shape = RoundedCornerShape(6.dp),
+                            color = Color(0xFF38BDF8).copy(alpha = 0.18f),
+                            border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.55f)),
+                            modifier = Modifier.testTag("friend_presence_level_badge_${sanitized.odinUid}")
+                        ) {
+                            Text(
+                                text = "Lv. ${sanitized.level}",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.ExtraBold
+                                ),
+                                color = Color(0xFF38BDF8),
+                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                            )
+                        }
+
+                        // Total Quests Completed Counter
+                        Surface(
+                            shape = RoundedCornerShape(6.dp),
+                            color = Color(0xFFC084FC).copy(alpha = 0.18f),
+                            border = BorderStroke(1.dp, Color(0xFFC084FC).copy(alpha = 0.55f)),
+                            modifier = Modifier.testTag("friend_presence_quest_count_${sanitized.odinUid}")
+                        ) {
+                            Text(
+                                text = "${sanitized.completedQuestCount} Quests",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold
+                                ),
+                                color = Color(0xFFE879F9),
+                                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                            )
+                        }
+                    }
+
+                    // Active Chat Context ("In: <Chat Title>") & Elapsed Session Time ("Online for Xh Ym")
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = sanitized.formattedChatContext(nowEpochMs),
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.SemiBold
+                            ),
+                            color = if (isOnlineEffective) Color(0xFFA7F3D0) else Color(0xFF94A3B8),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.testTag("friend_presence_chat_context_${sanitized.odinUid}")
+                        )
+                        Text(
+                            text = "•",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color(0xFF64748B)
+                        )
+                        Text(
+                            text = sanitized.formattedElapsedSessionTime(nowEpochMs),
+                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                            color = Color(0xFF94A3B8),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.testTag("friend_presence_session_time_${sanitized.odinUid}")
+                        )
+                    }
+                }
+            }
+
+            // "Always Offline" Eye Toggle Icon for quick privacy control (or Unpin button for added friends)
+            if (isControllableStealthCard) {
+                IconButton(
+                    onClick = {
+                        val synced = PlayerPresenceCoordinator.toggleStealthModeFromUi(
+                            context = context,
+                            currentPresence = presence.copy(isStealthMode = sanitized.isStealthMode),
+                            nowEpochMs = nowEpochMs
+                        )
+                        localStealthOverride = synced.isStealthMode
+                        onToggleStealthMode?.invoke()
+                    },
+                    modifier = Modifier
+                        .size(32.dp)
+                        .testTag("friend_presence_stealth_toggle")
+                ) {
+                    Icon(
+                        imageVector = if (sanitized.isStealthMode) {
+                            Icons.Default.VisibilityOff
+                        } else {
+                            Icons.Default.Visibility
+                        },
+                        contentDescription = if (sanitized.isStealthMode) {
+                            "Always Offline Enabled (Tap to go Online)"
+                        } else {
+                            "Always Offline Disabled (Tap for Stealth Mode)"
+                        },
+                        tint = if (sanitized.isStealthMode) Color(0xFFF59E0B) else Color(0xFF10B981),
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+            } else if (isPinnedFriend && onRemoveFriend != null) {
+                IconButton(
+                    onClick = onRemoveFriend,
+                    modifier = Modifier
+                        .size(28.dp)
+                        .testTag("friend_presence_remove_${sanitized.odinUid}")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = "Remove pinned friend",
+                        tint = Color(0xFF94A3B8),
+                        modifier = Modifier.size(14.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+
+

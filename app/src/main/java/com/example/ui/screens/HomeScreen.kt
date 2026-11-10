@@ -3,6 +3,7 @@ package com.example.ui.screens
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.runtime.collectAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -267,9 +268,15 @@ fun HomeScreen(
     onOpenCloudBackupVault: () -> Unit = {},
     onClearChatThread: (Long) -> Unit = {},
     externalSelectedCategoryFilter: String? = null,
-    onSelectCategoryFilter: ((String?) -> Unit)? = null
+    onSelectCategoryFilter: ((String?) -> Unit)? = null,
+    offlineQuestQueueingEnabled: Boolean? = null,
+    pendingOfflineSyncCount: Int = 0,
+    onToggleOfflineQuestQueueing: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
+    val globalOfflineQueueing by com.example.util.AppSettingsManager.offlineQuestQueueingEnabled.collectAsState()
+    val effectiveOfflineCacheMode = offlineQuestQueueingEnabled ?: globalOfflineQueueing
+    val lowPowerMode by com.example.util.AppSettingsManager.lowPowerModeEnabled.collectAsState()
     var selectedCategoryFilter by rememberSaveable { mutableStateOf(externalSelectedCategoryFilter) }
     androidx.compose.runtime.LaunchedEffect(externalSelectedCategoryFilter) {
         if (onSelectCategoryFilter != null && selectedCategoryFilter != externalSelectedCategoryFilter) {
@@ -420,22 +427,42 @@ fun HomeScreen(
                                 )
                             }
                             Column {
-                                Text(
-                                    text = "Gemini Wake",
-                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                                    maxLines = 1
-                                )
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Text(
+                                        text = "Gemini Wake",
+                                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                        maxLines = 1
+                                    )
+                                    com.example.ui.components.TopBarSyncModeStatusIndicator(
+                                        isOfflineCacheMode = effectiveOfflineCacheMode,
+                                        pendingQueuedCount = pendingOfflineSyncCount,
+                                        onToggleMode = {
+                                            if (onToggleOfflineQuestQueueing != null) {
+                                                onToggleOfflineQuestQueueing()
+                                            } else {
+                                                val next = !effectiveOfflineCacheMode
+                                                com.example.util.AppSettingsManager.setOfflineQuestQueueingEnabled(context, next)
+                                                com.example.game.AdventureEngine.playSyncModeSwitchHaptic(context, next)
+                                            }
+                                        },
+                                        testTag = "top_bar_sync_mode_indicator"
+                                    )
+                                }
                                 Text(
                                     text = when {
+                                        lowPowerMode -> "Low Power Mode • UI Mic Ready"
                                         isSleepMode -> "Sleep mode"
                                         isListening || isHandsFreeActive -> "Hands-Free Active"
                                         else -> "Standby"
                                     },
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = if ((isListening || isHandsFreeActive) && !isSleepMode) {
-                                        Color(0xFF10B981)
-                                    } else {
-                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                    color = when {
+                                        lowPowerMode -> Color(0xFFF59E0B)
+                                        (isListening || isHandsFreeActive) && !isSleepMode -> Color(0xFF10B981)
+                                        else -> MaterialTheme.colorScheme.onSurfaceVariant
                                     },
                                     maxLines = 1
                                 )
@@ -788,6 +815,46 @@ fun HomeScreen(
                     onDismiss = onDismissWakeReadyCue
                 )
 
+                com.example.ui.components.MicrophonePermissionStatusBanner(
+                    hideWhenGranted = true,
+                    onActivateVoiceListening = onToggleListening,
+                    testTag = "home_microphone_permission_banner",
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                )
+
+                val savedWakeWordForIndicator by com.example.util.AppSettingsManager.customWakeWordPhrase.collectAsState()
+                val screenOffSaverForIndicator by com.example.util.AppSettingsManager.screenOffBatterySaverEnabled.collectAsState()
+                val pollingMsForIndicator by com.example.voice.WakeWordVoiceService.activeWakeWordPollingIntervalMs.collectAsState()
+                val activeWakePhraseForIndicator = savedWakeWordForIndicator.ifBlank {
+                    chats.firstOrNull { it.isDefaultWakeChat }?.wakeWord ?: "Hey Gemini"
+                }
+                val isHomeWakeListening = (isListening || isHandsFreeActive) && !isSleepMode && !lowPowerMode
+                com.example.ui.components.WakeWordScreenPulseAnimation(
+                    isActivelyListening = isHomeWakeListening,
+                    activeWakePhrase = activeWakePhraseForIndicator,
+                    audioRmsDb = audioRmsDb,
+                    pollingIntervalMs = pollingMsForIndicator,
+                    testTag = "home_wake_word_screen_pulse_animation"
+                )
+                com.example.ui.components.WakeWordGlowingStatusWidget(
+                    isActivelyListening = isHomeWakeListening,
+                    activeWakePhrase = activeWakePhraseForIndicator,
+                    screenOffBatterySaverEnabled = screenOffSaverForIndicator,
+                    pollingIntervalMs = pollingMsForIndicator,
+                    hideWhenInactive = true,
+                    testTag = "home_wake_word_glowing_status_widget",
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)
+                )
+                com.example.ui.components.MicrophoneWakeWordListeningIndicator(
+                    isMicrophoneActiveAndListening = isHomeWakeListening,
+                    activeWakePhrase = activeWakePhraseForIndicator,
+                    audioRmsDb = audioRmsDb,
+                    lastHeardText = lastHeardText,
+                    hideWhenInactive = true,
+                    onToggleMicrophone = onToggleListening,
+                    testTag = "home_microphone_wake_word_listening_indicator"
+                )
+
                 // Expandable Top Drawer for Cloud Sync, Wake Summary, Radar & Analytics (collapsed by default)
                 AnimatedVisibility(
                     visible = isCloudSummaryDrawerExpanded,
@@ -1008,6 +1075,15 @@ fun HomeScreen(
                                 onShareCsvClick = onQuickShareCsv
                             )
                         }
+                    }
+
+                    // Active Chats Visual Priority & Category Dashboard + Quiet Mode + Cross-Chat Search
+                    item(key = "home_priority_and_search_dashboard") {
+                        com.example.ui.components.ActiveChatsPriorityAndSearchDashboardCard(
+                            chats = chats,
+                            chatCategoryMap = chatCategoryMap,
+                            onSelectChat = onSelectChat
+                        )
                     }
 
                     // Compact header with tag filter chips + active count

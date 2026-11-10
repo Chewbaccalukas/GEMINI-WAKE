@@ -3,6 +3,9 @@ package com.example.ui.screens
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.runtime.collectAsState
+import androidx.compose.ui.graphics.Color
+import kotlinx.coroutines.launch
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -171,12 +174,74 @@ fun SettingsScreen(
     bufferMetrics: com.example.cache.BufferMetrics = com.example.cache.BufferMetrics(),
     onClearActiveInMemoryBuffer: () -> Unit = {},
     onPurgeStagedDiskCache: () -> Unit = onForceResetAndClearHygiene,
-    onCreateGeneralLogFile: (() -> String)? = null
+    onCreateGeneralLogFile: (() -> String)? = null,
+    lowPowerModeEnabled: Boolean? = null,
+    onToggleLowPowerMode: ((Boolean) -> Unit)? = null,
+    batteryDrainEstimate: com.example.util.BatteryDrainEstimate? = null,
+    offlineQuestQueueingEnabled: Boolean? = null,
+    onToggleOfflineQuestQueueing: ((Boolean) -> Unit)? = null,
+    pendingOfflineSyncCount: Int = 0,
+    savedCustomWakeWordPhrase: String? = null,
+    onSaveCustomWakeWordToPrefs: ((String) -> Unit)? = null,
+    onResetCustomWakeWordInPrefs: (() -> Unit)? = null,
+    onSimulateWakeWordDiagnostic: ((String) -> com.example.voice.WakeWordSimulationDiagnosticReport)? = null,
+    screenOffBatterySaverEnabled: Boolean? = null,
+    onToggleScreenOffBatterySaver: ((Boolean) -> Unit)? = null,
+    activeWakeWordPollingIntervalMs: Long? = null,
+    cloudBackupChats: List<com.example.data.firebase.FirestoreChatDoc> = emptyList(),
+    onSelectFirestoreWakeChat: (com.example.data.firebase.FirestoreChatDoc) -> Unit = {}
 ) {
     BackHandler { onBack() }
 
     val context = androidx.compose.ui.platform.LocalContext.current
     val hapticFeedback = androidx.compose.ui.platform.LocalHapticFeedback.current
+    LaunchedEffect(context) {
+        com.example.util.AppSettingsManager.ensureInitialized(context)
+    }
+    val globalLowPowerMode by com.example.util.AppSettingsManager.lowPowerModeEnabled.collectAsState()
+    val effectiveLowPowerMode = lowPowerModeEnabled ?: globalLowPowerMode
+    val globalOfflineQueueing by com.example.util.AppSettingsManager.offlineQuestQueueingEnabled.collectAsState()
+    val effectiveOfflineQueueing = offlineQuestQueueingEnabled ?: globalOfflineQueueing
+    val globalScreenOffBatterySaver by com.example.util.AppSettingsManager.screenOffBatterySaverEnabled.collectAsState()
+    val dataStoreScreenOffBatterySaverFlow = remember(context) {
+        com.example.util.WakeWordDataStoreManager.observeScreenOffBatterySaver(context)
+    }
+    val dataStoreScreenOffBatterySaver by dataStoreScreenOffBatterySaverFlow.collectAsState(
+        initial = globalScreenOffBatterySaver
+    )
+    val effectiveScreenOffBatterySaver = screenOffBatterySaverEnabled ?: (globalScreenOffBatterySaver || dataStoreScreenOffBatterySaver)
+    val globalActivePollingIntervalMs by com.example.voice.WakeWordVoiceService.activeWakeWordPollingIntervalMs.collectAsState()
+    val isDeviceScreenInteractive by com.example.voice.WakeWordVoiceService.isDeviceScreenInteractive.collectAsState()
+    val effectivePollingIntervalMs = activeWakeWordPollingIntervalMs
+        ?: com.example.voice.WakeWordVoiceService.resolveEffectivePollingIntervalMs(
+            batterySaverEnabled = effectiveScreenOffBatterySaver,
+            isScreenInteractive = isDeviceScreenInteractive
+        ).takeIf { it > 0L }
+        ?: globalActivePollingIntervalMs
+    val globalCustomWakeWord by com.example.util.AppSettingsManager.customWakeWordPhrase.collectAsState()
+    val dataStoreWakeWordFlow = remember(context) {
+        com.example.util.WakeWordDataStoreManager.observeCustomWakeWord(context)
+    }
+    val dataStoreCustomWakeWord by dataStoreWakeWordFlow.collectAsState(initial = globalCustomWakeWord)
+    val effectiveSavedCustomWakeWord = savedCustomWakeWordPhrase ?: dataStoreCustomWakeWord
+    val dataStoreSensitivityFlow = remember(context) {
+        com.example.util.WakeWordDataStoreManager.observeWakeWordSensitivity(context)
+    }
+    val dataStoreWakeWordSensitivity by dataStoreSensitivityFlow.collectAsState(
+        initial = wakeWordSensitivity.coerceIn(0.50f, 0.98f)
+    )
+    val latestServiceSimReport by com.example.voice.WakeWordVoiceService.lastSimulationDiagnosticReport.collectAsState()
+    var localSimulationReport by remember {
+        mutableStateOf<com.example.voice.WakeWordSimulationDiagnosticReport?>(null)
+    }
+    val activeSimulationReport = localSimulationReport ?: latestServiceSimReport
+    val coroutineScope = androidx.compose.runtime.rememberCoroutineScope()
+    val resolvedBatteryEstimate = remember(effectiveLowPowerMode, batteryDrainEstimate) {
+        batteryDrainEstimate ?: com.example.util.AppSettingsManager.calculateEstimatedBatteryRemaining(
+            context = context,
+            lowPowerModeEnabled = effectiveLowPowerMode
+        )
+    }
     var generalLogPreviewText by remember { mutableStateOf<String?>(null) }
 
     val handleCreateGeneralLogFile: () -> Unit = {
@@ -305,6 +370,12 @@ fun SettingsScreen(
     var localGlobalSensitivity by remember(clampedGlobalSensitivity) {
         mutableFloatStateOf(clampedGlobalSensitivity)
     }
+    LaunchedEffect(dataStoreWakeWordSensitivity) {
+        val coerced = dataStoreWakeWordSensitivity.coerceIn(0.50f, 0.98f)
+        if (kotlin.math.abs(localGlobalSensitivity - coerced) > 0.001f) {
+            localGlobalSensitivity = coerced
+        }
+    }
     val activePreset = remember(localGlobalSensitivity) {
         WakeSensitivityLevel.fromSensitivity(localGlobalSensitivity)
     }
@@ -398,6 +469,20 @@ fun SettingsScreen(
                     }
                 },
                 actions = {
+                    com.example.ui.components.TopBarSyncModeStatusIndicator(
+                        isOfflineCacheMode = effectiveOfflineQueueing,
+                        pendingQueuedCount = pendingOfflineSyncCount,
+                        onToggleMode = {
+                            val next = !effectiveOfflineQueueing
+                            if (onToggleOfflineQuestQueueing != null) {
+                                onToggleOfflineQuestQueueing(next)
+                            } else {
+                                com.example.util.AppSettingsManager.setOfflineQuestQueueingEnabled(context, next)
+                                com.example.game.AdventureEngine.playSyncModeSwitchHaptic(context, next)
+                            }
+                        },
+                        testTag = "settings_top_bar_sync_mode_indicator"
+                    )
                     IconButton(
                         onClick = onOpenDiagnosticLog,
                         modifier = Modifier.testTag("settings_open_diagnostics_button")
@@ -443,6 +528,327 @@ fun SettingsScreen(
                         sleepReason = sleepModeReason,
                         onWakeUpTap = onExitSleepMode
                     )
+                }
+            }
+
+            // Runtime Microphone (RECORD_AUDIO) & SAF File Access Permission Card
+            item {
+                com.example.ui.components.MicrophonePermissionStatusBanner(
+                    hideWhenGranted = false,
+                    onActivateVoiceListening = onToggleListening,
+                    testTag = "settings_microphone_permission_banner"
+                )
+            }
+
+            // Custom Wake Word DataStore & SharedPreferences Configuration Card
+            item {
+                val runWakeWordSimulation: (String) -> com.example.voice.WakeWordSimulationDiagnosticReport = { phraseToTest ->
+                    val cleanedPhrase = phraseToTest.trim().ifBlank { effectiveSavedCustomWakeWord }
+                    val report = onSimulateWakeWordDiagnostic?.invoke(cleanedPhrase)
+                        ?: com.example.voice.WakeWordVoiceService.simulateWakeWordDetectionFlow(
+                            context = context,
+                            wakePhraseOverride = cleanedPhrase,
+                            configuredWakeWords = configuredWakeWords,
+                            sensitivityOverride = clampedGlobalSensitivity,
+                            dispatchToDetectionCallbacks = false
+                        )
+                    localSimulationReport = report
+                    report
+                }
+
+                CustomWakeWordPreferencesCard(
+                    savedWakeWordPhrase = effectiveSavedCustomWakeWord,
+                    wakeWordSensitivity = localGlobalSensitivity,
+                    onSetWakeWordSensitivity = { updatedSens ->
+                        val coerced = updatedSens.coerceIn(0.50f, 0.98f)
+                        localGlobalSensitivity = coerced
+                        coroutineScope.launch {
+                            com.example.util.WakeWordDataStoreManager.saveWakeWordSensitivity(
+                                context = context,
+                                sensitivity = coerced
+                            )
+                        }
+                        onSetWakeWordSensitivity(coerced)
+                    },
+                    isActivelyListening = (isListening || isHandsFreeActive) && !isSleepMode && !effectiveLowPowerMode,
+                    audioRmsDb = audioRmsDb,
+                    lastHeardText = lastHeardText,
+                    screenOffBatterySaverEnabled = effectiveScreenOffBatterySaver,
+                    pollingIntervalMs = effectivePollingIntervalMs,
+                    simulationDiagnosticReport = activeSimulationReport,
+                    onSimulateWakeWordDetection = runWakeWordSimulation,
+                    availableChats = chats,
+                    preselectedChatId = selectedTargetChatId,
+                    onSelectPreselectedChat = { chosenChatId ->
+                        selectedTargetChatId = chosenChatId
+                        onSetDefaultWakeChat(chosenChatId)
+                    },
+                    onSaveWakeWord = { phraseToSave ->
+                        val cleaned = com.example.voice.WakeWordRoutingEngine.resolveWakeWordOrSuggestedFallback(
+                            inputPhrase = phraseToSave,
+                            preferredSuggestion = com.example.util.AppSettingsManager.DEFAULT_CUSTOM_WAKE_WORD_PHRASE
+                        )
+                        coroutineScope.launch {
+                            com.example.util.WakeWordDataStoreManager.saveCustomWakeWord(
+                                context = context,
+                                phrase = cleaned,
+                                chatId = selectedTargetChatId.takeIf { it > 0L },
+                                sensitivity = localGlobalSensitivity
+                            )
+                        }
+                        if (onSaveCustomWakeWordToPrefs != null) {
+                            onSaveCustomWakeWordToPrefs(cleaned)
+                        } else {
+                            com.example.util.AppSettingsManager.saveCustomWakeWordPhrase(
+                                context = context,
+                                phrase = cleaned,
+                                chatId = selectedTargetChatId.takeIf { it > 0L },
+                                sensitivity = localGlobalSensitivity
+                            )
+                        }
+                    },
+                    onResetDefault = {
+                        localGlobalSensitivity = com.example.util.WakeWordDataStoreManager.DEFAULT_WAKE_WORD_SENSITIVITY
+                        onSetWakeWordSensitivity(com.example.util.WakeWordDataStoreManager.DEFAULT_WAKE_WORD_SENSITIVITY)
+                        coroutineScope.launch {
+                            com.example.util.WakeWordDataStoreManager.resetCustomWakeWord(context)
+                        }
+                        if (onResetCustomWakeWordInPrefs != null) {
+                            onResetCustomWakeWordInPrefs()
+                        } else {
+                            com.example.util.AppSettingsManager.resetCustomWakeWordPhrase(context)
+                        }
+                    }
+                )
+            }
+
+            // Firestore Gemini Chat Sessions Selector Card (Multi-Sync Wake Target)
+            item {
+                FirestoreWakeChatSelectorCard(
+                    cloudChats = cloudBackupChats,
+                    localChats = chats,
+                    onSelectFirestoreWakeChat = onSelectFirestoreWakeChat,
+                    onSelectLocalWakeChat = onSetDefaultWakeChat,
+                    onOpenChat = onOpenChat
+                )
+            }
+
+            // 0. Low Power Mode (with Dynamic Estimated Hours Remaining) & Offline Room Queueing Global Toggle Card
+            item {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("settings_low_power_and_offline_sync_card"),
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.28f)
+                    ),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.35f))
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        // A. Low Power Mode Row + Dynamic Estimated Hours Remaining
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Low Power Mode",
+                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+                                )
+                                Text(
+                                    text = "Disables the constant background wake-word listener while keeping the UI microphone button functional to extend battery life on older devices",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Switch(
+                                checked = effectiveLowPowerMode,
+                                onCheckedChange = { enabled ->
+                                    if (onToggleLowPowerMode != null) {
+                                        onToggleLowPowerMode(enabled)
+                                    } else {
+                                        com.example.util.AppSettingsManager.setLowPowerModeEnabled(context, enabled)
+                                    }
+                                },
+                                modifier = Modifier.testTag("settings_low_power_mode_switch")
+                            )
+                        }
+
+                        // Dynamic Estimated Hours Remaining Pill
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (effectiveLowPowerMode) {
+                                Color(0xFF10B981).copy(alpha = 0.14f)
+                            } else {
+                                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
+                            },
+                            border = BorderStroke(
+                                1.dp,
+                                if (effectiveLowPowerMode) Color(0xFF10B981).copy(alpha = 0.5f)
+                                else MaterialTheme.colorScheme.outlineVariant
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(
+                                    text = resolvedBatteryEstimate.formattedLabel,
+                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                    color = if (effectiveLowPowerMode) Color(0xFF10B981) else MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("settings_estimated_hours_remaining_label")
+                                )
+                                Text(
+                                    text = if (effectiveLowPowerMode) "Wake Listener Off" else "Wake Listener Active",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (effectiveLowPowerMode) Color(0xFF10B981) else MaterialTheme.colorScheme.primary
+                                )
+                            }
+                        }
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+                        // A2. Screen-Off Battery Saver Toggle (Reduces Wake-Word Polling Frequency When Screen Is Off)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Text(
+                                        text = "Screen-Off Battery Saver (Reduced Polling)",
+                                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
+                                    )
+                                    Surface(
+                                        shape = RoundedCornerShape(999.dp),
+                                        color = if (effectiveScreenOffBatterySaver) {
+                                            Color(0xFF10B981).copy(alpha = 0.18f)
+                                        } else {
+                                            MaterialTheme.colorScheme.surfaceVariant
+                                        }
+                                    ) {
+                                        Text(
+                                            text = if (effectiveScreenOffBatterySaver) {
+                                                "450ms Screen-Off / ${effectivePollingIntervalMs}ms Active"
+                                            } else {
+                                                "60ms Full Polling"
+                                            },
+                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                            color = if (effectiveScreenOffBatterySaver) {
+                                                Color(0xFF10B981)
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurfaceVariant
+                                            },
+                                            modifier = Modifier
+                                                .padding(horizontal = 8.dp, vertical = 2.dp)
+                                                .testTag("settings_screen_off_polling_interval_label")
+                                        )
+                                    }
+                                }
+                                Text(
+                                    text = "Reduces wake word detection polling frequency from 60ms to 450ms when the screen is off to conserve battery while keeping hands-free detection active",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Switch(
+                                checked = effectiveScreenOffBatterySaver,
+                                onCheckedChange = { enabled ->
+                                    coroutineScope.launch {
+                                        com.example.util.WakeWordDataStoreManager.saveScreenOffBatterySaver(
+                                            context = context,
+                                            enabled = enabled
+                                        )
+                                    }
+                                    if (onToggleScreenOffBatterySaver != null) {
+                                        onToggleScreenOffBatterySaver(enabled)
+                                    } else {
+                                        com.example.util.AppSettingsManager.setScreenOffBatterySaverEnabled(
+                                            context = context,
+                                            enabled = enabled
+                                        )
+                                    }
+                                },
+                                modifier = Modifier.testTag("settings_screen_off_battery_saver_switch")
+                            )
+                        }
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+                        // B. Global Offline Room-Backed Quest Queueing Toggle ('Online Sync' vs 'Offline Cache')
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Text(
+                                        text = "Offline Quest Room Queueing",
+                                        style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
+                                    )
+                                    Surface(
+                                        shape = RoundedCornerShape(999.dp),
+                                        color = if (effectiveOfflineQueueing) Color(0xFFF59E0B).copy(alpha = 0.18f)
+                                        else Color(0xFF10B981).copy(alpha = 0.18f)
+                                    ) {
+                                        Text(
+                                            text = if (effectiveOfflineQueueing) "Offline Cache" else "Online Sync",
+                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                            color = if (effectiveOfflineQueueing) Color(0xFFF59E0B) else Color(0xFF10B981),
+                                            modifier = Modifier
+                                                .padding(horizontal = 8.dp, vertical = 2.dp)
+                                                .testTag("settings_sync_mode_status_pill")
+                                        )
+                                    }
+                                }
+                                Text(
+                                    text = if (effectiveOfflineQueueing) {
+                                        "Offline Cache mode active: quest progress is cached in Room for later synchronization"
+                                    } else {
+                                        "Online Sync mode active: quest progress is synced immediately when connected"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Switch(
+                                checked = effectiveOfflineQueueing,
+                                onCheckedChange = { enabled ->
+                                    if (onToggleOfflineQuestQueueing != null) {
+                                        onToggleOfflineQuestQueueing(enabled)
+                                    } else {
+                                        com.example.util.AppSettingsManager.setOfflineQuestQueueingEnabled(context, enabled)
+                                        com.example.game.AdventureEngine.playSyncModeSwitchHaptic(context, enabled)
+                                    }
+                                },
+                                modifier = Modifier.testTag("settings_offline_quest_queue_switch")
+                            )
+                        }
+                    }
                 }
             }
 
@@ -502,7 +908,7 @@ fun SettingsScreen(
                                 color = MaterialTheme.colorScheme.primary
                             ) {
                                 Text(
-                                    text = "${(clampedGlobalSensitivity * 100).toInt()}%",
+                                    text = "${(localGlobalSensitivity * 100).toInt()}%",
                                     style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
                                     color = MaterialTheme.colorScheme.onPrimary,
                                     modifier = Modifier
@@ -520,7 +926,17 @@ fun SettingsScreen(
                             WakeSensitivityLevel.entries.forEach { preset ->
                                 val isSelected = activePreset == preset
                                 OutlinedButton(
-                                    onClick = { onSetWakeWordSensitivityLevel(preset) },
+                                    onClick = {
+                                        val presetVal = preset.sensitivityValue.coerceIn(0.50f, 0.98f)
+                                        localGlobalSensitivity = presetVal
+                                        coroutineScope.launch {
+                                            com.example.util.WakeWordDataStoreManager.saveWakeWordSensitivity(
+                                                context = context,
+                                                sensitivity = presetVal
+                                            )
+                                        }
+                                        onSetWakeWordSensitivityLevel(preset)
+                                    },
                                     colors = if (isSelected) {
                                         ButtonDefaults.outlinedButtonColors(
                                             containerColor = MaterialTheme.colorScheme.primaryContainer,
@@ -550,6 +966,12 @@ fun SettingsScreen(
                                 onValueChange = { newValue ->
                                     val coerced = newValue.coerceIn(0.50f, 0.98f)
                                     localGlobalSensitivity = coerced
+                                    coroutineScope.launch {
+                                        com.example.util.WakeWordDataStoreManager.saveWakeWordSensitivity(
+                                            context = context,
+                                            sensitivity = coerced
+                                        )
+                                    }
                                     onSetWakeWordSensitivity(coerced)
                                 },
                                 valueRange = 0.50f..0.98f,
@@ -670,6 +1092,31 @@ fun SettingsScreen(
                                     )
                                 }
                             }
+                        }
+
+                        FilledTonalButton(
+                            onClick = {
+                                val report = onSimulateWakeWordDiagnostic?.invoke(effectiveSavedCustomWakeWord)
+                                    ?: com.example.voice.WakeWordVoiceService.simulateWakeWordDetectionFlow(
+                                        context = context,
+                                        wakePhraseOverride = effectiveSavedCustomWakeWord,
+                                        configuredWakeWords = configuredWakeWords,
+                                        sensitivityOverride = clampedGlobalSensitivity,
+                                        dispatchToDetectionCallbacks = false
+                                    )
+                                localSimulationReport = report
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("settings_sensitivity_simulate_wake_word_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.PlayArrow,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Simulate Wake Word Detection Flow")
                         }
 
                         OutlinedButton(
@@ -2504,3 +2951,1032 @@ fun SettingsScreen(
         }
     }
 }
+
+/**
+ * Compose Settings card allowing users to define, preview presets, and save/update their custom wake word
+ * in Jetpack [androidx.datastore.core.DataStore] (`WakeWordDataStoreManager`) and [android.content.SharedPreferences]
+ * (`gemini_wake_settings` & `WakeWordVoiceService`), alongside a live [com.example.ui.components.ActiveWakeWordListeningOverlay].
+ */
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
+@Composable
+fun CustomWakeWordPreferencesCard(
+    savedWakeWordPhrase: String,
+    onSaveWakeWord: (String) -> Unit,
+    onResetDefault: () -> Unit,
+    wakeWordSensitivity: Float = com.example.util.WakeWordDataStoreManager.DEFAULT_WAKE_WORD_SENSITIVITY,
+    onSetWakeWordSensitivity: (Float) -> Unit = {},
+    isActivelyListening: Boolean = false,
+    audioRmsDb: Float = 0f,
+    lastHeardText: String = "",
+    screenOffBatterySaverEnabled: Boolean = false,
+    pollingIntervalMs: Long = 60L,
+    simulationDiagnosticReport: com.example.voice.WakeWordSimulationDiagnosticReport? = null,
+    onSimulateWakeWordDetection: ((String) -> com.example.voice.WakeWordSimulationDiagnosticReport)? = null,
+    availableChats: List<ChatSession> = emptyList(),
+    preselectedChatId: Long? = null,
+    onSelectPreselectedChat: (Long) -> Unit = {},
+    modifier: Modifier = Modifier
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val coroutineScope = androidx.compose.runtime.rememberCoroutineScope()
+    var draftPhrase by rememberSaveable(savedWakeWordPhrase) { mutableStateOf(savedWakeWordPhrase) }
+    var lastSelectedCommonSuggestion by rememberSaveable {
+        mutableStateOf(com.example.voice.WakeWordRoutingEngine.COMMON_WAKE_WORD_SUGGESTIONS.first())
+    }
+    val clampedSensitivity = wakeWordSensitivity.coerceIn(0.50f, 0.98f)
+    var localDataStoreSensitivity by remember(clampedSensitivity) {
+        mutableFloatStateOf(clampedSensitivity)
+    }
+    val sensitivityTierLabel = remember(localDataStoreSensitivity) {
+        when {
+            localDataStoreSensitivity >= 0.85f -> "Strict Match (Low False Triggers)"
+            localDataStoreSensitivity >= 0.72f -> "Balanced Threshold"
+            else -> "More Permissive (Quiet Rooms)"
+        }
+    }
+    var confirmationMessage by remember { mutableStateOf<String?>(null) }
+    var validationError by remember { mutableStateOf<String?>(null) }
+    var internalSimReport by remember {
+        mutableStateOf<com.example.voice.WakeWordSimulationDiagnosticReport?>(null)
+    }
+    val effectiveSimReport = internalSimReport ?: simulationDiagnosticReport
+
+    val quickSuggestions = remember {
+        com.example.voice.WakeWordRoutingEngine.COMMON_WAKE_WORD_SUGGESTIONS
+    }
+
+    Card(
+        modifier = modifier
+            .fillMaxWidth()
+            .testTag("settings_custom_wake_word_prefs_card"),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f)
+        ),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f))
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(36.dp)
+                            .clip(CircleShape)
+                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.16f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.RecordVoiceOver,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column {
+                        Text(
+                            text = "Custom Wake Word (DataStore & Prefs)",
+                            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold)
+                        )
+                        Text(
+                            text = "Define and update your custom wake phrase stored in Jetpack DataStore",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.testTag("settings_datastore_wake_word_badge")
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Surface(
+                    shape = RoundedCornerShape(999.dp),
+                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f))
+                ) {
+                    Text(
+                        text = "Active: \"$savedWakeWordPhrase\"",
+                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                            .testTag("settings_saved_custom_wake_word_badge")
+                    )
+                }
+            }
+
+            // Visual pulse animation that triggers on the screen when actively listening for the wake word
+            com.example.ui.components.WakeWordScreenPulseAnimation(
+                isActivelyListening = isActivelyListening,
+                activeWakePhrase = savedWakeWordPhrase,
+                audioRmsDb = if (effectiveSimReport != null && audioRmsDb <= 0f) effectiveSimReport.computedRmsDb else audioRmsDb,
+                pollingIntervalMs = pollingIntervalMs,
+                testTag = "settings_wake_word_screen_pulse_animation",
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            // Custom glowing status widget indicating the wake word listener & notification icon are active
+            com.example.ui.components.WakeWordGlowingStatusWidget(
+                isActivelyListening = isActivelyListening,
+                activeWakePhrase = savedWakeWordPhrase,
+                screenOffBatterySaverEnabled = screenOffBatterySaverEnabled,
+                pollingIntervalMs = pollingIntervalMs,
+                hideWhenInactive = false,
+                testTag = "settings_wake_word_glowing_status_widget",
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            // Animated visual indicator showing when the microphone is active and listening for the wake word
+            com.example.ui.components.MicrophoneWakeWordListeningIndicator(
+                isMicrophoneActiveAndListening = isActivelyListening,
+                activeWakePhrase = savedWakeWordPhrase,
+                audioRmsDb = if (effectiveSimReport != null && audioRmsDb <= 0f) effectiveSimReport.computedRmsDb else audioRmsDb,
+                lastHeardText = lastHeardText.ifBlank { effectiveSimReport?.simulatedTranscript.orEmpty() },
+                hideWhenInactive = false,
+                testTag = "settings_microphone_wake_word_listening_indicator",
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            // Subtle animated visual indicator showing when the app is actively listening for the wake word
+            com.example.ui.components.ActiveWakeWordListeningOverlay(
+                isActivelyListening = isActivelyListening,
+                activeWakePhrase = savedWakeWordPhrase,
+                audioRmsDb = if (effectiveSimReport != null && audioRmsDb <= 0f) effectiveSimReport.computedRmsDb else audioRmsDb,
+                lastHeardText = lastHeardText.ifBlank { effectiveSimReport?.simulatedTranscript.orEmpty() }
+            )
+
+            OutlinedTextField(
+                value = draftPhrase,
+                onValueChange = { updated ->
+                    draftPhrase = updated
+                    validationError = null
+                },
+                label = { Text("Custom Wake Word Phrase") },
+                placeholder = { Text("e.g., Hey Gemini, Hey Nebula, Computer") },
+                singleLine = true,
+                isError = validationError != null,
+                leadingIcon = {
+                    Icon(
+                        imageVector = Icons.Default.Hearing,
+                        contentDescription = "Wake Word Input"
+                    )
+                },
+                trailingIcon = {
+                    if (draftPhrase.isNotEmpty()) {
+                        IconButton(
+                            onClick = {
+                                draftPhrase = ""
+                                validationError = null
+                            },
+                            modifier = Modifier.testTag("settings_clear_custom_wake_word_prefs_input")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = "Clear wake word input"
+                            )
+                        }
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("settings_custom_wake_word_prefs_input")
+            )
+
+            if (validationError != null) {
+                Text(
+                    text = validationError!!,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.testTag("settings_custom_wake_word_prefs_error")
+                )
+            }
+
+            // Quick preset suggestion chips (with fallback when custom input is left blank)
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Text(
+                    text = "Common Wake Word Suggestions (tap to apply, or leave input blank to auto-use):",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                androidx.compose.foundation.layout.FlowRow(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("settings_common_wake_word_suggestions_row"),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    quickSuggestions.forEach { suggestion ->
+                        val slug = suggestion.lowercase(Locale.US).replace(" ", "_")
+                        val isSelected = draftPhrase.trim().equals(suggestion, ignoreCase = true) ||
+                            (draftPhrase.isBlank() && lastSelectedCommonSuggestion.equals(suggestion, ignoreCase = true))
+                        FilterChip(
+                            selected = isSelected,
+                            onClick = {
+                                lastSelectedCommonSuggestion = suggestion
+                                draftPhrase = suggestion
+                                validationError = null
+                                com.example.voice.LocalKeywordSpotterEngine.syncConfiguration(
+                                    customWakePhrase = suggestion,
+                                    sensitivityThreshold = localDataStoreSensitivity
+                                )
+                            },
+                            label = {
+                                Text(
+                                    text = suggestion,
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            },
+                            modifier = Modifier.testTag("settings_custom_wake_word_chip_$slug")
+                        )
+                    }
+                }
+            }
+
+            // Pre-Selected Chat, 4-Tier Priority Level & Location Context Selector
+            val chatPriorityMap by com.example.util.AppSettingsManager.chatPriorityMap.collectAsState()
+            val activeLocProfile by com.example.util.AppSettingsManager.activeLocationProfile.collectAsState()
+            var hasCoarseLocation by remember {
+                mutableStateOf(
+                    androidx.core.content.ContextCompat.checkSelfPermission(
+                        context,
+                        android.Manifest.permission.ACCESS_COARSE_LOCATION
+                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                )
+            }
+            val coarseLocationLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+                contract = androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
+            ) { granted ->
+                hasCoarseLocation = granted
+            }
+
+            if (availableChats.isNotEmpty()) {
+                val activePreselectedChat = remember(availableChats, preselectedChatId) {
+                    availableChats.firstOrNull { it.id == preselectedChatId }
+                        ?: availableChats.firstOrNull { it.isDefaultWakeChat }
+                        ?: availableChats.first()
+                }
+                val currentChatPriority = chatPriorityMap[activePreselectedChat.id]
+                    ?: com.example.util.ChatPriorityLevel.NORMAL
+
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("settings_custom_wake_preselected_chat_selector")
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "Pre-Selected Chat on Wake-Word Detection: ${activePreselectedChat.title}",
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        androidx.compose.foundation.layout.FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            availableChats.take(6).forEach { chatItem ->
+                                val isSelectedChat = chatItem.id == activePreselectedChat.id
+                                FilterChip(
+                                    selected = isSelectedChat,
+                                    onClick = { onSelectPreselectedChat(chatItem.id) },
+                                    label = {
+                                        Text(
+                                            text = chatItem.title,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    },
+                                    modifier = Modifier.testTag("settings_preselected_chat_chip_${chatItem.id}")
+                                )
+                            }
+                        }
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+
+                        Text(
+                            text = "Priority Level for \"${activePreselectedChat.title}\": ${currentChatPriority.displayLabel}",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        androidx.compose.foundation.layout.FlowRow(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("settings_chat_priority_level_row"),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            com.example.util.ChatPriorityLevel.entries.forEach { prio ->
+                                FilterChip(
+                                    selected = currentChatPriority == prio,
+                                    onClick = {
+                                        com.example.util.AppSettingsManager.setChatPriorityLevel(
+                                            context = context,
+                                            chatId = activePreselectedChat.id,
+                                            priority = prio
+                                        )
+                                    },
+                                    label = {
+                                        Text(
+                                            text = "${prio.shortBadge} (+${prio.weight})",
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+                                    },
+                                    modifier = Modifier.testTag("settings_chat_priority_chip_${prio.name.lowercase(Locale.US)}")
+                                )
+                            }
+                        }
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Location & Place Context: ${activeLocProfile.displayLabel}",
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.weight(1f)
+                            )
+                            if (!hasCoarseLocation) {
+                                TextButton(
+                                    onClick = {
+                                        coarseLocationLauncher.launch(android.Manifest.permission.ACCESS_COARSE_LOCATION)
+                                    },
+                                    modifier = Modifier.testTag("settings_grant_coarse_location_button")
+                                ) {
+                                    Text("Enable Coarse GPS", style = MaterialTheme.typography.labelSmall)
+                                }
+                            }
+                        }
+                        androidx.compose.foundation.layout.FlowRow(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("settings_location_profile_row"),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            com.example.util.ContextLocationProfile.entries.forEach { locProfile ->
+                                FilterChip(
+                                    selected = activeLocProfile == locProfile,
+                                    onClick = {
+                                        com.example.util.AppSettingsManager.setActiveLocationProfile(
+                                            context = context,
+                                            profile = locProfile
+                                        )
+                                    },
+                                    label = {
+                                        Text(
+                                            text = locProfile.displayLabel,
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+                                    },
+                                    modifier = Modifier.testTag("settings_location_profile_chip_${locProfile.name.lowercase(Locale.US)}")
+                                )
+                            }
+                        }
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+
+                        // Quiet Mode Toggle in Settings
+                        val quietModeEnabled by com.example.util.AppSettingsManager.quietModeEnabled.collectAsState()
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("settings_quiet_mode_row"),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Quiet Mode (Pause Wake Word Detection)",
+                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                    color = if (quietModeEnabled) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    text = if (quietModeEnabled) {
+                                        "Wake words are currently muted across background & foreground listeners"
+                                    } else {
+                                        "Active — wake words respond immediately"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Switch(
+                                checked = quietModeEnabled,
+                                onCheckedChange = { enabled ->
+                                    com.example.util.AppSettingsManager.setQuietModeEnabled(context, enabled)
+                                    com.example.voice.WakeWordVoiceService.setQuietMode(enabled, context)
+                                },
+                                modifier = Modifier.testTag("settings_quiet_mode_switch")
+                            )
+                        }
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+
+                        // Wake Word Action Selector for current custom wake phrase
+                        val wakeWordActionMap by com.example.util.AppSettingsManager.wakeWordActionMap.collectAsState()
+                        val effectivePhraseKey = draftPhrase.trim().ifBlank { savedWakeWordPhrase }.lowercase(Locale.US)
+                        val selectedWakeAction = wakeWordActionMap[effectivePhraseKey]
+                            ?: com.example.util.WakeWordActionType.OPEN_CHAT
+                        Text(
+                            text = "Action When \"${draftPhrase.ifBlank { savedWakeWordPhrase }}\" Is Spoken:",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        androidx.compose.foundation.layout.FlowRow(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("settings_wake_word_action_row"),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            com.example.util.WakeWordActionType.entries.forEach { actionType ->
+                                FilterChip(
+                                    selected = selectedWakeAction == actionType,
+                                    onClick = {
+                                        com.example.util.AppSettingsManager.setWakeWordAction(
+                                            context = context,
+                                            phrase = draftPhrase.ifBlank { savedWakeWordPhrase },
+                                            actionType = actionType
+                                        )
+                                    },
+                                    label = {
+                                        Text(
+                                            text = actionType.displayLabel,
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+                                    },
+                                    modifier = Modifier.testTag("settings_wake_action_chip_${actionType.name.lowercase(Locale.US)}")
+                                )
+                            }
+                        }
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+
+                        // Category Wake Word Assignments (Work, Personal, Learning)
+                        val categoryWakeMap by com.example.util.AppSettingsManager.categoryWakeWordMap.collectAsState()
+                        Text(
+                            text = "Category Wake Words (Opens Highest-Priority Chat in Category):",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        androidx.compose.foundation.layout.FlowRow(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("settings_category_wake_words_row"),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            listOf("Work", "Personal", "Learning").forEach { categoryName ->
+                                val assignedCatPhrase = categoryWakeMap[categoryName] ?: "Hey Gemini"
+                                FilterChip(
+                                    selected = draftPhrase.trim().equals(assignedCatPhrase, ignoreCase = true),
+                                    onClick = {
+                                        val phraseToAssign = draftPhrase.trim().ifBlank { savedWakeWordPhrase }
+                                        com.example.util.AppSettingsManager.setCategoryWakeWord(
+                                            context = context,
+                                            category = categoryName,
+                                            wakePhrase = phraseToAssign
+                                        )
+                                    },
+                                    label = {
+                                        Text(
+                                            text = "$categoryName: \"$assignedCatPhrase\"",
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+                                    },
+                                    modifier = Modifier.testTag("settings_category_wake_chip_${categoryName.lowercase(Locale.US)}")
+                                )
+                            }
+                        }
+
+                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+
+                        // Configurable Context-to-Chat Trigger Rules
+                        val contextRules by com.example.util.AppSettingsManager.contextTriggerRules.collectAsState()
+                        Text(
+                            text = "Context-to-Chat Trigger Rules (Tap to bind active target chat):",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        androidx.compose.foundation.layout.FlowRow(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("settings_context_trigger_rules_row"),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            com.example.util.ContextTriggerType.entries.forEach { triggerType ->
+                                val existingRule = contextRules[triggerType]
+                                val boundChatTitle = existingRule?.let { rule ->
+                                    availableChats.firstOrNull { it.id == rule.targetChatId }?.title
+                                }
+                                FilterChip(
+                                    selected = existingRule != null,
+                                    onClick = {
+                                        val targetId = activePreselectedChat.id
+                                        if (existingRule != null && existingRule.targetChatId == targetId) {
+                                            com.example.util.AppSettingsManager.removeContextTriggerRule(
+                                                context = context,
+                                                contextType = triggerType
+                                            )
+                                        } else if (targetId > 0L) {
+                                            com.example.util.AppSettingsManager.setContextTriggerRule(
+                                                context = context,
+                                                contextType = triggerType,
+                                                targetChatId = targetId,
+                                                autoOpenDirectly = true
+                                            )
+                                        }
+                                    },
+                                    label = {
+                                        Text(
+                                            text = if (boundChatTitle != null) {
+                                                "${triggerType.displayLabel} → $boundChatTitle"
+                                            } else {
+                                                triggerType.displayLabel
+                                            },
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+                                    },
+                                    modifier = Modifier.testTag("settings_context_rule_chip_${triggerType.name.lowercase(Locale.US)}")
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Wake Word Detection Sensitivity Threshold Slider (Saved in Jetpack DataStore)
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = MaterialTheme.colorScheme.surface.copy(alpha = 0.72f),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.28f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("settings_datastore_wake_word_sensitivity_section")
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Wake Word Detection Sensitivity Threshold (DataStore)",
+                                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Text(
+                                text = "Saved in Jetpack DataStore • $sensitivityTierLabel",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.primary
+                        ) {
+                            Text(
+                                text = "${(localDataStoreSensitivity * 100).toInt()}%",
+                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                color = MaterialTheme.colorScheme.onPrimary,
+                                modifier = Modifier
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                                    .testTag("settings_datastore_wake_word_sensitivity_value_text")
+                            )
+                        }
+                    }
+
+                    Slider(
+                        value = localDataStoreSensitivity,
+                        onValueChange = { updatedValue ->
+                            val coerced = updatedValue.coerceIn(0.50f, 0.98f)
+                            localDataStoreSensitivity = coerced
+                            coroutineScope.launch {
+                                com.example.util.WakeWordDataStoreManager.saveWakeWordSensitivity(
+                                    context = context,
+                                    sensitivity = coerced
+                                )
+                            }
+                            onSetWakeWordSensitivity(coerced)
+                        },
+                        valueRange = 0.50f..0.98f,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("settings_datastore_wake_word_sensitivity_slider")
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "50% (More Permissive)",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            text = "78% (Balanced)",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        Text(
+                            text = "98% (Strict Match)",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+
+                    // Quick Sensitivity Preset Chips (Synced to DataStore & Keyword Spotter)
+                    val sensitivityPresets = remember {
+                        listOf(
+                            "Permissive" to 0.62f,
+                            "Balanced" to 0.78f,
+                            "Strict" to 0.88f,
+                            "Ultra-Precise" to 0.94f
+                        )
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        sensitivityPresets.forEach { (presetLabel, presetValue) ->
+                            val presetSlug = presetLabel.lowercase(Locale.US).replace("-", "_")
+                            val isSelectedPreset = kotlin.math.abs(localDataStoreSensitivity - presetValue) < 0.025f
+                            FilterChip(
+                                selected = isSelectedPreset,
+                                onClick = {
+                                    localDataStoreSensitivity = presetValue
+                                    coroutineScope.launch {
+                                        com.example.util.WakeWordDataStoreManager.saveWakeWordSensitivity(
+                                            context = context,
+                                            sensitivity = presetValue
+                                        )
+                                    }
+                                    com.example.voice.LocalKeywordSpotterEngine.syncConfiguration(
+                                        customWakePhrase = draftPhrase.ifBlank { savedWakeWordPhrase },
+                                        sensitivityThreshold = presetValue
+                                    )
+                                    onSetWakeWordSensitivity(presetValue)
+                                },
+                                label = {
+                                    Text(
+                                        text = "$presetLabel ${(presetValue * 100).toInt()}%",
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                },
+                                modifier = Modifier.testTag("settings_sensitivity_preset_chip_$presetSlug")
+                            )
+                        }
+                    }
+
+                    // Live Hybrid Keyword Spotter Confidence vs. Threshold Meter
+                    val spotterTelemetry by com.example.voice.WakeWordVoiceService.keywordSpotterTelemetry.collectAsState()
+                    val displayConfidence = if (effectiveSimReport != null && spotterTelemetry.combinedSpotterConfidence <= 0f) {
+                        effectiveSimReport.phraseSimilarityScore
+                    } else {
+                        spotterTelemetry.combinedSpotterConfidence
+                    }
+                    val isAboveThresholdNow = displayConfidence >= localDataStoreSensitivity
+                    val meterColor = if (isAboveThresholdNow) {
+                        Color(0xFF10B981)
+                    } else {
+                        Color(0xFF38BDF8)
+                    }
+
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+                        border = BorderStroke(1.dp, meterColor.copy(alpha = 0.45f)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 6.dp)
+                            .testTag("settings_keyword_spotter_confidence_meter")
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Keyword Spotter Live Confidence: ${(displayConfidence * 100).toInt()}%",
+                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                    color = meterColor,
+                                    modifier = Modifier.testTag("settings_keyword_spotter_confidence_value_text")
+                                )
+                                Text(
+                                    text = if (isAboveThresholdNow) {
+                                        "ABOVE THRESHOLD (${(localDataStoreSensitivity * 100).toInt()}%)"
+                                    } else {
+                                        "THRESHOLD ${(localDataStoreSensitivity * 100).toInt()}%"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                    color = meterColor
+                                )
+                            }
+
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(10.dp)
+                                    .clip(RoundedCornerShape(999.dp))
+                                    .background(MaterialTheme.colorScheme.surface)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth(displayConfidence.coerceIn(0.02f, 1f))
+                                        .height(10.dp)
+                                        .clip(RoundedCornerShape(999.dp))
+                                        .background(meterColor)
+                                )
+                            }
+
+                            Text(
+                                text = "Acoustic Energy: ${(spotterTelemetry.acousticEnergyScore * 100).toInt()}% • Phonetic Match: ${(spotterTelemetry.phoneticPhraseScore * 100).toInt()}% • Peak: ${(spotterTelemetry.peakSpotterConfidence * 100).toInt()}%",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = {
+                        val trimmed = draftPhrase.trim()
+                        val resolvedToSave = if (trimmed.isBlank()) {
+                            com.example.voice.WakeWordRoutingEngine.resolveWakeWordOrSuggestedFallback(
+                                inputPhrase = trimmed,
+                                preferredSuggestion = lastSelectedCommonSuggestion
+                            )
+                        } else {
+                            trimmed
+                        }
+                        if (resolvedToSave.length < 2) {
+                            validationError = "Please enter a wake word with at least 2 characters."
+                        } else {
+                            validationError = null
+                            draftPhrase = resolvedToSave
+                            onSaveWakeWord(resolvedToSave)
+                            confirmationMessage = if (trimmed.isBlank()) {
+                                "No custom phrase entered — applied suggested wake word \"$resolvedToSave\""
+                            } else {
+                                "Saved \"$resolvedToSave\" to Jetpack DataStore & SharedPreferences"
+                            }
+                            try {
+                                android.widget.Toast.makeText(
+                                    context,
+                                    "Saved custom wake word: \"$resolvedToSave\"",
+                                    android.widget.Toast.LENGTH_SHORT
+                                ).show()
+                            } catch (_: Exception) {}
+                        }
+                    },
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("settings_save_custom_wake_word_prefs_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Check,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Save Wake Word")
+                }
+
+                OutlinedButton(
+                    onClick = {
+                        validationError = null
+                        draftPhrase = com.example.util.AppSettingsManager.DEFAULT_CUSTOM_WAKE_WORD_PHRASE
+                        onResetDefault()
+                        confirmationMessage =
+                            "Reset to default \"${com.example.util.AppSettingsManager.DEFAULT_CUSTOM_WAKE_WORD_PHRASE}\" in DataStore & SharedPreferences"
+                    },
+                    modifier = Modifier.testTag("settings_reset_custom_wake_word_prefs_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Reset Default")
+                }
+            }
+
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+
+            // Diagnostic Button to Simulate Wake Word Detection Flow without speaking out loud
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = "Simulates the wake word detection flow to verify microphone pre-roll, phrase matching, and synchronous handoff without speaking out loud",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.testTag("settings_simulate_wake_word_diagnostic_subtitle")
+                )
+
+                FilledTonalButton(
+                    onClick = {
+                        val targetPhrase = draftPhrase.trim().ifBlank { savedWakeWordPhrase }
+                        val report = onSimulateWakeWordDetection?.invoke(targetPhrase)
+                            ?: com.example.voice.WakeWordVoiceService.simulateWakeWordDetectionFlow(
+                                context = context,
+                                wakePhraseOverride = targetPhrase,
+                                dispatchToDetectionCallbacks = false
+                            )
+                        internalSimReport = report
+                        try {
+                            android.widget.Toast.makeText(
+                                context,
+                                "Simulated wake word \"${report.matchedPhrase}\" — Diagnostic Passed!",
+                                android.widget.Toast.LENGTH_SHORT
+                            ).show()
+                        } catch (_: Exception) {}
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("settings_simulate_wake_word_diagnostic_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.BugReport,
+                        contentDescription = "Simulate Wake Word Detection",
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Simulate Wake Word Detection",
+                        style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold)
+                    )
+                }
+
+                if (effectiveSimReport != null) {
+                    WakeWordSimulationDiagnosticResultBanner(
+                        report = effectiveSimReport
+                    )
+                }
+            }
+
+            AnimatedVisibility(visible = confirmationMessage != null) {
+                if (confirmationMessage != null) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = Color(0xFF10B981).copy(alpha = 0.14f),
+                        border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.45f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = confirmationMessage!!,
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                            color = Color(0xFF10B981),
+                            modifier = Modifier
+                                .padding(horizontal = 12.dp, vertical = 8.dp)
+                                .testTag("settings_custom_wake_word_saved_confirmation")
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Displays the structured diagnostic verification results from [com.example.voice.WakeWordSimulationDiagnosticReport]
+ * after simulating the wake word detection flow in Settings.
+ */
+@Composable
+fun WakeWordSimulationDiagnosticResultBanner(
+    report: com.example.voice.WakeWordSimulationDiagnosticReport,
+    modifier: Modifier = Modifier
+) {
+    val accentColor = if (report.overallPassed) Color(0xFF10B981) else Color(0xFFF59E0B)
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = accentColor.copy(alpha = 0.12f),
+        border = BorderStroke(1.dp, accentColor.copy(alpha = 0.45f)),
+        modifier = modifier
+            .fillMaxWidth()
+            .testTag("settings_wake_word_simulation_diagnostic_result")
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Check,
+                        contentDescription = null,
+                        tint = accentColor,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Text(
+                        text = if (report.overallPassed) "DIAGNOSTIC PASSED" else "DIAGNOSTIC PARTIAL",
+                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                        color = accentColor,
+                        modifier = Modifier.testTag("settings_wake_word_simulation_status_badge")
+                    )
+                }
+                Text(
+                    text = "${report.elapsedDurationMs}ms • Handoff #${report.handoffReleaseCountAfter}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            Text(
+                text = "Simulated: \"${report.simulatedTranscript}\" → Matched: \"${report.matchedPhrase}\" (${report.targetChatTitle})",
+                style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.testTag("settings_wake_word_simulation_summary_text")
+            )
+
+            Text(
+                text = report.diagnosticSteps.getOrElse(0) {
+                    "1. Mic & Pre-Roll: Verified (${report.preRollPcmBytesVerified}B PCM @ ${String.format(Locale.US, "%.1f", report.computedRmsDb)} dB)"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.testTag("settings_wake_word_simulation_mic_check")
+            )
+
+            Text(
+                text = report.diagnosticSteps.getOrElse(1) {
+                    "2. Wake-Word Processing: Matched \"${report.matchedPhrase}\" (${(report.phraseSimilarityScore * 100).toInt()}% similarity)"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.testTag("settings_wake_word_simulation_processing_check")
+            )
+
+            Text(
+                text = report.diagnosticSteps.getOrElse(2) {
+                    "3. Synchronous Mic Handoff: Verified (serviceAudioRecord=null, Handoff #${report.handoffReleaseCountAfter})"
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.testTag("settings_wake_word_simulation_handoff_check")
+            )
+        }
+    }
+}
+
+

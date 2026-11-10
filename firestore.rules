@@ -185,5 +185,55 @@ service cloud.firestore {
 
       allow delete: if isOwner(userId) && isValidId(userId) && isValidId(wakeWordId);
     }
+
+    // Validation Blueprint 4: PlayerPresenceDoc
+    function isValidPlayerPresenceDoc(data, uid) {
+      return data.odinUid is string &&
+             data.odinUid == uid &&
+             data.odinUid == request.auth.uid &&
+             data.odinUid.size() >= 1 && data.odinUid.size() <= 128 &&
+             data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
+             data.level is int && data.level >= 1 && data.level <= 9999 &&
+             data.completedQuestCount is int && data.completedQuestCount >= 0 && data.completedQuestCount <= 100000 &&
+             data.currentActiveChatTitle is string && data.currentActiveChatTitle.size() >= 1 && data.currentActiveChatTitle.size() <= 200 &&
+             data.isOnline is bool &&
+             data.isStealthMode is bool &&
+             (!data.isStealthMode || (data.isOnline == false && data.currentActiveChatTitle == 'Offline' && data.sessionStartedEpochMs == 0)) &&
+             data.sessionStartedEpochMs is int && data.sessionStartedEpochMs >= 0 &&
+             data.lastHeartbeatEpochMs is int && data.lastHeartbeatEpochMs >= 0 &&
+             (!('createdAt' in data) || (data.createdAt is timestamp && data.createdAt <= request.time)) &&
+             data.updatedAt is timestamp && data.updatedAt <= request.time;
+    }
+
+    // 4. Multiplayer Adventure Presence Collection
+    match /presence/{uid} {
+      allow get, list: if isSignedIn() && isValidId(uid);
+
+      allow create: if isOwner(uid) &&
+                       isValidId(uid) &&
+                       incoming().keys().hasAll([
+                         'odinUid', 'displayName', 'level', 'completedQuestCount',
+                         'currentActiveChatTitle', 'isOnline', 'isStealthMode',
+                         'sessionStartedEpochMs', 'lastHeartbeatEpochMs', 'updatedAt'
+                       ]) &&
+                       incoming().keys().hasOnly([
+                         'odinUid', 'displayName', 'level', 'completedQuestCount',
+                         'currentActiveChatTitle', 'isOnline', 'isStealthMode',
+                         'sessionStartedEpochMs', 'lastHeartbeatEpochMs', 'createdAt', 'updatedAt'
+                       ]) &&
+                       isValidPlayerPresenceDoc(incoming(), uid);
+
+      allow update: if isOwner(uid) &&
+                       isValidId(uid) &&
+                       isValidPlayerPresenceDoc(incoming(), uid) &&
+                       incoming().odinUid == existing().odinUid &&
+                       incoming().diff(existing()).affectedKeys().hasOnly([
+                         'displayName', 'level', 'completedQuestCount',
+                         'currentActiveChatTitle', 'isOnline', 'isStealthMode',
+                         'sessionStartedEpochMs', 'lastHeartbeatEpochMs', 'updatedAt'
+                       ]);
+
+      allow delete: if isOwner(uid) && isValidId(uid);
+    }
   }
 }

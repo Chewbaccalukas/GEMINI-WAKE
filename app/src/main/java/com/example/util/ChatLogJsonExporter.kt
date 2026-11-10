@@ -261,13 +261,14 @@ object ChatLogJsonExporter {
         }
 
         val root = JSONObject().apply {
-            put("schemaVersion", 2)
+            put("schemaVersion", 1)
             put("exportedAt", exportedAtMs)
             put("exportedAtIso", formatIsoTimestamp(exportedAtMs))
             put("filterChatId", filterChatId ?: JSONObject.NULL)
             put("totalChats", targetChats.size)
             put("totalMessages", targetMessages.size)
-            put("totalVoiceCommands", allTimeWakeTriggers)
+            put("totalVoiceCommands", if (targetVoiceCommands.isNotEmpty()) targetVoiceCommands.size else allTimeWakeTriggers)
+            put("allTimeWakeTriggerCount", allTimeWakeTriggers)
             put("usageStatistics", usageStatisticsJson)
             put("chats", chatsJsonArray)
             put("interactions", flatInteractionsArray)

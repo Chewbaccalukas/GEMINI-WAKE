@@ -507,9 +507,9 @@ class WakeWordManager(
 
         const val SPEECH_DB_THRESHOLD = 0.0f
         const val SILENCE_CUTOFF_MS = 1200L
-        const val SPEECH_COMPLETE_SILENCE_MS = 3000L
         const val SPEECH_POSSIBLY_COMPLETE_SILENCE_MS = 3000L
-        const val SPEECH_MINIMUM_LENGTH_MS = 5000L
+        const val SPEECH_COMPLETE_SILENCE_MS = 5000L
+        const val SPEECH_MINIMUM_LENGTH_MS = 3000L
         const val MIN_NON_SILENT_SAMPLE_ABS = 1
 
         const val MAX_AUDIO_RECORD_INIT_RETRIES = 3
@@ -546,16 +546,16 @@ class WakeWordManager(
                 intent.putExtra(android.speech.RecognizerIntent.EXTRA_CALLING_PACKAGE, callingPackage)
             }
             intent.putExtra(
-                android.speech.RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
-                SPEECH_COMPLETE_SILENCE_MS
+                android.speech.RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
+                3000L
             )
             intent.putExtra(
-                android.speech.RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-                SPEECH_POSSIBLY_COMPLETE_SILENCE_MS
+                android.speech.RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
+                5000L
             )
             intent.putExtra(
                 android.speech.RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS,
-                SPEECH_MINIMUM_LENGTH_MS
+                3000L
             )
             val completeSilenceMs = intent.getLongExtra(
                 android.speech.RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
@@ -1105,28 +1105,19 @@ class WakeWordManager(
         val previous = _isTextInputFocused.value
         if (focused == previous) return
         _isTextInputFocused.value = focused
+        if (_isUserVoiceTurn.value) {
+            return
+        }
         if (focused) {
             if (_isListening.value || _isHandsFreeMode.value) {
                 shouldResumeAfterYield = true
             }
-            // Only yield passive background listening; if user is actively in a dedicated voice turn,
-            // do not let passive keyboard focus kill an explicit voice turn unless passive listening is active.
             if (_isListening.value && !_isUserVoiceTurn.value) {
                 stopAndReleaseForYield("Paused for keyboard / Gboard input")
             }
-            try {
-                val pauseIntent = Intent(context, WakeWordVoiceService::class.java).apply {
-                    action = WakeWordVoiceService.ACTION_PAUSE_FOR_INPUT_FOCUS
-                }
-                context.startService(pauseIntent)
-            } catch (_: Exception) {}
+            WakeWordVoiceService.pauseForInternalDictationInMemory()
         } else {
-            try {
-                val resumeIntent = Intent(context, WakeWordVoiceService::class.java).apply {
-                    action = WakeWordVoiceService.ACTION_RESUME_AFTER_INPUT_FOCUS
-                }
-                context.startService(resumeIntent)
-            } catch (_: Exception) {}
+            WakeWordVoiceService.resumeAfterInternalDictationInMemory()
             maybeResumeAfterYield()
         }
     }

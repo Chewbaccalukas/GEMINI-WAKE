@@ -83,11 +83,14 @@ fun CloudBackupVaultScreen(
     onSyncNow: () -> Unit,
     onSignOut: () -> Unit,
     onRestoreToDevice: (FirestoreChatDoc) -> Unit,
-    onDeleteFromCloud: (FirestoreChatDoc) -> Unit
+    onDeleteFromCloud: (FirestoreChatDoc) -> Unit,
+    onSelectWakeTargetChat: (FirestoreChatDoc) -> Unit = {}
 ) {
     BackHandler(onBack = onBack)
 
     var chatPendingCloudDelete by remember { mutableStateOf<FirestoreChatDoc?>(null) }
+    var showWakeTargetSelectorTab by remember { mutableStateOf(false) }
+    var wakeSelectorSearchQuery by remember { mutableStateOf("") }
 
     val dateFormatter = remember {
         SimpleDateFormat("MMM d, yyyy • h:mm a", Locale.getDefault())
@@ -258,10 +261,87 @@ fun CloudBackupVaultScreen(
                             )
                         }
                     }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    // Mode Switcher: Cloud Backup Vault vs. Firestore Wake-Word Target Selector (Multi-Sync)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = { showWakeTargetSelectorTab = false },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (!showWakeTargetSelectorTab) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceVariant
+                                },
+                                contentColor = if (!showWakeTargetSelectorTab) {
+                                    MaterialTheme.colorScheme.onPrimary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            ),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("cloud_vault_tab_backups_button")
+                        ) {
+                            Text(
+                                text = "Backup & Restore",
+                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                            )
+                        }
+                        Button(
+                            onClick = { showWakeTargetSelectorTab = true },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (showWakeTargetSelectorTab) {
+                                    Color(0xFF10B981)
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceVariant
+                                },
+                                contentColor = if (showWakeTargetSelectorTab) {
+                                    Color.White
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            ),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("cloud_vault_tab_wake_selector_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Mic,
+                                contentDescription = null,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Wake-Word Selector",
+                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                            )
+                        }
+                    }
                 }
             }
 
-            if (cloudChats.isEmpty()) {
+            if (showWakeTargetSelectorTab) {
+                FirestoreWakeChatSelectorContent(
+                    cloudChats = cloudChats,
+                    cloudMessages = cloudMessages,
+                    localChats = localChats,
+                    cloudSyncStatus = cloudSyncStatus,
+                    isCloudOperationInProgress = isCloudOperationInProgress,
+                    searchQuery = wakeSelectorSearchQuery,
+                    onSearchQueryChange = { wakeSelectorSearchQuery = it },
+                    onSelectWakeTargetChat = onSelectWakeTargetChat,
+                    onOpenFirestoreChat = onRestoreToDevice,
+                    onSyncNow = onSyncNow,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                )
+            } else if (cloudChats.isEmpty()) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -464,6 +544,56 @@ fun CloudBackupVaultScreen(
                                 }
 
                                 Spacer(modifier = Modifier.height(14.dp))
+
+                                val isDefaultWakeTarget = cloudDoc.isDefaultWakeChat ||
+                                    localChats.any { it.id == targetLocalId && it.isDefaultWakeChat }
+
+                                OutlinedButton(
+                                    onClick = { onSelectWakeTargetChat(cloudDoc) },
+                                    enabled = !isCloudOperationInProgress,
+                                    border = androidx.compose.foundation.BorderStroke(
+                                        1.dp,
+                                        if (isDefaultWakeTarget) {
+                                            Color(0xFF10B981)
+                                        } else {
+                                            MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)
+                                        }
+                                    ),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("select_wake_target_from_vault_${cloudDoc.id.ifBlank { targetLocalId.toString() }}")
+                                ) {
+                                    Icon(
+                                        imageVector = if (isDefaultWakeTarget) {
+                                            Icons.Default.CheckCircle
+                                        } else {
+                                            Icons.Default.Mic
+                                        },
+                                        contentDescription = null,
+                                        tint = if (isDefaultWakeTarget) {
+                                            Color(0xFF10B981)
+                                        } else {
+                                            MaterialTheme.colorScheme.primary
+                                        },
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = if (isDefaultWakeTarget) {
+                                            "Active Wake-Word Target (Multi-Synced)"
+                                        } else {
+                                            "Set to Open on Wake-Word (Multi-Sync)"
+                                        },
+                                        color = if (isDefaultWakeTarget) {
+                                            Color(0xFF10B981)
+                                        } else {
+                                            MaterialTheme.colorScheme.primary
+                                        },
+                                        style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.height(8.dp))
 
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),

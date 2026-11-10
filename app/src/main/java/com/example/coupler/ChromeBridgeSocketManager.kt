@@ -466,30 +466,35 @@ object ChromeBridgeSocketManager {
         stagedUrl: String,
         timestamp: Long
     ): String {
-        val msgArray = JSONArray()
-        messages.forEach { msg ->
-            msgArray.put(
-                JSONObject().apply {
-                    put("id", msg.id)
-                    put("chatId", msg.chatId)
-                    put("sender", msg.sender)
-                    put("content", msg.content)
-                    put("timestamp", msg.timestamp)
-                    put("triggeredByWakeWord", msg.triggeredByWakeWord)
-                }
-            )
+        return try {
+            val msgArray = JSONArray()
+            messages.takeLast(150).forEach { msg ->
+                msgArray.put(
+                    JSONObject().apply {
+                        put("id", msg.id)
+                        put("chatId", msg.chatId)
+                        put("sender", msg.sender)
+                        put("content", msg.content)
+                        put("timestamp", msg.timestamp)
+                        put("triggeredByWakeWord", msg.triggeredByWakeWord)
+                    }
+                )
+            }
+            JSONObject().apply {
+                put("status", "staged")
+                put("boundPort", _bridgeState.value.boundPort)
+                put("chatId", chat?.id ?: 0L)
+                put("chatTitle", chat?.title ?: "Gemini Chat")
+                put("wakeWord", chat?.wakeWord ?: "Hey Gemini")
+                put("systemInstruction", chat?.systemInstruction ?: "")
+                put("stagedUrl", stagedUrl)
+                put("stagedAt", timestamp)
+                put("messages", msgArray)
+            }.toString()
+        } catch (t: Throwable) {
+            Log.w(TAG, "Fallback minimal staged payload due to error: ${t.message}")
+            "{\"status\":\"staged\",\"chatId\":${chat?.id ?: 0L}}"
         }
-        return JSONObject().apply {
-            put("status", "staged")
-            put("boundPort", _bridgeState.value.boundPort)
-            put("chatId", chat?.id ?: 0L)
-            put("chatTitle", chat?.title ?: "Gemini Chat")
-            put("wakeWord", chat?.wakeWord ?: "Hey Gemini")
-            put("systemInstruction", chat?.systemInstruction ?: "")
-            put("stagedUrl", stagedUrl)
-            put("stagedAt", timestamp)
-            put("messages", msgArray)
-        }.toString()
     }
 
     /**
@@ -741,8 +746,14 @@ object ChromeBridgeSocketManager {
         try {
             val dir = getCacheDir(context)
             if (!dir.exists()) dir.mkdirs()
-            File(dir, filename).writeText(content)
-        } catch (_: Exception) {}
+            val targetFile = File(dir, filename)
+            val tempFile = File(dir, "$filename.tmp")
+            tempFile.writeText(content)
+            if (!tempFile.renameTo(targetFile)) {
+                targetFile.writeText(content)
+                tempFile.delete()
+            }
+        } catch (_: Throwable) {}
     }
 
     private fun calculateCacheDirSize(context: Context): Long {

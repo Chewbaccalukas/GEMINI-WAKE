@@ -52,7 +52,10 @@ class ChatMemoryBufferManager(
 ) {
     companion object {
         const val DEFAULT_HOT_WINDOW_LIMIT = 30
+        private const val MAX_DISK_CACHE_MESSAGES_PER_STREAM = 250
     }
+
+    private val diskWriteLock = Any()
 
     private val cacheDir = File(context.cacheDir, "chat_disk_buffers").apply {
         if (!exists()) mkdirs()
@@ -492,14 +495,21 @@ class ChatMemoryBufferManager(
     }
 
     private fun writeDiskCacheFileAsync(chatId: Long, messages: List<ChatMessage>) {
-        try {
-            val incomingMessages = messages.filter { it.sender != "user" }
-            val outgoingMessages = messages.filter { it.sender == "user" }
+        synchronized(diskWriteLock) {
+            try {
+                val snapshot = messages.toList()
+                val incomingMessages = snapshot
+                    .filter { it.sender != "user" }
+                    .takeLast(MAX_DISK_CACHE_MESSAGES_PER_STREAM)
+                val outgoingMessages = snapshot
+                    .filter { it.sender == "user" }
+                    .takeLast(MAX_DISK_CACHE_MESSAGES_PER_STREAM)
 
-            writeMessagesToFile(getIncomingCacheFile(chatId), incomingMessages)
-            writeMessagesToFile(getOutgoingCacheFile(chatId), outgoingMessages)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to write disk cache files", e)
+                writeMessagesToFile(getIncomingCacheFile(chatId), incomingMessages)
+                writeMessagesToFile(getOutgoingCacheFile(chatId), outgoingMessages)
+            } catch (e: Throwable) {
+                Log.w(TAG, "Failed to write disk cache files", e)
+            }
         }
     }
 
@@ -522,7 +532,13 @@ class ChatMemoryBufferManager(
                     jsonArray.put(obj)
                 } catch (_: Throwable) {}
             }
-            file.writeText(jsonArray.toString())
+            val payload = jsonArray.toString()
+            val tempFile = File(cacheDir, "${file.name}.tmp")
+            tempFile.writeText(payload)
+            if (!tempFile.renameTo(file)) {
+                file.writeText(payload)
+                tempFile.delete()
+            }
         } catch (e: Throwable) {
             Log.w(TAG, "Failed writing cache file ${file.name}", e)
         }

@@ -197,15 +197,30 @@ class MainActivity : ComponentActivity() {
         }
         val targetChatId = intent?.getLongExtra(com.example.heartbeat.HeartbeatAlarmReceiver.EXTRA_TARGET_CHAT_ID, -1L) ?: -1L
         val wakeTargetChatId = intent?.getLongExtra(WakeWordVoiceService.EXTRA_WAKE_TARGET_CHAT_ID, -1L) ?: -1L
+        val wakeMatchedPhrase = intent?.getStringExtra(WakeWordVoiceService.EXTRA_WAKE_MATCHED_PHRASE)
+        val wakeInitialQuery = intent?.getStringExtra(WakeWordVoiceService.EXTRA_WAKE_INITIAL_QUERY)
+        if (!wakeMatchedPhrase.isNullOrBlank()) {
+            WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
+            if (!wakeInitialQuery.isNullOrBlank()) {
+                viewModel.setPendingWakeQuery(wakeInitialQuery)
+            }
+        }
         val resolvedTargetChatId = when {
             wakeTargetChatId != -1L -> wakeTargetChatId
             targetChatId != -1L -> targetChatId
             else -> -1L
         }
-        if (resolvedTargetChatId != -1L) {
-            if (wakeTargetChatId != -1L) {
-                WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
+        if (wakeTargetChatId != -1L || !wakeMatchedPhrase.isNullOrBlank()) {
+            WakeWordVoiceService.stopAndReleaseServiceAudioRecordSynchronously("wake_word_detected")
+            viewModel.triggerWakeActivationWithContextualOverlay(
+                detectedPhrase = wakeMatchedPhrase.orEmpty(),
+                explicitTargetChatId = resolvedTargetChatId.takeIf { it > 0L },
+                initialQuery = wakeInitialQuery
+            )
+            if (resolvedTargetChatId != -1L) {
+                viewModel.selectChat(resolvedTargetChatId)
             }
+        } else if (resolvedTargetChatId != -1L) {
             viewModel.selectChat(resolvedTargetChatId)
             currentScreen = Screen.Chat(resolvedTargetChatId)
         }
@@ -920,9 +935,14 @@ fun MainApp(
     // never bypass the strict 1500ms windowFocus debounce in SpeechRecognitionCoordinator and WakeWordManager.
     // Also guard against isWakeHandoffInProgress, isTtsSpeaking, and speechRecognitionCoordinator.isProcessing
     // so transitioning to ChatScreen never aggressively grabs the mic before the wake-word or TTS handoff finishes.
+    val lowPowerModeEnabled by viewModel.lowPowerModeEnabled.collectAsStateWithLifecycle()
+    val offlineQuestQueueingEnabled by viewModel.offlineQuestQueueingEnabled.collectAsStateWithLifecycle()
+    val adventureStateForTopBar by viewModel.adventureState.collectAsStateWithLifecycle()
+
     LaunchedEffect(
         hasAudioPermission,
         isHandsFreeActive,
+        lowPowerModeEnabled,
         isUserVoiceTurn,
         isInChatDictationActive,
         isSleepMode,
@@ -934,11 +954,13 @@ fun MainApp(
         if (hasWindowFocus &&
             hasAudioPermission &&
             isHandsFreeActive &&
+            !lowPowerModeEnabled &&
             !isSleepMode &&
             !isListening &&
             !isSpeechRecognizerListening &&
             !isInChatDictationActive &&
             !viewModel.speechRecognitionCoordinator.isInChatDictationMode &&
+            !viewModel.isUiMicDebouncePending &&
             !viewModel.speechRecognitionCoordinator.hasPendingRestart &&
             !viewModel.speechRecognitionCoordinator.hasPendingWindowFocusDebounce &&
             !viewModel.speechRecognitionCoordinator.isProcessing &&
@@ -1357,6 +1379,14 @@ fun MainApp(
             },
             onDeleteFromCloud = { cloudDoc ->
                 viewModel.deleteChatFromCloud(cloudDoc)
+            },
+            onSelectWakeTargetChat = { cloudDoc ->
+                viewModel.selectFirestoreChatAsWakeTarget(cloudDoc, multiSyncToCloud = true)
+                Toast.makeText(
+                    context,
+                    "Multi-synced \"${cloudDoc.title}\" as wake-word target!",
+                    Toast.LENGTH_SHORT
+                ).show()
             }
         )
     } else {
@@ -1510,44 +1540,29 @@ fun MainApp(
             onOpenCloudBackupVault = { navigateInApp(Screen.CloudBackupVault) },
             onClearChatThread = { chatId -> viewModel.clearChatHistory(chatId) },
             externalSelectedCategoryFilter = viewModel.selectedCategoryFilter.collectAsStateWithLifecycle().value,
-            onSelectCategoryFilter = { category -> viewModel.setSelectedCategoryFilter(category) }
+            onSelectCategoryFilter = { category -> viewModel.setSelectedCategoryFilter(category) },
+            offlineQuestQueueingEnabled = offlineQuestQueueingEnabled,
+            pendingOfflineSyncCount = adventureStateForTopBar.pendingOfflineSyncCount,
+            onToggleOfflineQuestQueueing = { viewModel.toggleOfflineQuestQueueingMode() }
         )
     }
 
-    if (showWakeFavoritesPickerDialog) {
-        val categoryMap = viewModel.chatCategoryMap.collectAsStateWithLifecycle().value
-        val matchedCategory = viewModel.matchedWakeCategory.collectAsStateWithLifecycle().value
-        val rankedSuggestions = remember(chats, favoriteChatIds) {
-            com.example.voice.WakeWordRoutingEngine.rankContextualChatSuggestions(
-                chats = chats,
-                favoriteChatIds = favoriteChatIds
-            )
-        }
-        val fallbackChat = remember(chats) {
-            com.example.voice.WakeWordRoutingEngine.resolveFallbackChat(chats)
-        }
-        val favoriteChatsList = remember(chats, favoriteChatIds) {
-            chats.filter { favoriteChatIds.contains(it.id) }
-        }
-        com.example.ui.components.WakeFavoritesAndSuggestionsDialog(
-            spokenWakePhrase = lastDetectedWakePhrase,
-            favoriteChats = favoriteChatsList,
-            contextualSuggestions = rankedSuggestions,
-            fallbackChat = fallbackChat,
-            favoriteChatIds = favoriteChatIds,
-            onSelectChat = { selectedChat ->
-                viewModel.dismissWakeFavoritesPicker()
-                viewModel.selectChat(selectedChat.id)
-                onNavigate(Screen.Chat(selectedChat.id))
-            },
-            onToggleFavorite = { chatId ->
-                viewModel.toggleFavoriteChat(chatId)
-            },
-            onDismiss = { viewModel.dismissWakeFavoritesPicker() },
-            chatCategoryMap = categoryMap,
-            initialCategoryFilter = matchedCategory
-        )
-    }
+    MainAppWakeWordTopOverlay(
+        viewModel = viewModel,
+        chats = chats,
+        isListening = isListening,
+        isSpeechRecognizerListening = isSpeechRecognizerListening,
+        isSleepMode = isSleepMode,
+        lowPowerModeEnabled = lowPowerModeEnabled,
+        isInChatDictationActive = isInChatDictationActive,
+        currentScreen = currentScreen,
+        audioRmsDb = audioRmsDb,
+        lastHeardText = lastHeardText,
+        showWakeFavoritesPickerDialog = showWakeFavoritesPickerDialog,
+        lastDetectedWakePhrase = lastDetectedWakePhrase,
+        favoriteChatIds = favoriteChatIds,
+        onNavigate = { navigateInApp(it) }
+    )
 
     if (showBackupExportDialog) {
         com.example.ui.components.BackupExportDialog(
@@ -1689,85 +1704,18 @@ fun MainApp(
     }
 
     if (showCreateEditDialog) {
-        val enrollmentRecording by viewModel.isWakeWordEnrollmentRecording.collectAsStateWithLifecycle()
-        val activeRecordingSlot by viewModel.activeRecordingSlot.collectAsStateWithLifecycle()
-        val recordingDurationMs by viewModel.snippetRecordingDurationMs.collectAsStateWithLifecycle()
-        val currentlyPlayingPath by viewModel.currentlyPlayingSnippetPath.collectAsStateWithLifecycle()
-        val playbackProgress by viewModel.snippetPlaybackProgress.collectAsStateWithLifecycle()
-        val playbackPositionMs by viewModel.snippetPlaybackPositionMs.collectAsStateWithLifecycle()
-        val playbackDurationMs by viewModel.snippetPlaybackDurationMs.collectAsStateWithLifecycle()
-        val isSnippetPaused by viewModel.isSnippetPaused.collectAsStateWithLifecycle()
-        val pendingCategory by viewModel.pendingNewChatCategory.collectAsStateWithLifecycle()
-
-        CreateEditChatDialog(
-            initialChat = chatToEdit,
-            existingChats = chats,
-            defaultPersistence = defaultPersistenceEnabled,
-            isEnrollmentRecording = enrollmentRecording,
-            activeRecordingSlot = activeRecordingSlot,
-            recordingDurationMs = recordingDurationMs,
-            currentlyPlayingPath = currentlyPlayingPath,
-            playbackProgress = playbackProgress,
-            playbackPositionMs = playbackPositionMs,
-            playbackDurationMs = playbackDurationMs,
-            isSnippetPaused = isSnippetPaused,
+        MainAppCreateEditChatModal(
+            viewModel = viewModel,
+            chatToEdit = chatToEdit,
+            chats = chats,
+            defaultPersistenceEnabled = defaultPersistenceEnabled,
             autoStopLimitSec = autoStopLimitSec,
-            onSetAutoStopLimit = { viewModel.setAutoStopLimit(it) },
-            onStartSnippetRecording = { chatId, slotIndex ->
+            onRequestRecordSnippet = { chatId, slotIndex ->
                 requestAudioPermissionAndExecute(PendingAudioAction.RecordWakeSnippet(chatId, slotIndex))
             },
-            onStopSnippetRecording = { chatId, slotIndex ->
-                viewModel.stopRecordingWakeSnippet(chatId, slotIndex)
-            },
-            onPlaySnippetPreview = { filePath ->
-                viewModel.playSnippetPreview(filePath)
-            },
-            onPauseSnippetPreview = {
-                viewModel.pauseSnippetPreview()
-            },
-            onResumeSnippetPreview = {
-                viewModel.resumeSnippetPreview()
-            },
-            onStopSnippetPreview = {
-                viewModel.stopSnippetPreview()
-            },
-            onPlayAllSnippets = {
-                chatToEdit?.let { viewModel.playAllWakeSnippets(it.id) }
-            },
-            onDeleteSampleById = { chatId, sampleId, filePath ->
-                viewModel.deleteWakeWordSampleById(chatId, sampleId, filePath)
-            },
-            onStartEnrollment = { viewModel.startWakeWordEnrollment(it) },
-            onStopEnrollment = { viewModel.stopWakeWordEnrollment() },
-            onSaveSample = { chatId, index, pcm -> viewModel.saveWakeWordSample(chatId, index, pcm) },
-            onDeleteSamples = { chatId -> viewModel.deleteWakeWordSamples(chatId) },
-            getSamplesFlow = { chatId -> viewModel.getSamplesForChatFlow(chatId) },
-            onDismiss = {
-                viewModel.cancelRecordingWakeSnippet()
-                viewModel.stopSnippetPreview()
+            onDismissDialog = {
                 showCreateEditDialog = false
                 chatToEdit = null
-            },
-            onSave = { savedChat ->
-                viewModel.cancelRecordingWakeSnippet()
-                viewModel.stopSnippetPreview()
-                viewModel.saveChat(savedChat) { _ ->
-                    showCreateEditDialog = false
-                    chatToEdit = null
-                }
-            },
-            initialCategory = chatToEdit?.let { viewModel.chatCategoryMap.collectAsStateWithLifecycle().value[it.id] }
-                ?: pendingCategory
-                ?: "Work",
-            initialTags = chatToEdit?.let { viewModel.chatTagsMap.collectAsStateWithLifecycle().value[it.id] }.orEmpty(),
-            availableCategories = viewModel.availableCategories.collectAsStateWithLifecycle().value,
-            onSaveCategoryAndTags = { selectedCat, selectedTags ->
-                val targetId = chatToEdit?.id ?: 0L
-                if (targetId > 0L) {
-                    viewModel.setChatCategoryAndTags(targetId, selectedCat, selectedTags)
-                } else {
-                    viewModel.setPendingNewChatCategory(selectedCat, selectedTags)
-                }
             }
         )
     }
@@ -1777,6 +1725,12 @@ fun MainApp(
             onDismiss = {
                 showPermissionRationaleDialog = false
                 pendingAudioAction = null
+            },
+            onRetryPermissionRequest = {
+                permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            },
+            onRequestFileAccess = {
+                documentPickerLauncher.launch(FileProcessingService.SUPPORTED_MIME_TYPES)
             }
         )
     }
@@ -2177,6 +2131,18 @@ private fun MainSettingsSection(
     val defaultPersistenceEnabled by viewModel.defaultPersistenceEnabled.collectAsStateWithLifecycle()
     val preserveCacheAcrossSessions by viewModel.preserveCacheAcrossSessions.collectAsStateWithLifecycle()
     val bufferMetrics by viewModel.bufferMetrics.collectAsStateWithLifecycle()
+    val lowPowerModeEnabled by viewModel.lowPowerModeEnabled.collectAsStateWithLifecycle()
+    val batteryDrainEstimate by viewModel.batteryDrainEstimate.collectAsStateWithLifecycle()
+    val offlineQuestQueueingEnabled by viewModel.offlineQuestQueueingEnabled.collectAsStateWithLifecycle()
+    val adventureState by viewModel.adventureState.collectAsStateWithLifecycle()
+    val savedCustomWakeWordPhrase by viewModel.customWakeWordPhrase.collectAsStateWithLifecycle()
+    val screenOffBatterySaverEnabled by viewModel.screenOffBatterySaverEnabled.collectAsStateWithLifecycle()
+    val activeWakeWordPollingIntervalMs by viewModel.activeWakeWordPollingIntervalMs.collectAsStateWithLifecycle()
+    val cloudBackupChats by viewModel.cloudBackupChats.collectAsStateWithLifecycle()
+
+    LaunchedEffect(Unit) {
+        viewModel.refreshBatteryDrainEstimate()
+    }
 
     SettingsScreen(
         chats = chats,
@@ -2306,7 +2272,240 @@ private fun MainSettingsSection(
         },
         onCreateGeneralLogFile = {
             viewModel.createAndCopyGeneralLogFileToClipboard(context)
+        },
+        lowPowerModeEnabled = lowPowerModeEnabled,
+        onToggleLowPowerMode = { enabled ->
+            viewModel.setLowPowerModeEnabled(enabled)
+        },
+        batteryDrainEstimate = batteryDrainEstimate,
+        offlineQuestQueueingEnabled = offlineQuestQueueingEnabled,
+        onToggleOfflineQuestQueueing = { enabled ->
+            viewModel.setOfflineQuestQueueingEnabled(enabled, triggerHaptic = true)
+        },
+        pendingOfflineSyncCount = adventureState.pendingOfflineSyncCount,
+        savedCustomWakeWordPhrase = savedCustomWakeWordPhrase,
+        onSaveCustomWakeWordToPrefs = { phrase ->
+            viewModel.saveCustomWakeWordToPrefs(phrase)
+        },
+        onResetCustomWakeWordInPrefs = {
+            viewModel.resetCustomWakeWordInPrefs()
+        },
+        onSimulateWakeWordDiagnostic = { phrase ->
+            viewModel.simulateWakeWordDetectionDiagnostic(wakePhraseOverride = phrase)
+        },
+        screenOffBatterySaverEnabled = screenOffBatterySaverEnabled,
+        onToggleScreenOffBatterySaver = { enabled ->
+            viewModel.setScreenOffBatterySaverEnabled(enabled)
+        },
+        activeWakeWordPollingIntervalMs = activeWakeWordPollingIntervalMs,
+        cloudBackupChats = cloudBackupChats,
+        onSelectFirestoreWakeChat = { cloudDoc ->
+            viewModel.selectFirestoreChatAsWakeTarget(cloudDoc, multiSyncToCloud = true)
+            Toast.makeText(
+                context,
+                "Multi-synced \"${cloudDoc.title}\" as wake-word target!",
+                Toast.LENGTH_SHORT
+            ).show()
         }
     )
 }
+
+@Composable
+private fun MainAppWakeWordTopOverlay(
+    viewModel: MainViewModel,
+    chats: List<com.example.data.model.ChatSession>,
+    isListening: Boolean,
+    isSpeechRecognizerListening: Boolean,
+    isSleepMode: Boolean,
+    lowPowerModeEnabled: Boolean,
+    isInChatDictationActive: Boolean,
+    currentScreen: Screen,
+    audioRmsDb: Float,
+    lastHeardText: String,
+    showWakeFavoritesPickerDialog: Boolean,
+    lastDetectedWakePhrase: String,
+    favoriteChatIds: Set<Long>,
+    onNavigate: (Screen) -> Unit
+) {
+    val isServiceSpeechRecognizerListening by WakeWordVoiceService.isServiceSpeechRecognizerListening.collectAsStateWithLifecycle()
+    val savedDataStoreWakePhrase by viewModel.dataStoreCustomWakeWordPhrase.collectAsStateWithLifecycle()
+    val savedPrefsWakePhrase by viewModel.customWakeWordPhrase.collectAsStateWithLifecycle()
+    val effectiveOverlayWakePhrase = savedDataStoreWakePhrase.ifBlank {
+        savedPrefsWakePhrase.ifBlank {
+            chats.firstOrNull { it.isDefaultWakeChat }?.wakeWord ?: "Hey Gemini"
+        }
+    }
+    val isOverlayWakeWordListening = (isListening || isSpeechRecognizerListening || isServiceSpeechRecognizerListening) &&
+        !isSleepMode &&
+        !lowPowerModeEnabled &&
+        !isInChatDictationActive &&
+        currentScreen !is Screen.Settings
+
+    val activeOverlayPollingIntervalMs by viewModel.activeWakeWordPollingIntervalMs.collectAsStateWithLifecycle()
+    val pendingWakeOverlay by viewModel.pendingWakeActivationOverlay.collectAsStateWithLifecycle()
+
+    androidx.compose.foundation.layout.Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = androidx.compose.ui.Alignment.TopCenter
+    ) {
+        androidx.compose.foundation.layout.Column(
+            horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally
+        ) {
+            com.example.ui.components.WakeWordContextualSuggestionOverlay(
+                overlayState = pendingWakeOverlay,
+                onSelectSuggestion = { selectedChat ->
+                    viewModel.confirmWakeActivationChatSelection(selectedChat)
+                    onNavigate(Screen.Chat(selectedChat.id))
+                },
+                onProceedToPreselectedChat = { preselectedChat ->
+                    viewModel.confirmWakeActivationChatSelection(preselectedChat)
+                    onNavigate(Screen.Chat(preselectedChat.id))
+                },
+                onDismiss = {
+                    viewModel.dismissPendingWakeActivationOverlay()
+                }
+            )
+            com.example.ui.components.ActiveWakeWordListeningOverlay(
+                isActivelyListening = isOverlayWakeWordListening,
+                activeWakePhrase = effectiveOverlayWakePhrase,
+                audioRmsDb = audioRmsDb,
+                lastHeardText = lastHeardText,
+                onClick = { onNavigate(Screen.Settings) }
+            )
+            com.example.ui.components.WakeWordScreenPulseAnimation(
+                isActivelyListening = isOverlayWakeWordListening && currentScreen !is Screen.Home,
+                activeWakePhrase = effectiveOverlayWakePhrase,
+                audioRmsDb = audioRmsDb,
+                pollingIntervalMs = activeOverlayPollingIntervalMs,
+                testTag = "wake_word_screen_pulse_animation"
+            )
+        }
+    }
+
+    if (showWakeFavoritesPickerDialog) {
+        val categoryMap = viewModel.chatCategoryMap.collectAsStateWithLifecycle().value
+        val matchedCategory = viewModel.matchedWakeCategory.collectAsStateWithLifecycle().value
+        val rankedSuggestions = remember(chats, favoriteChatIds) {
+            com.example.voice.WakeWordRoutingEngine.rankContextualChatSuggestions(
+                chats = chats,
+                favoriteChatIds = favoriteChatIds
+            )
+        }
+        val fallbackChat = remember(chats) {
+            com.example.voice.WakeWordRoutingEngine.resolveFallbackChat(chats)
+        }
+        val favoriteChatsList = remember(chats, favoriteChatIds) {
+            chats.filter { favoriteChatIds.contains(it.id) }
+        }
+        com.example.ui.components.WakeFavoritesAndSuggestionsDialog(
+            spokenWakePhrase = lastDetectedWakePhrase,
+            favoriteChats = favoriteChatsList,
+            contextualSuggestions = rankedSuggestions,
+            fallbackChat = fallbackChat,
+            favoriteChatIds = favoriteChatIds,
+            onSelectChat = { selectedChat ->
+                viewModel.dismissWakeFavoritesPicker()
+                viewModel.selectChat(selectedChat.id)
+                onNavigate(Screen.Chat(selectedChat.id))
+            },
+            onToggleFavorite = { chatId ->
+                viewModel.toggleFavoriteChat(chatId)
+            },
+            onDismiss = { viewModel.dismissWakeFavoritesPicker() },
+            chatCategoryMap = categoryMap,
+            initialCategoryFilter = matchedCategory
+        )
+    }
+}
+
+@Composable
+private fun MainAppCreateEditChatModal(
+    viewModel: MainViewModel,
+    chatToEdit: com.example.data.model.ChatSession?,
+    chats: List<com.example.data.model.ChatSession>,
+    defaultPersistenceEnabled: Boolean,
+    autoStopLimitSec: Int,
+    onRequestRecordSnippet: (Long, Int) -> Unit,
+    onDismissDialog: () -> Unit
+) {
+    val enrollmentRecording by viewModel.isWakeWordEnrollmentRecording.collectAsStateWithLifecycle()
+    val activeRecordingSlot by viewModel.activeRecordingSlot.collectAsStateWithLifecycle()
+    val recordingDurationMs by viewModel.snippetRecordingDurationMs.collectAsStateWithLifecycle()
+    val currentlyPlayingPath by viewModel.currentlyPlayingSnippetPath.collectAsStateWithLifecycle()
+    val playbackProgress by viewModel.snippetPlaybackProgress.collectAsStateWithLifecycle()
+    val playbackPositionMs by viewModel.snippetPlaybackPositionMs.collectAsStateWithLifecycle()
+    val playbackDurationMs by viewModel.snippetPlaybackDurationMs.collectAsStateWithLifecycle()
+    val isSnippetPaused by viewModel.isSnippetPaused.collectAsStateWithLifecycle()
+    val pendingCategory by viewModel.pendingNewChatCategory.collectAsStateWithLifecycle()
+
+    CreateEditChatDialog(
+        initialChat = chatToEdit,
+        existingChats = chats,
+        defaultPersistence = defaultPersistenceEnabled,
+        isEnrollmentRecording = enrollmentRecording,
+        activeRecordingSlot = activeRecordingSlot,
+        recordingDurationMs = recordingDurationMs,
+        currentlyPlayingPath = currentlyPlayingPath,
+        playbackProgress = playbackProgress,
+        playbackPositionMs = playbackPositionMs,
+        playbackDurationMs = playbackDurationMs,
+        isSnippetPaused = isSnippetPaused,
+        autoStopLimitSec = autoStopLimitSec,
+        onSetAutoStopLimit = { viewModel.setAutoStopLimit(it) },
+        onStartSnippetRecording = onRequestRecordSnippet,
+        onStopSnippetRecording = { chatId, slotIndex ->
+            viewModel.stopRecordingWakeSnippet(chatId, slotIndex)
+        },
+        onPlaySnippetPreview = { filePath ->
+            viewModel.playSnippetPreview(filePath)
+        },
+        onPauseSnippetPreview = {
+            viewModel.pauseSnippetPreview()
+        },
+        onResumeSnippetPreview = {
+            viewModel.resumeSnippetPreview()
+        },
+        onStopSnippetPreview = {
+            viewModel.stopSnippetPreview()
+        },
+        onPlayAllSnippets = {
+            chatToEdit?.let { viewModel.playAllWakeSnippets(it.id) }
+        },
+        onDeleteSampleById = { chatId, sampleId, filePath ->
+            viewModel.deleteWakeWordSampleById(chatId, sampleId, filePath)
+        },
+        onStartEnrollment = { viewModel.startWakeWordEnrollment(it) },
+        onStopEnrollment = { viewModel.stopWakeWordEnrollment() },
+        onSaveSample = { chatId, index, pcm -> viewModel.saveWakeWordSample(chatId, index, pcm) },
+        onDeleteSamples = { chatId -> viewModel.deleteWakeWordSamples(chatId) },
+        getSamplesFlow = { chatId -> viewModel.getSamplesForChatFlow(chatId) },
+        onDismiss = {
+            viewModel.cancelRecordingWakeSnippet()
+            viewModel.stopSnippetPreview()
+            onDismissDialog()
+        },
+        onSave = { savedChat ->
+            viewModel.cancelRecordingWakeSnippet()
+            viewModel.stopSnippetPreview()
+            viewModel.saveChat(savedChat) { _ ->
+                onDismissDialog()
+            }
+        },
+        initialCategory = chatToEdit?.let { viewModel.chatCategoryMap.collectAsStateWithLifecycle().value[it.id] }
+            ?: pendingCategory
+            ?: "Work",
+        initialTags = chatToEdit?.let { viewModel.chatTagsMap.collectAsStateWithLifecycle().value[it.id] }.orEmpty(),
+        availableCategories = viewModel.availableCategories.collectAsStateWithLifecycle().value,
+        onSaveCategoryAndTags = { selectedCat, selectedTags ->
+            val targetId = chatToEdit?.id ?: 0L
+            if (targetId > 0L) {
+                viewModel.setChatCategoryAndTags(targetId, selectedCat, selectedTags)
+            } else {
+                viewModel.setPendingNewChatCategory(selectedCat, selectedTags)
+            }
+        }
+    )
+}
+
+
 

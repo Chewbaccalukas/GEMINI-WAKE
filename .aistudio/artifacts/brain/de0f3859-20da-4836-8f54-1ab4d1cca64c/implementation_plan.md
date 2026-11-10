@@ -1,94 +1,84 @@
-# Adventure Drawer — Quest Filter Toggle & Rarity Glow Indicator System
+# Implementation Plan: Multiplayer Presence & Friend Status System (Adventure Engine)
 
-Upgrades the Infinite Adventure Engine drawer with a persistent **All / Active / Completed** quest filter toggle bar (featuring live quest count badges) and a multi-tiered **Visual Rarity Glow System** on the 3-column Inventory Grid (Common Grey, Rare Blue, Epic Purple, and Legendary Orange, with an animated pulsing aura on Epic and Legendary items).
-
----
-
-## User Review & Critical Decisions
-
-> [!IMPORTANT]
-> The following design and behavior decisions incorporate your confirmed choices from Phase 1:
-
-- **Confirmed Decision 1 — Rarity Glow Behavior**: **Pulsing aura on Epic and Legendary with static glow on Common and Rare**.
-  - `Common` (Grey `#94A3B8`) and `Rare` (Blue `#38BDF8`) items render a crisp static outer glow halo and gradient border.
-  - `Epic` (Purple `#C084FC`) and `Legendary` (Orange `#F59E0B`) items render a continuous, smooth `InfiniteTransition` pulsing radial/border glow aura with a corner rarity tier badge.
-- **Confirmed Decision 2 — Quest Filter Toggle & Persistence**: **Show live count badges on chips and persist selection**.
-  - The Quests tab displays a 3-way segmented filter toggle (**All (N)**, **Active (N)**, **Completed (N)**) that persists the user's selected `QuestFilterMode` in `AdventureGameState` across drawer open/close sessions and chat switches.
+## 1. Overview
+We will implement a real-time **Multiplayer Presence & Friend Status System** for the Adventure Engine that synchronizes the player's RPG progression (`level`, `completedQuestCount`), active chat context (`currentActiveChatTitle`), and session timers with Firestore (`presence/{uid}`) and a local Room cache, while enforcing one-tap **"Always Offline" (Stealth Mode)** privacy and rendering a pinned Party & Friend Status header with expandable `FriendPresenceCard` items in `GameDrawerSheet.kt`.
 
 ---
 
-## 1. Overview & Core Concept
+## 2. Data Model & Persistence (`com.example.game.PlayerPresence`)
 
-- **What It Does**:
-  1. Adds a segmented **Quest Filter Toggle** (`All`, `Active`, `Completed`) to the Quests tab in the Adventure Drawer so players can isolate current objectives or review completed milestones at a glance.
-  2. Introduces a custom Compose `drawBehind` + gradient border **Rarity Glow System** in the 3-column Inventory Grid that visually differentiates item tiers by color and aura intensity (`Common: Grey`, `Rare: Blue`, `Epic: Purple`, `Legendary: Orange`).
-- **Target Audience / Persona**: Players managing growing RPG quest logs and multi-tier procedural loot collections who want immediate visual hierarchy and effortless organization.
-- **Key Value**: Makes high-tier loot drops (`Epic` and `Legendary`) feel genuinely special with an animated pulsing halo while keeping long campaign quest logs organized.
+### 2.1 `PlayerPresence` Model (`/app/src/main/java/com/example/game/PlayerPresence.kt`)
+- Create `com.example.game.PlayerPresence` (also annotated as a Room `@Entity(tableName = "player_presence_cache")` with `@PrimaryKey val odinUid: String`):
+  - `odinUid: String` — Player's unique identifier (Firebase Auth UID or local fallback adventurer UID).
+  - `displayName: String` — Player's display name or adventurer handle.
+  - `level: Int` — Synced from local `AdventureGameState.characterLevel`.
+  - `completedQuestCount: Int` — Synced from local `AdventureGameState.quests.count { it.isCompleted }`.
+  - `currentActiveChatTitle: String` — Active chat session title (forced to `"Offline"` when `isStealthMode == true` or `!isOnline`).
+  - `isOnline: Boolean` — Whether the user is actively online (forced to `false` when `isStealthMode == true`).
+  - `isStealthMode: Boolean` — Whether Stealth Mode ("Always Offline") is enabled.
+  - `sessionStartedEpochMs: Long` — Epoch timestamp when the current online session started (`0L` when in Stealth Mode or offline).
+  - `lastHeartbeatEpochMs: Long` — Epoch timestamp of the latest presence heartbeat.
+- Helper methods on `PlayerPresence`:
+  - `fun isEffectivelyOnline(nowEpochMs: Long = System.currentTimeMillis(), timeoutMs: Long = 120_000L): Boolean` — Returns `isOnline && !isStealthMode && (nowEpochMs - lastHeartbeatEpochMs) <= timeoutMs`.
+  - `fun formattedElapsedSessionTime(nowEpochMs: Long = System.currentTimeMillis()): String` — Computes `"Online for Xh Ym"` (or `"Online for Xm"` / `"Offline"` when not effectively online or when `isStealthMode == true`).
+  - `fun sanitizedForStealthOrBroadcast(): PlayerPresence` — Returns a copy where if `isStealthMode` is `true`, `isOnline = false`, `currentActiveChatTitle = "Offline"`, and `sessionStartedEpochMs = 0L`.
+  - Firestore serialization helpers (`toFirestoreMap()` and `fromFirestoreDoc(doc)`).
 
----
-
-## 2. User Experience & Visual Design
-
-### Key User Flows
-1. **Quest Filter Toggle (`All` / `Active` / `Completed`)**:
-   - Located directly below the Campaign Quest Milestones progress card in the Quests tab.
-   - Displays three interactive filter chips with live counts: `All (total)`, `Active (activeCount)`, and `Completed (completedCount)`.
-   - Selecting a filter smoothly updates the visible quest cards; if a filtered view has no matching quests (e.g., no completed quests yet), a tailored empty-state card appears with a helpful prompt.
-   - Selected filter mode is stored in `AdventureGameState.questFilter` (and persisted in `GameSettings`) so reopening the drawer preserves your view.
-2. **Inventory Rarity Glow Indicator System**:
-   - Every item card in the 3-column Inventory Grid resolves its rarity tier (`Common`, `Rare`, `Epic`, `Legendary`) and applies a custom `Modifier.rarityGlowBorder(...)`:
-     - **Common (`#94A3B8` Grey)**: Subtle 1.5dp slate border with a soft 4dp static outer halo (`alpha = 0.22f`).
-     - **Rare (`#38BDF8` Blue)**: Luminous 1.8dp sapphire border with a 7dp static outer glow (`alpha = 0.35f`).
-     - **Epic (`#C084FC` Purple)**: 2.dp amethyst gradient border with an animated pulsing 11dp outer aura (`alpha` oscillating between `0.30f` and `0.72f`).
-     - **Legendary (`#F59E0B` Orange)**: 2.5dp solar-orange/gold gradient border with an animated pulsing 14dp outer aura (`alpha` oscillating between `0.40f` and `0.88f`) and a subtle inner shimmer gradient.
-
-### Visual Identity & Theme
-- **Rarity Palette**:
-  - `Common`: Slate Grey (`#94A3B8`)
-  - `Rare`: Arcane Blue (`#38BDF8`)
-  - `Epic`: Void Purple (`#C084FC`)
-  - `Legendary`: Mythic Orange (`#F59E0B`)
-- **Interactive Feedback & Motion**: Smooth `rememberInfiniteTransition` sine-wave glow breathing (1800ms cycle) for `Epic` and `Legendary` items, and animated state transitions when switching between `All`, `Active`, and `Completed` quest views.
+### 2.2 Room & Firestore Schema + Security Rules
+- **Room Database (`AppDatabase.kt` & `PlayerPresenceDao`)**:
+  - Add `PlayerPresenceDao` to query, upsert, and observe cached `PlayerPresence` rows (`observeAllPresence()`, `upsertPresence(...)`, `upsertAllPresence(...)`, `getPresenceByUidSync(odinUid)`).
+- **Firestore Blueprint (`firebase-blueprint.json`) & Security Rules (`firestore.rules`)**:
+  - Add `PlayerPresenceDoc` schema at `/presence/{uid}`.
+  - Allow signed-in users (`isSignedIn()`) to `get` and `list` `/presence/{uid}` for the live global lobby and friend status cards.
+  - Allow only `isOwner(uid)` to `create`, `update`, and `delete` `/presence/{uid}`, validating all required fields (`odinUid == uid`, `displayName`, `level >= 1`, `completedQuestCount >= 0`, `currentActiveChatTitle`, `isOnline`, `isStealthMode`, `sessionStartedEpochMs >= 0`, `lastHeartbeatEpochMs >= 0`) and enforcing that when `isStealthMode == true`, `isOnline == false` and `currentActiveChatTitle == 'Offline'`.
 
 ---
 
-## 3. Key Product Decisions & Trade-Offs
+## 3. Privacy / "Always Offline" (Stealth Mode) & Presence Heartbeat Coordinator
 
-- **Decision 1: Canvas `drawBehind` Outer Glow Halo + Gradient Border**
-  - *Chosen Approach*: Render the glowing border using a custom `Modifier.drawBehind` rounded-rect radial/halo pass combined with a `Brush.linearGradient` border stroke.
-  - *Why*: Works reliably across all Android API levels (API 24–36) and Robolectric unit tests without relying on hardware-only `RenderEffect` blur APIs that can clip inside grid cells.
-- **Decision 2: Persisting `QuestFilterMode` in `GameSettings` / `AdventureGameState`**
-  - *Chosen Approach*: Store `questFilter: QuestFilterMode` (`ALL`, `ACTIVE`, `COMPLETED`) in `GameSettings` and `AdventureGameState` with Room JSON serialization.
-  - *Why*: Guarantees the user's chosen quest filter persists across drawer open/close cycles, configuration changes, and app restarts.
+### 3.1 `AppSettingsManager` Stealth Mode & Pinned Friend UIDs (`/app/src/main/java/com/example/util/AppSettingsManager.kt`)
+- Add preference keys:
+  - `KEY_ADVENTURE_STEALTH_MODE = "adventure_stealth_mode_enabled"`
+  - `KEY_PINNED_FRIEND_UIDS = "adventure_pinned_friend_uids"`
+- Expose reactive `StateFlow`s & mutators:
+  - `isStealthMode: StateFlow<Boolean>`
+  - `setStealthModeEnabled(context: Context, enabled: Boolean): Boolean`
+  - `toggleStealthMode(context: Context): Boolean`
+  - `pinnedFriendUids: StateFlow<Set<String>>`
+  - `addPinnedFriendUid(context: Context, odinUid: String)` / `removePinnedFriendUid(context: Context, odinUid: String)`
+
+### 3.2 `PlayerPresenceRepository` & 30s Heartbeat Loop (`/app/src/main/java/com/example/game/PlayerPresence.kt`)
+- Synchronizes local `PlayerPresence` (derived from `AdventureGameState.characterLevel`, completed quests count, active chat title, and `AppSettingsManager.isStealthMode`) to both Room (`player_presence_cache`) and Firestore (`presence/{uid}`).
+- **Stealth Mode Privacy Enforcement**:
+  - Whenever `isStealthMode == true`, `buildLocalPlayerPresence(...)` and `pushPresenceToFirestore(...)` strictly set `isOnline = false`, `currentActiveChatTitle = "Offline"`, and `sessionStartedEpochMs = 0L`, ignoring live session timers.
+- **Heartbeat & Lifecycle Hooks**:
+  - Runs a 30-second coroutine heartbeat while the app is in the foreground and signed in.
+  - Triggers an immediate presence push whenever `level`, `completedQuestCount`, `currentActiveChatTitle`, or `isStealthMode` changes.
+  - Marks `isOnline = false` on foreground pause/stop or sign-out, and treats any remote presence document with `now - lastHeartbeatEpochMs > 120_000L` (2 minutes) as offline.
 
 ---
 
-## 4. Technical Architecture & Data Strategy *(Technical Reference)*
+## 4. Friend Status Drawer UI (`GameDrawerSheet.kt` & `FriendPresenceCard`)
 
-### Architecture & Component Diagram
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                         GameDrawerSheet (Right Drawer)                       │
-│  ┌────────────────────────────────────┐  ┌────────────────────────────────┐  │
-│  │     3-Column Inventory Grid        │  │         Quests Tab             │  │
-│  │  • RarityTier Resolver             │  │  • Milestone Progress Card     │  │
-│  │    (Common Grey, Rare Blue,        │  │  • 3-Way Filter Toggle Row     │  │
-│  │     Epic Purple, Legendary Orange) │  │    [All (N)] [Active (N)]      │  │
-│  │  • Modifier.rarityGlowBorder()     │  │    [Completed (N)]             │  │
-│  │    - Static Halo (Common / Rare)   │  │  • Filtered Quest Card List +  │  │
-│  │    - Pulsing Aura (Epic/Legendary) │  │    Tailored Empty State        │  │
-│  └─────────────────┬──────────────────┘  └───────────────┬────────────────┘  │
-└────────────────────┼─────────────────────────────────────┼───────────────────┘
-                     ▼                                     ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│          MainViewModel & AdventureGameState (Room SQLite Persistence)        │
-│  • QuestFilterMode (ALL, ACTIVE, COMPLETED) persisted in GameSettings        │
-│  • setAdventureQuestFilter(filter: QuestFilterMode)                          │
-│  • filteredQuests computed property on AdventureGameState                    │
-└──────────────────────────────────────────────────────────────────────────────┘
-```
+### 4.1 Pinned Party Header & Stealth Toggle in `GameDrawerSheet.kt`
+- Add a pinned **Multiplayer Party & Presence Banner** below the top controls bar in `GameDrawerSheet.kt`:
+  - Shows the local player's own status pill (`Online` green dot vs. `Always Offline (Stealth)` gray dot), current `Lv. X • Y Quests`, and an **"Always Offline" eye icon button** (`adventure_stealth_mode_toggle_button`) for one-tap privacy control.
+  - Displays a live counter of online friends/adventurers (`"X Online"`), an expand/collapse toggle (`adventure_friend_drawer_expand_button`) to view the full party/lobby list, and an optional quick **"Add Friend by UID"** input row (`adventure_add_friend_uid_input`, `adventure_add_friend_uid_button`).
 
-### Data Model & State
-- **`QuestFilterMode`**: Enum (`ALL`, `ACTIVE`, `COMPLETED`) with `displayName` (`"All"`, `"Active"`, `"Completed"`).
-- **`RarityTier`**: Enum (`COMMON`, `RARE`, `EPIC`, `LEGENDARY`) resolved from `InventoryItem.rarityColorHex` or `rarityLabel`, providing canonical hex/Compose colors (`Grey #94A3B8`, `Blue #38BDF8`, `Purple #C084FC`, `Orange #F59E0B`), border widths, glow radii, and `isAnimatedPulse: Boolean`.
-- **`AdventureGameState.filteredQuests`**: Returns all quests for `ALL`, `!it.isCompleted` for `ACTIVE`, and `it.isCompleted` for `COMPLETED`.
+### 4.2 `FriendPresenceCard` Composable
+- Create `FriendPresenceCard` (`friend_presence_card_<odinUid>`) displaying:
+  - **Online Status Dot**: Glowing Emerald Green (`#10B981`) for effectively online players, Neutral Slate Gray (`#94A3B8`) for Offline or Stealth players (`friend_presence_status_dot_<odinUid>`).
+  - **Player Identity & Badges**: `displayName`, **Level Badge** (`Lv. <level>`), and **Total Quests Completed Counter** (`<completedQuestCount> Quests`).
+  - **Active Chat Context & Session Timer**:
+    - Shows `"In: <currentActiveChatTitle>"` and `"Online for Xh Ym"` (or `"Online for Xm"`) when online.
+    - Shows `"In: Offline"` and `"Offline"` when offline or in Stealth Mode.
+  - **Header / Card Eye Toggle**: Quick `"Always Offline"` eye toggle icon on the local player's card/header (`friend_presence_stealth_toggle`) and a pin/unpin toggle for fellow adventurers.
+
+---
+
+## 5. Verification & Error Checking Plan
+1. Add unit & Robolectric tests verifying:
+   - `PlayerPresence` model fields, `isEffectivelyOnline` 2-minute timeout, and `formattedElapsedSessionTime`.
+   - `isStealthMode = true` persists in `AppSettingsManager` and forces `isOnline = false`, `currentActiveChatTitle = "Offline"`, and `sessionStartedEpochMs = 0L` before Room/Firestore sync.
+   - Firestore `/presence/{uid}` security rules validation in `FirebaseSyncRepositoryRuleTest`.
+2. Run `compile_applet` and `gradle :app:testDebugUnitTest` sequentially, fix any discovered issues, re-scan until 0 errors remain, and output the complete Errors & Fixes log in chat.

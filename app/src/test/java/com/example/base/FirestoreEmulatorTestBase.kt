@@ -54,8 +54,6 @@ abstract class FirestoreEmulatorTestBase {
         val resId = context.resources.getIdentifier("firestore_database_id", "string", context.packageName)
         databaseId = if (resId != 0) context.getString(resId) else "(default)"
 
-        clearFirestoreEmulatorData()
-
         firestore = if (resId != 0) {
             FirebaseFirestore.getInstance(databaseId)
         } else {
@@ -79,11 +77,15 @@ abstract class FirestoreEmulatorTestBase {
             // Already configured in this process
         }
         auth.signOut()
+
+        clearFirestoreEmulatorData()
     }
 
     @After
     open fun tearDown() {
-        auth.signOut()
+        if (::auth.isInitialized) {
+            auth.signOut()
+        }
     }
 
     protected suspend fun signInAndGetUid(): String = withTimeout(10_000L) {
@@ -110,6 +112,11 @@ abstract class FirestoreEmulatorTestBase {
         }
         try {
             conn.responseCode
+        } catch (e: java.net.ConnectException) {
+            org.junit.Assume.assumeNoException(
+                "Firestore emulator is not running on $FIRESTORE_HOST:$FIRESTORE_PORT; skipping live emulator rule test",
+                e
+            )
         } finally {
             conn.disconnect()
         }
